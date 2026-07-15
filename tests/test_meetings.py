@@ -991,3 +991,273 @@ def test_the_supervisor_can_reopen_a_meeting_the_agents_closed(desk):
     # The proof the old resume could not pass: it accepts a message.
     meetings.send_update(thread_id, role="beta", kind="evidence",
                          body="picking the thread back up")
+
+
+# --- 10. history: when a meeting ended, and how the console reads it back ----
+# `list_meetings` is the console's whole view of the desk, and every test here
+# guards it telling the truth about time. The three invariants are that a
+# meeting's END is recorded (not inferred from its last write), that narrowing
+# the history never narrows the present, and that history reads in the order
+# things finished.
+
+#: A fixed instant that is 2026-07-15 in UTC and 2026-07-14 in the conftest's
+#: America/New_York (23:00 EDT). Every way the day filter can be wrong lives in
+#: this gap, so the history tests close on it rather than on "now".
+_UTC_EVENING = dt.datetime(2026, 7, 15, 3, 0, tzinfo=dt.timezone.utc)
+_LOCAL_DAY = "2026-07-14"
+_UTC_DAY = "2026-07-15"
+
+
+def _close(thread_id: str, resolution: str = "concluded", *,
+           ended_at: str | None = None) -> None:
+    """Close a meeting through the real handshake, then optionally back-date the
+    end. Injected rather than slept for — see the module docstring."""
+    meetings.propose_end(thread_id, role="alpha", resolution=resolution)
+    meetings.confirm_end(thread_id, role="beta")
+    if ended_at is not None:
+        with _db() as conn:
+            conn.execute("UPDATE meetings SET closed_at=? WHERE thread_id=?",
+                         (ended_at, thread_id))
+
+
+def _listed(**kwargs) -> list[str]:
+    return [s["meeting"]["thread_id"] for s in meetings.list_meetings(**kwargs)]
+
+
+def test_closed_at_records_when_a_meeting_ended_not_when_it_was_last_written(desk):
+    """`updated_at` coincides with the close on every row that exists today, which
+    is exactly why it looked like an end timestamp. It is not one: closing merely
+    happens to be the last thing that touches most meetings, and that is a
+    coincidence, not an invariant. Anything writing a closed meeting afterwards
+    turns updated_at into a lie about when it ended — silently — and a history
+    sorted by "end time" quietly reorders itself. So the end is recorded, once,
+    by the only thing that can end a meeting.
+    """
+    thread_id = _start("ends at a knowable time", ["alpha", "beta"])
+    assert meetings.meeting_status(thread_id)["meeting"]["closed_at"] is None, (
+        "a live meeting has not ended; a closed_at would file it under a day")
+
+    _close(thread_id, "we are done here")
+    meeting = meetings.meeting_status(thread_id)["meeting"]
+    assert meeting["state"] == "closed"
+    assert meeting["closed_at"] is not None, "closing must record when it closed"
+
+    # Back-date the close so a later write is distinguishable without sleeping.
+    ended = _past(3600)
+    with _db() as conn:
+        conn.execute("UPDATE meetings SET closed_at=?,updated_at=? WHERE thread_id=?",
+                     (ended, ended, thread_id))
+
+    # A supervisor read of the transcript, an escalation sweep, any later touch:
+    # updated_at moves, closed_at does not. Simulated with a direct write because
+    # the only path that writes an already-closed meeting today is `resume`, and
+    # resume is the one case where the end legitimately stops existing (below).
+    with _db() as conn:
+        conn.execute("UPDATE meetings SET updated_at=? WHERE thread_id=?",
+                     (_past(0), thread_id))
+    with _db() as conn:
+        row = dict(conn.execute(
+            "SELECT closed_at,updated_at FROM meetings WHERE thread_id=?",
+            (thread_id,)).fetchone())
+    assert row["updated_at"] > ended, "the later write must move updated_at"
+    assert row["closed_at"] == ended, (
+        "...and must leave closed_at alone: it says when the meeting ended, not "
+        "when the row was last touched")
+
+
+def test_reopening_a_meeting_clears_the_end_it_no_longer_has(desk):
+    """`resume` is not "a later write" — it is an un-ending.
+
+    Everywhere else, closed_at must survive a subsequent touch (above). Here it
+    must not: the meeting is live again, so "when it ended" has stopped being a
+    fact about it. A live row carrying an end time contradicts itself, and
+    list_meetings ranks the live block by COALESCE(closed_at, created_at) — a
+    reopened meeting would sort by when it used to finish instead of when it
+    began, i.e. wherever its old ending happened to fall.
+
+    Re-closing must then record the SECOND ending, not resurrect the first.
+    """
+    thread_id = _start("reopened after all", ["alpha", "beta"])
+    _close(thread_id, "premature")
+    first_end = _past(3600)
+    with _db() as conn:
+        conn.execute("UPDATE meetings SET closed_at=? WHERE thread_id=?",
+                     (first_end, thread_id))
+
+    meetings.apply_simple_supervisor_action(
+        {"action": "resume", "meeting_id": thread_id, "reason": "not done after all"})
+    live = meetings.meeting_status(thread_id)["meeting"]
+    assert live["state"] != "closed"
+    assert live["closed_at"] is None, (
+        "a live meeting has no end; leaving the old one files it under the day it "
+        "used to close on and ranks it there among meetings that are still open")
+
+    _close(thread_id, "now we really are done")
+    again = meetings.meeting_status(thread_id)["meeting"]
+    assert again["closed_at"] is not None
+    assert again["closed_at"] > first_end, (
+        "the second ending is the one that happened; the first is over")
+
+
+def test_the_day_filter_narrows_history_and_never_hides_a_live_meeting(desk):
+    """The load-bearing one. `day` narrows HISTORY only. A filter that could hide
+    a meeting still waiting on someone would hide the exact thing the console
+    exists to show, so "narrow the history" must never quietly mean "narrow the
+    present" — a live meeting is listed whatever day it was called on.
+    """
+    waiting = meetings.call_meeting(
+        agenda="still waiting on the others", called_by="alpha")["meeting"]["thread_id"]
+    closed = _start("finished on its own day", ["alpha", "beta"])
+    _close(closed, "wrapped up", ended_at=meetings._iso(_UTC_EVENING))
+
+    listed = _listed(include_closed=True, day="2026-01-02")
+    assert waiting in listed, (
+        "a live meeting has no end date to be filtered by; it is always listed")
+    assert closed not in listed, "the day filter must still narrow the history"
+
+    listed = _listed(include_closed=True, day=_LOCAL_DAY)
+    assert {waiting, closed} <= set(listed), "the closed one is back on its own day"
+
+
+def test_history_reads_newest_ended_first_and_urgency_ranks_only_live_meetings(desk):
+    """Priority answers "what needs you now", which a finished meeting cannot.
+    Applied to history it hoists every urgent meeting into its own block and cuts
+    the timeline in two — the first cut of this did exactly that, and reading the
+    output back showed a 07-15 meeting sorted above a 07-14 one, which makes the
+    day impossible to follow. Live first (urgent ahead of normal); then history,
+    strictly newest-ended first whatever its priority was.
+    """
+    live_normal = _start("live, and merely normal", ["alpha", "beta"])
+    live_urgent = _start("live, and urgent", ["alpha", "beta"], priority="urgent")
+    # Priority INTERLEAVED against close order: a global urgent-first key
+    # reshuffles these three, a live-block-only one leaves them in time order.
+    newest = _start("closed most recently", ["alpha", "beta"], priority="urgent")
+    middle = _start("closed in between", ["alpha", "beta"])
+    oldest = _start("closed first of all", ["alpha", "beta"], priority="urgent")
+    for thread_id, age in ((newest, 60), (middle, 3600), (oldest, 7200)):
+        _close(thread_id, f"done {age}s ago", ended_at=_past(age))
+
+    assert _listed(include_closed=True) == [
+        live_urgent, live_normal, newest, middle, oldest]
+
+
+def test_the_day_is_a_local_calendar_date_not_a_prefix_of_the_stored_utc_time(desk):
+    """`day` is a LOCAL date resolved through CONFIG.tzinfo() — America/New_York
+    here, deliberately not UTC. This meeting ended at 23:00 on the 14th for the
+    person reading the console, and is stored as '2026-07-15T03:00:00+00:00'. A
+    string prefix match answers a different question everywhere the offset is not
+    zero, which is everywhere this desk runs: it would file the meeting under a
+    day nobody worked and leave the day they did work looking empty.
+    """
+    thread_id = _start("closed late in the local evening", ["alpha", "beta"])
+    _close(thread_id, "late night", ended_at=meetings._iso(_UTC_EVENING))
+
+    assert thread_id in _listed(include_closed=True, day=_LOCAL_DAY), (
+        "it ended on the local evening of the 14th and belongs to that day")
+    assert thread_id not in _listed(include_closed=True, day=_UTC_DAY), (
+        "the local 15th had not begun yet; only a prefix match files it there")
+    assert meetings.meeting_days() == [_LOCAL_DAY]
+
+
+@pytest.mark.parametrize("garbage", ["", "yesterday", "2026-13-01", "2026-02-30",
+                                     "2026-07-15T00:00:00", "2026-7-5", None])
+def test_a_day_that_is_not_a_calendar_date_is_refused(desk, garbage):
+    """The day reaches `_local_day_bounds`, which builds SQL bounds from it.
+    Anything not a real date must die at the door with a message that says what
+    was wanted, rather than deeper down as a TypeError or an empty history that
+    looks like a quiet day."""
+    with pytest.raises(ValueError, match="day must be YYYY-MM-DD"):
+        meetings._valid_day(garbage)
+
+
+def test_no_day_means_no_filter(desk):
+    """`day=None` is the console's default view: the whole history, not none of
+    it."""
+    live = _start("live", ["alpha", "beta"])
+    closed = _start("closed", ["alpha", "beta"])
+    _close(closed, "done", ended_at=meetings._iso(_UTC_EVENING))
+
+    assert set(_listed(include_closed=True, day=None)) == {live, closed}
+
+
+def test_the_day_filter_is_ignored_when_history_was_not_asked_for(desk):
+    """With include_closed=False there are no closed meetings to narrow, so `day`
+    has nothing left to say. It must not become a second, silent filter on the
+    live board — the same failure as hiding a live meeting, reached by a
+    different route."""
+    live = _start("live", ["alpha", "beta"])
+    closed = _start("closed", ["alpha", "beta"])
+    _close(closed, "done", ended_at=meetings._iso(_UTC_EVENING))
+
+    assert _listed(include_closed=False) == [live]
+    assert _listed(include_closed=False, day=_LOCAL_DAY) == [live]
+    assert _listed(include_closed=False, day="2026-01-02") == [live], (
+        "a day with no closed meetings at all must not empty the live board")
+
+
+def test_meeting_days_offers_only_days_that_have_a_closed_meeting(desk):
+    """The console's date picker is populated from this, so every entry has to be
+    a day that lists something: a day with nothing in it is a dead choice, and a
+    live meeting has no end date to offer yet."""
+    _start("never closed", ["alpha", "beta"])
+    morning = _start("day one, local morning", ["alpha", "beta"])
+    evening = _start("day one, local evening", ["alpha", "beta"])
+    later = _start("day two", ["alpha", "beta"])
+    _close(morning, "done", ended_at=meetings._iso(
+        dt.datetime(2026, 7, 14, 14, 0, tzinfo=dt.timezone.utc)))
+    _close(evening, "done", ended_at=meetings._iso(_UTC_EVENING))
+    _close(later, "done", ended_at=meetings._iso(
+        dt.datetime(2026, 7, 16, 12, 0, tzinfo=dt.timezone.utc)))
+
+    assert meetings.meeting_days() == ["2026-07-16", _LOCAL_DAY], (
+        "newest first; two meetings on one local day are one choice, not two; "
+        "and the live meeting contributes no day at all")
+
+
+def test_migrating_a_db_without_closed_at_adds_it_and_backfills_only_closed_rows(desk):
+    """closed_at is new, so every DB that predates it holds closed meetings whose
+    end survives only as updated_at. Backfilling from it is an APPROXIMATION and
+    the only one available — the tightest true upper bound, and exact on the rows
+    that exist, because closing was in fact their last write. A live row has no
+    end to approximate and must stay NULL: inventing one files a meeting that is
+    still running into the history.
+
+    This reaches across a layer on purpose. The column is meetings', but
+    orchestration owns _migrate — meetings must never import it (module
+    docstring), so the migration cannot be exercised from that side.
+    """
+    from deskd import orchestration
+
+    closed = _start("closed before the column existed", ["alpha", "beta"])
+    _close(closed, "done long ago")
+    live = _start("still going", ["alpha", "beta"])
+
+    legacy_end = _past(7200)
+    with _db() as conn:
+        conn.execute("UPDATE meetings SET updated_at=? WHERE thread_id=?",
+                     (legacy_end, closed))
+        # The pre-migration shape, in raw SQL: _migrate keys off the column
+        # actually being absent, so it has to actually be absent.
+        conn.execute("ALTER TABLE meetings DROP COLUMN closed_at")
+        assert "closed_at" not in {
+            r["name"] for r in conn.execute("PRAGMA table_info(meetings)")}
+
+    with orchestration.connect():
+        pass   # opening the DB IS the migration
+
+    def _row(thread_id: str) -> dict:
+        with _db() as conn:
+            return dict(conn.execute(
+                "SELECT state,closed_at FROM meetings WHERE thread_id=?",
+                (thread_id,)).fetchone())
+
+    assert _row(closed) == {"state": "closed", "closed_at": legacy_end}
+    assert _row(live)["closed_at"] is None
+
+    # Idempotent: every connect() runs _migrate, so a second ALTER would raise
+    # "duplicate column name" and a re-backfill would overwrite real end times
+    # with whatever last touched the row.
+    with orchestration.connect():
+        pass
+    assert _row(closed) == {"state": "closed", "closed_at": legacy_end}
+    assert _row(live)["closed_at"] is None

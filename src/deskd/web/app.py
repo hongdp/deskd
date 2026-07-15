@@ -87,12 +87,19 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     # Resolve the mode once, at construction: an invalid DESKD_SUPERVISOR_AUTH_MODE
     # must be a loud startup failure, never a surprise 500 mid-meeting.
     auth_mode = auth.auth_mode()
-    if auth.simple_auth_enabled() and auth.access_code_is_ephemeral():
+    if auth.access_code_is_ephemeral():
         # auth generates rather than defaulting: a checked-in default code is a
         # published credential. Surfaced once, to this server's terminal only —
         # auth itself never logs it.
         print(f"[{config_mod.PROJECT_NAME}] generated supervisor access code "
               f"(simple auth): {auth.simple_access_code()}")
+    if auth_mode == "open":
+        # Unmissable, on every boot: `open` means the socket is the only
+        # boundary left, and whoever runs this should hear it from the server
+        # rather than rediscover it in their own .env months later.
+        print(f"[{config_mod.PROJECT_NAME}] *** supervisor authentication is OFF "
+              "(DESKD_SUPERVISOR_AUTH_MODE=open) *** anyone who can reach this "
+              "port acts as supervisor. Bind to a host you trust.")
 
     app = FastAPI(title=f"{config_mod.PROJECT_NAME} console")
 
@@ -152,6 +159,10 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
             ],
             "supervisor_auth_mode": auth_mode,
             "simple_auth_enabled": auth.simple_auth_enabled(),
+            # Whether the console should ask for a code at all. Read from auth,
+            # like the rest of this boundary — a console deciding for itself is
+            # the second reader that makes the two disagree.
+            "access_code_required": auth.access_code_required(),
             # Usable, not merely enabled: a signed mode whose key is missing or
             # agent-writable is not a working mode, and the console must not
             # advertise it as one.

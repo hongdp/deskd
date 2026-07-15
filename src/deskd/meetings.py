@@ -115,6 +115,14 @@ CREATE TABLE IF NOT EXISTS meetings (
     wait_timeout_seconds  INTEGER NOT NULL DEFAULT 300 CHECK (wait_timeout_seconds >= 30),
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
+    -- When the meeting actually closed. NOT a synonym for updated_at, even
+    -- though the two coincide on every row today: closing merely happens to be
+    -- the last thing that touches most meetings. That is a coincidence, not an
+    -- invariant — anything writing a closed meeting afterwards turns updated_at
+    -- into a lie about when it ended, silently, and a console sorting history by
+    -- "end time" would quietly reorder itself. Written in exactly one place
+    -- (_close_meeting), which is also the only place that can close a meeting.
+    closed_at             TEXT,
     auto_escalated_at     TEXT,
     waiting_escalated_at  TEXT
 );
@@ -257,10 +265,32 @@ def connect(db_path: Path | str | None = None, *, write: bool = False):
     with mailbox.connect(db_path) as conn:
         conn.executescript(auth.SCHEMA)
         conn.executescript(MEETING_SCHEMA)
+        _migrate(conn)
         conn.commit()
         if write:
             conn.execute("BEGIN IMMEDIATE")
         yield conn
+
+
+def _migrate(conn) -> None:
+    """Bring an existing DB's meeting tables up to schema. Idempotent.
+
+    This layer migrates its own tables. `closed_at` was briefly added by
+    orchestration's `_migrate` instead, which a meetings-only host never runs —
+    so its `list_meetings` raised `no such column: closed_at` against any DB that
+    predated the column, while a fresh DB was fine because CREATE TABLE already
+    had it. Only the shape nobody exercises breaks that way.
+    """
+    if "closed_at" not in {r["name"] for r in conn.execute(
+            "PRAGMA table_info(meetings)")}:
+        conn.execute("ALTER TABLE meetings ADD COLUMN closed_at TEXT")
+        # Backfilled from updated_at, which is an APPROXIMATION and the only one
+        # available: these rows closed before anything recorded when. It is the
+        # tightest true upper bound — a meeting cannot have closed after its last
+        # write — and on every row in existence today it is exact, because
+        # closing was in fact the last write. New rows get the real thing.
+        conn.execute("UPDATE meetings SET closed_at=updated_at "
+                     "WHERE state='closed' AND closed_at IS NULL")
 
 
 # --- roles ------------------------------------------------------------------
@@ -1606,9 +1636,10 @@ def propose_end(thread_id: str, *, role: str, resolution: str,
 def _close_meeting(conn, thread_id: str, resolution: str, actor: str,
                    auth_nonce: str | None = None) -> None:
     now = _iso()
+    # The only place a meeting closes, so the only place closed_at is written.
     conn.execute(
-        "UPDATE meetings SET state='closed',updated_at=? WHERE thread_id=?",
-        (now, thread_id),
+        "UPDATE meetings SET state='closed',updated_at=?,closed_at=? WHERE thread_id=?",
+        (now, now, thread_id),
     )
     conn.execute(
         "UPDATE meeting_attendees SET stopped_at=? WHERE thread_id=?",
@@ -1835,16 +1866,78 @@ def meeting_status(thread_id: str, *, db_path: Path | str | None = None,
                 "response_obligations": obligations}
 
 
-def list_meetings(*, include_closed: bool = False,
+def list_meetings(*, include_closed: bool = False, day: str | None = None,
                   db_path: Path | str | None = None) -> list[dict]:
+    """Meetings, live ones first, then closed ones newest-ended first.
+
+    `day` is a local calendar date (YYYY-MM-DD in CONFIG.timezone) and filters
+    CLOSED meetings only — a live meeting is always listed, whatever day it was
+    called on. A filter that could hide a meeting still waiting on someone would
+    be a filter that hides the one thing this console exists to show; "narrow the
+    history" must never quietly mean "narrow the present".
+
+    Closed meetings sort by `closed_at`, not `created_at`: history reads in the
+    order things finished, and a long meeting called on Monday and closed on
+    Friday belongs at Friday. Ordering by created_at instead puts it in Monday's
+    slot, where nobody looking for what happened on Friday will find it.
+    """
     _sweep_timeouts(db_path)
     with connect(db_path) as conn:
-        sql = "SELECT thread_id FROM meetings"
+        where, params = [], []
         if not include_closed:
-            sql += " WHERE state!='closed'"
-        sql += " ORDER BY (priority='urgent') DESC,created_at DESC"
-        ids = [r["thread_id"] for r in conn.execute(sql).fetchall()]
+            where.append("state!='closed'")
+        elif day:
+            _valid_day(day)
+            # A closed meeting belongs to the local day it CLOSED on. closed_at
+            # is UTC, so compare in CONFIG.timezone rather than by string prefix
+            # — a prefix match silently answers a different question everywhere
+            # the offset is not zero, which is everywhere this desk runs.
+            lo, hi = _local_day_bounds(day)
+            where.append("(state!='closed' OR (closed_at >= ? AND closed_at < ?))")
+            params += [lo, hi]
+        sql = "SELECT thread_id FROM meetings"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        # Live first (urgent ahead of normal), then closed newest-ended first.
+        #
+        # Priority ranks the LIVE block only. It answers "what needs you now",
+        # which a finished meeting cannot; applying it to history hoists every
+        # urgent meeting into its own block and cuts the timeline in two, so
+        # 07-15 lands above 07-14 and reading the day back is impossible.
+        # COALESCE keeps a legacy closed row with no closed_at off the top.
+        sql += (" ORDER BY (state='closed'),"
+                " CASE WHEN state!='closed' AND priority='urgent' THEN 0 ELSE 1 END,"
+                " COALESCE(closed_at, created_at) DESC")
+        ids = [r["thread_id"] for r in conn.execute(sql, params).fetchall()]
     return [meeting_status(i, db_path=db_path, sweep=False) for i in ids]
+
+
+def _valid_day(day: str) -> None:
+    try:
+        dt.date.fromisoformat(day)
+    except (TypeError, ValueError):
+        raise ValueError(f"day must be YYYY-MM-DD, got {day!r}") from None
+
+
+def _local_day_bounds(day: str) -> tuple[str, str]:
+    """[start, end) of a local calendar day, as the UTC ISO strings the DB holds."""
+    tz = CONFIG.tzinfo()
+    start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time.min, tzinfo=tz)
+    return (start.astimezone(dt.timezone.utc).isoformat(),
+            (start + dt.timedelta(days=1)).astimezone(dt.timezone.utc).isoformat())
+
+
+def meeting_days(db_path: Path | str | None = None) -> list[str]:
+    """Local dates that have at least one closed meeting, newest first — so the
+    console can offer real choices instead of a blank date box."""
+    tz = CONFIG.tzinfo()
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT COALESCE(closed_at, updated_at) AS t FROM meetings "
+            "WHERE state='closed' AND t IS NOT NULL").fetchall()
+    days = {dt.datetime.fromisoformat(r["t"]).astimezone(tz).date().isoformat()
+            for r in rows}
+    return sorted(days, reverse=True)
 
 
 def meeting_transcript(thread_id: str, *,
@@ -1999,8 +2092,14 @@ def _apply_supervisor_payload(verified: auth.VerifiedAssertion, *,
                 meeting = _meeting(conn, thread_id)
             next_state = ("consensus" if meeting["messages_remaining"] <=
                           meeting["consensus_threshold"] else "active")
+            # closed_at is cleared: a live meeting has not ended, so it cannot
+            # carry an end time. Leaving the old one is a row that contradicts
+            # itself, and list_meetings ranks the live block by
+            # COALESCE(closed_at, created_at) — a reopened meeting would sort by
+            # when it used to finish rather than when it started.
             conn.execute(
-                "UPDATE meetings SET state=?,updated_at=? WHERE thread_id=?",
+                "UPDATE meetings SET state=?,updated_at=?,closed_at=NULL "
+                "WHERE thread_id=?",
                 (next_state, now, thread_id),
             )
             # Reopening must also grant a fresh idle window, as every mailbox

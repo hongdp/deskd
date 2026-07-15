@@ -36,7 +36,7 @@ dialog{width:min(620px,calc(100vw - 24px));border:1px solid var(--line);border-r
 <main>
   <div class="header">
     <div><div class="eyebrow">Supervisor oversight</div><h2 id="title">Select a meeting</h2><div class="sub" id="subtitle">Watch, call, and join agent meetings</div></div>
-    <div class="auth"><div><label>Supervisor access code</label><input id="access-code" type="password" autocomplete="current-password" placeholder="printed by the server at startup, or set in .env"></div><button class="btn" id="remember">Keep for session</button></div>
+    <div class="auth" id="auth-box" hidden><div><label>Supervisor access code</label><input id="access-code" type="password" autocomplete="current-password" placeholder="printed by the server at startup, or set in .env"></div><button class="btn" id="remember">Keep for session</button></div>
   </div>
   <div class="security" id="security">Reading auth mode…</div>
   <div class="layout">
@@ -91,7 +91,10 @@ var meetings=[],selected=null,detail=null,delivery={};
 // META comes from /api/meeting-meta: the supervisor identity, the registered
 // roles, the auth modes in force, and the name of the access-code header (it is
 // derived from the project name server-side). Nothing here is hardcoded.
-var META={supervisor_role:"supervisor",roles:[],code_header:"",wait_timeout_seconds:300};
+// `access_code_required` defaults TRUE so a failed/stale meta fetch asks for a
+// code rather than firing actions without one: the client fails closed, even
+// though the server is the one that decides.
+var META={supervisor_role:"supervisor",roles:[],code_header:"",wait_timeout_seconds:300,access_code_required:true};
 function $(s){return document.querySelector(s)}
 function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
 function fmt(v){return v?new Date(v).toLocaleString([],{month:"short",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}):"—"}
@@ -103,9 +106,13 @@ async function api(url,opts){var r=await fetch(url,opts);var data=await r.json()
 // Every supervisor mutation goes through the authenticated adapter; the code is
 // sent per-request and never stored anywhere but this browser session.
 async function supervisor(payload){
-  if(!code())throw new Error("enter the supervisor access code");
   var headers={"Content-Type":"application/json"};
-  headers[META.code_header]=code();
+  // No code field in `open` mode: an input that accepts anything and sends
+  // nothing would leave an operator believing a credential is still in play.
+  if(META.access_code_required){
+    if(!code())throw new Error("enter the supervisor access code");
+    headers[META.code_header]=code();
+  }
   return api("/api/meetings/supervisor-action",{method:"POST",headers:headers,body:JSON.stringify({payload:payload})});
 }
 function renderCallRoles(){
@@ -119,8 +126,12 @@ async function meta(){
   META=await api("/api/meeting-meta");
   $("#sla-quiet").textContent=(META.wait_timeout_seconds||300)+"s";
   renderCallRoles();
+  $("#auth-box").hidden=!META.access_code_required;
   var n=$("#security");
-  if(META.simple_auth_enabled){
+  if(META.supervisor_auth_mode==="open"){
+    n.className="security bad";
+    n.textContent="authentication is OFF (DESKD_SUPERVISOR_AUTH_MODE=open): anyone who can reach this page acts as supervisor, with no access code. Set the mode back to simple and restart to require one.";
+  }else if(META.simple_auth_enabled){
     n.className="security";
     n.textContent="simple auth: one access code authorizes supervisor actions. The code is never written into a meeting, and never embedded in this page. Set DESKD_SUPERVISOR_AUTH_MODE=signed or hybrid to require an Ed25519 assertion signed off-host.";
   }else{

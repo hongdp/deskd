@@ -364,6 +364,13 @@ def _migrate(conn) -> None:
         conn.execute("ALTER TABLE agent_sessions ADD COLUMN session_day TEXT")
     if "phase" not in cols:
         conn.execute("ALTER TABLE agent_sessions ADD COLUMN phase TEXT")
+    # NOTE: only agent_* tables belong here. A migration for a lower layer's
+    # table must live in that layer — `meetings.closed_at` was briefly added
+    # here, which made it unreachable for a host that uses meetings without
+    # orchestration (a supported configuration: meetings._known_roles falls back
+    # to CONFIG.role_names() precisely so that works). Its list_meetings then
+    # raised `no such column: closed_at` on any pre-existing DB, and nothing
+    # noticed, because the meetings-only shape is the one nothing exercises.
     # Legacy DBs (including one adopted from a host that predates deskd) may
     # still enumerate roles/sources/kinds in CHECK constraints. Drop them so the
     # host's own vocabulary works; Python validates instead.
@@ -1950,8 +1957,16 @@ def _delivery_health(conn, now_iso: str) -> dict:
             stuck += 1
         elif st == "escalated":
             escalated += 1
+    # Same rule as the rows above, for the same reason: a closed thread's failed
+    # escalation is history, not a call to action. Nobody can rejoin the
+    # conversation to answer it, so counting it pins this gauge above zero
+    # forever — 35 of one desk's 39 were exactly that, which is how the number
+    # became scenery and the 4 that were about a live, unanswered meeting hid
+    # inside it. The rows stay; only the alarm narrows.
     unsent = conn.execute(
-        "SELECT COUNT(*) FROM meeting_escalations WHERE status!='sent'").fetchone()[0]
+        """SELECT COUNT(*) FROM meeting_escalations e
+           JOIN mailbox_threads t ON t.id=e.thread_id
+           WHERE e.status!='sent' AND t.status != 'closed'""").fetchone()[0]
     age = None
     if oldest_unread:
         age = int((_now() - dt.datetime.fromisoformat(oldest_unread)).total_seconds())

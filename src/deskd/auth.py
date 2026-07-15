@@ -86,6 +86,7 @@ __all__ = [
     "simple_auth_enabled",
     "signed_auth_enabled",
     "simple_access_code",
+    "access_code_required",
     "access_code_is_ephemeral",
     "verify_access_code",
     "verify_bytes",
@@ -532,7 +533,10 @@ def mint_simple(action_payload: dict, *, actions: ActionAllowlist,
         "nonce": f"simple-{os.urandom(16).hex()}",
         "issued_at": _iso(now),
         "expires_at": _iso(now + dt.timedelta(minutes=5)),
-        "auth_mode": "simple",
+        # The real mode, not the literal "simple": in `open` the ledger is the
+        # only remaining record that this action arrived with no credential, and
+        # a row claiming "simple" would overstate the identity behind it.
+        "auth_mode": auth_mode(),
     })
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return VerifiedAssertion(payload=payload, raw=raw, signature=b"simple-web-auth")
@@ -540,12 +544,12 @@ def mint_simple(action_payload: dict, *, actions: ActionAllowlist,
 
 # --- simple mode: access code ----------------------------------------------
 
-_VALID_MODES = ("simple", "signed", "hybrid")
+_VALID_MODES = ("simple", "signed", "hybrid", "open")
 _EPHEMERAL_CODE: str | None = None
 
 
 def auth_mode() -> str:
-    """``simple`` | ``signed`` | ``hybrid`` from ``DESKD_SUPERVISOR_AUTH_MODE``.
+    """``simple`` | ``signed`` | ``hybrid`` | ``open`` from ``DESKD_SUPERVISOR_AUTH_MODE``.
 
     One name runs through the whole trust boundary: the ``SUPERVISOR_`` env
     knobs, the ``config.SUPERVISOR_*`` constants, the role
@@ -557,6 +561,17 @@ def auth_mode() -> str:
 
     Note the default (``simple``) leaves the signed path DISABLED. Set
     ``signed`` or ``hybrid`` to accept Ed25519 assertions.
+
+    ``open`` runs the simple action path with NO credential at all: every caller
+    that can reach the socket is the supervisor. It exists because the
+    alternative people actually reach for is worse — a code they paste into a
+    chat log, mail to themselves, or hardcode into the console (this project has
+    already done the last one). An operator who has decided the socket *is* the
+    boundary should say so in one legible place rather than keep a credential
+    that is only theatre. It is never the default, and nothing infers it: an
+    unset variable stays ``simple``, so this mode only exists where somebody
+    typed it. Pair it with a bind address you trust — on ``0.0.0.0`` it hands
+    supervisor authority to the whole network segment.
     """
     mode = (env("SUPERVISOR_AUTH_MODE") or "simple").strip().lower()
     if mode not in _VALID_MODES:
@@ -567,7 +582,27 @@ def auth_mode() -> str:
 
 
 def simple_auth_enabled() -> bool:
-    return auth_mode() in {"simple", "hybrid"}
+    """True when the access-code action path is reachable.
+
+    ``open`` is included: it uses that same path, minus the credential. Callers
+    asking "is this endpoint live?" want it in; callers asking "must I present a
+    code?" want :func:`access_code_required` instead. Conflating the two is what
+    would make ``open`` look like a disabled endpoint (403) rather than an
+    unauthenticated one.
+    """
+    return auth_mode() in {"simple", "hybrid", "open"}
+
+
+def access_code_required() -> bool:
+    """Must a caller present an access code to act as supervisor?
+
+    False only in ``open`` mode. This is THE reader of that policy: consoles ask
+    it before rendering a code field, servers ask it before warning at startup,
+    and :func:`verify_access_code` asks it before comparing. A second reader
+    somewhere else is how a console ends up demanding a code the verifier does
+    not want, or worse, how one gets skipped where it is still required.
+    """
+    return simple_auth_enabled() and auth_mode() != "open"
 
 
 def signed_auth_enabled() -> bool:
@@ -584,7 +619,10 @@ def simple_access_code() -> str | None:
     this module never logs it.
     """
     global _EPHEMERAL_CODE
-    if not simple_auth_enabled():
+    if not access_code_required():
+        # Includes `open`, where there is no code to mint or show. Generating one
+        # anyway would put a credential in the startup log that nothing checks —
+        # an operator would reasonably read that as proof they are protected.
         return None
     configured = env("SUPERVISOR_ACCESS_CODE")
     if configured:
@@ -597,16 +635,25 @@ def simple_access_code() -> str | None:
 def access_code_is_ephemeral() -> bool:
     """True when the code was generated for this process rather than configured
     — i.e. it dies on restart and should be shown to the operator."""
-    return simple_auth_enabled() and not env("SUPERVISOR_ACCESS_CODE")
+    return access_code_required() and not env("SUPERVISOR_ACCESS_CODE")
 
 
 def verify_access_code(presented: str | None) -> bool:
-    """Constant-time access-code check. Use this — never ``==``.
+    """Is this caller authorized to act as supervisor on the simple path?
 
-    A plain string compare leaks the code one character at a time through timing.
-    An empty/absent presented code is always false, so a missing header can never
+    Constant-time when a code is required — use this, never ``==``: a plain
+    string compare leaks the code one character at a time through timing. An
+    empty/absent presented code is always false, so a missing header can never
     match a missing configuration.
+
+    In ``open`` mode this returns True for anything, including nothing. That is
+    the mode's entire meaning, and it lives here rather than in each caller so
+    that every server asking "is this authorized?" gets one answer from one
+    place. Callers must still gate the endpoint on :func:`simple_auth_enabled`;
+    this function answers authorization, not reachability.
     """
+    if not access_code_required():
+        return simple_auth_enabled()
     expected = simple_access_code()
     if not expected or not presented:
         return False
