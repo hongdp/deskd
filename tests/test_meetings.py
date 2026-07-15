@@ -223,22 +223,35 @@ def test_a_one_to_one_message_creates_a_tracked_response_obligation(desk):
     assert not [o for o in owed if o["status"] == "pending"]
 
 
-def test_transport_rejects_stacked_unresolved_questions(desk):
-    """You cannot ask a second question before the first is answered. Without
-    this, one agent talks past the other and the SLA tracks a queue rather than
-    a conversation."""
-    thread_id = _start("no stacking", ["alpha", "beta"])
+def test_meetings_track_stacked_questions_instead_of_refusing_them(desk):
+    """This was test_transport_rejects_stacked_unresolved_questions, and it was
+    green for the wrong reason. Meetings never passes requires_reply, so the
+    transport's stacking bound is unreachable from this layer — it guards
+    mailbox.send_message callers, and test_mailbox covers it there. What
+    actually refused a second question here was the one_to_one turn-taking gate,
+    which is gone: it silenced whoever was present on behalf of whoever was slow.
+
+    Stacking is now allowed and *tracked*. The old docstring's worry was that
+    "the SLA tracks a queue rather than a conversation" — that is now the design,
+    not the failure. A queue whose every item has an owner and a due date is
+    exactly what the wake ladder can act on, and one answer can settle several
+    at once (see test_one_reply_can_settle_several_questions_at_once). Refusing
+    the second question never made the first one get answered.
+    """
+    thread_id = _start("stacking is tracked", ["alpha", "beta"])
     first = meetings.send_update(thread_id, role="alpha", kind="question",
-                                 body="first question")
+                                 body="first question")["message_id"]
+    second = meetings.send_update(thread_id, role="alpha", kind="question",
+                                  body="second question, entirely different")["message_id"]
+    # And the party who owes the replies may change the subject — the debts stand.
+    meetings.send_update(thread_id, role="beta", kind="evidence",
+                         body="an unrelated new topic")
 
-    with pytest.raises(ValueError, match=f"#{first['message_id']}"):
-        meetings.send_update(thread_id, role="alpha", kind="question",
-                             body="second question, entirely different")
-
-    # And the party who OWES the reply cannot change the subject either.
-    with pytest.raises(ValueError, match="requires a reply"):
-        meetings.send_update(thread_id, role="beta", kind="evidence",
-                             body="an unrelated new topic")
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert (owed[first]["owed_by"], owed[first]["status"]) == ("beta", "pending")
+    assert (owed[second]["owed_by"], owed[second]["status"]) == ("beta", "pending"), (
+        "both questions must be tracked, each carrying its own SLA")
 
 
 def test_transport_rejects_duplicate_messages(desk):
@@ -692,3 +705,134 @@ def test_an_agent_cannot_invite_the_supervisor(desk):
     with pytest.raises(ValueError, match="cannot add"):
         meetings.call_meeting(agenda="come join us", called_by="alpha",
                               attendees=["alpha", CONFIG.supervisor_role])
+
+
+def test_an_agent_can_answer_the_supervisor_alone_in_a_one_to_one_meeting(desk):
+    """The invariant is authorship, not addressing — and conflating the two
+    deadlocks the meeting. Naming the supervisor as a recipient forges nothing,
+    so that door stays open while test_agent_meeting_api_rejects_the_supervisor_role
+    keeps authorship shut.
+
+    This test used to assert a second door as well: strict turn-taking refusing
+    any new topic until the outstanding reply was made. That door is gone. It
+    never protected authorship — it was a pull-era stand-in for delivery
+    receipts — and it silenced whoever was present on behalf of whoever was
+    slow, which deadlocked the console outright the moment the debt was the
+    supervisor's. Changing the subject is now allowed; the debt survives it, and
+    is nudged rather than enforced.
+    """
+    called = meetings.apply_simple_supervisor_action(
+        {"action": "call", "agenda": "one on one", "attendees": ["alpha"]})
+    thread_id = called["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="alpha")
+    ask = meetings.apply_simple_supervisor_action(
+        {"action": "send", "meeting_id": thread_id, "body": "analyze this"},
+    )["message_id"]
+
+    # Speaking out of turn is not refused any more...
+    meetings.send_update(thread_id, role="alpha", kind="evidence",
+                         body="changing the subject instead")
+    # ...and doing so does NOT quietly mark the question answered. A ledger that
+    # settles itself on any outgoing message is a dropped message with clean books.
+    owed = meetings.meeting_status(thread_id)["response_obligations"]
+    assert [o["status"] for o in owed if o["message_id"] == ask] == ["pending"], (
+        "an unrelated message must leave the supervisor's question outstanding")
+
+    meetings.send_update(thread_id, role="alpha", kind="answer", reply_to=ask,
+                         body="here is the analysis you asked for")
+
+    obligations = meetings.meeting_status(thread_id)["response_obligations"]
+    assert [o["status"] for o in obligations if o["message_id"] == ask] == ["resolved"], (
+        "an explicit reply must discharge the supervisor's obligation")
+    with _db() as conn:
+        recipient = conn.execute(
+            "SELECT recipient FROM mailbox_messages WHERE reply_to=?", (ask,),
+        ).fetchone()["recipient"]
+    assert recipient == CONFIG.supervisor_role, (
+        "the reply must be addressed to the supervisor, not broadcast — an "
+        "obligation owed by a broadcast is owed by nobody")
+
+
+def test_one_reply_can_settle_several_questions_at_once(desk):
+    """reply_to threads at exactly one message, so when it was also the only way
+    to discharge a debt, two questions cost two replies — the ping-pong the
+    turn-taking gate then enforced. `resolves` is the separate act: what this
+    message settles, decided by the only party that knows, the sender."""
+    thread_id = _start("two questions", ["alpha", "beta"])
+    q1 = meetings.send_update(thread_id, role="alpha", kind="question",
+                              body="does the thesis still hold")["message_id"]
+    # alpha may ask again without waiting — no gate, and the debts stack.
+    q2 = meetings.send_update(thread_id, role="alpha", kind="question",
+                              body="and what is the downside case")["message_id"]
+
+    answer = meetings.send_update(
+        thread_id, role="beta", kind="answer", reply_to=q1,
+        resolves=[q2], body="yes, and the downside is a 12% drawdown")["message_id"]
+
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert owed[q1]["status"] == "resolved" and owed[q1]["resolution"] == "explicit reply"
+    assert owed[q2]["status"] == "resolved", "one answer settled both questions"
+    assert owed[q2]["resolved_by_message_id"] == answer
+    assert owed[q2]["resolution"] == f"covered by #{answer}"
+
+
+def test_an_agent_can_settle_a_debt_its_earlier_message_already_answered(desk):
+    """Noticing after the fact must not cost a redundant "as I said above"
+    message: that trains noise, and a debt left pending because replying felt
+    silly is a reply the counterpart never gets."""
+    thread_id = _start("already covered", ["alpha", "beta"])
+    broad = meetings.send_update(thread_id, role="beta", kind="evidence",
+                                 body="the downside case is a 12% drawdown")["message_id"]
+    ask = meetings.send_update(thread_id, role="alpha", kind="question",
+                               body="what is the downside case")["message_id"]
+    covering = meetings.send_update(thread_id, role="beta", kind="evidence",
+                                    body="restating: 12% drawdown, as measured")["message_id"]
+
+    out = meetings.resolve_obligations(thread_id, role="beta",
+                                       message_ids=[ask], covered_by=covering)
+    assert out["discharged"] == [ask]
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert owed[ask]["status"] == "resolved"
+    assert owed[ask]["resolved_by_message_id"] == covering
+
+    # A message that predates the question cannot have answered it — allowing it
+    # would let resolved_by_message_id lie about causality.
+    ask2 = meetings.send_update(thread_id, role="alpha", kind="question",
+                                body="and the upside")["message_id"]
+    with pytest.raises(ValueError, match="did not come after"):
+        meetings.resolve_obligations(thread_id, role="beta",
+                                     message_ids=[ask2], covered_by=broad)
+
+
+def test_an_agent_cannot_settle_a_debt_it_does_not_owe(desk):
+    """"Never create both sides": discharging a counterpart's obligation would
+    let an agent answer on behalf of someone it cannot speak for, and the ledger
+    would record a reply that never happened."""
+    thread_id = _start("not yours to settle", ["alpha", "beta"])
+    ask = meetings.send_update(thread_id, role="alpha", kind="question",
+                               body="does the thesis still hold")["message_id"]
+    mine = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                                body="adding context to my own question")["message_id"]
+    # The debt on `ask` is beta's; alpha must not clear it.
+    with pytest.raises(ValueError, match="owed by beta"):
+        meetings.resolve_obligations(thread_id, role="alpha",
+                                     message_ids=[ask], covered_by=mine)
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert owed[ask]["status"] == "pending"
+
+
+def test_addressing_the_supervisor_stays_shut_outside_a_meeting_it_sits_in(desk):
+    """The addressing door is opened by the meetings module for an attending
+    supervisor only. Left open by default it would let any mailbox caller
+    conjure supervisor-addressed traffic the console would render as a real
+    exchange, so the raw ledger must still refuse."""
+    thread_id = _start("agents only", ["alpha", "beta"])
+    with _db() as conn:
+        thread = mailbox._refresh_thread(conn, thread_id)
+        with pytest.raises(ValueError, match="not an agent role"):
+            mailbox._insert_message(conn, thread, sender="alpha",
+                                    recipient=CONFIG.supervisor_role,
+                                    kind="evidence", body="psst")

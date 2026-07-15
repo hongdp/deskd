@@ -263,6 +263,18 @@ def build_parser() -> argparse.ArgumentParser:
     mt_s.add_argument("--kind", choices=MEETING_KINDS, default="evidence")
     mt_s.add_argument("--body", required=True)
     mt_s.add_argument("--reply-to", type=int)
+    mt_s.add_argument("--resolves", type=int, nargs="+", metavar="MSG_ID",
+                      help="response obligations this message settles (may be "
+                           "several; independent of --reply-to)")
+    mt_r = mt.add_parser("resolve",
+                         help="settle obligations an earlier message of yours "
+                              "already answered, without saying anything new")
+    mt_r.add_argument("meeting")
+    _add_role(mt_r, "--role")
+    mt_r.add_argument("--covered-by", type=int, required=True, metavar="MSG_ID",
+                      help="your own message that answered them")
+    mt_r.add_argument("--resolves", type=int, nargs="+", required=True,
+                      metavar="MSG_ID", help="obligations it covers")
     mt_p = mt.add_parser("position")
     mt_p.add_argument("meeting")
     _add_role(mt_p, "--role")
@@ -480,7 +492,12 @@ def _cmd_meeting(args) -> None:
                                         mark_read=args.mark_read)
     elif args.meeting_cmd == "send":
         out = meetings.send_update(args.meeting, role=args.role, body=args.body,
-                                   kind=args.kind, reply_to=args.reply_to)
+                                   kind=args.kind, reply_to=args.reply_to,
+                                   resolves=args.resolves)
+    elif args.meeting_cmd == "resolve":
+        out = meetings.resolve_obligations(args.meeting, role=args.role,
+                                           message_ids=args.resolves,
+                                           covered_by=args.covered_by)
     elif args.meeting_cmd == "position":
         out = meetings.submit_position(args.meeting, role=args.role, body=args.body,
                                        reply_to=args.reply_to)

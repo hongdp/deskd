@@ -234,3 +234,38 @@ def test_migrating_a_legacy_row_does_not_disturb_directed_rows(desk):
         ).fetchone()[0] == 0
     # gamma was never a recipient of the directed row and must not become one.
     assert directed["id"] not in [m["id"] for m in mailbox.inbox("gamma")]
+
+
+# --- the transport's own reply bounds ---------------------------------------
+
+def test_the_transport_refuses_stacked_requests_and_says_which_one(desk):
+    """design.md: "The transport rejects duplicates and stacked unresolved
+    questions." This is that claim's only real coverage.
+
+    It used to be asserted one layer up, by a meetings test named for the
+    transport — but meetings never passes `requires_reply`, so that test was
+    green off the one_to_one turn-taking gate and the bound below never ran.
+    When the gate went, the claim was left with nothing testing it at all.
+    Meetings deliberately does not opt in (it tracks obligations instead, which
+    a host may stack and settle in batches); this bound guards the callers who
+    DO ask for it, so it is pinned where it actually lives.
+    """
+    thread = mailbox.open_thread("one open question at a time")
+    first = mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
+                                 kind="question", body="does the thesis hold",
+                                 requires_reply=True)
+
+    with pytest.raises(ValueError, match=f"#{first['id']}"):
+        mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
+                             kind="question", body="and what is the downside",
+                             requires_reply=True)
+
+    # The bound is per-recipient, not per-thread: gamma holds no open question,
+    # so alpha asking gamma is a different conversation, not a stacked one.
+    mailbox.send_message(thread["id"], sender="alpha", recipient="gamma",
+                         kind="question", body="and what is the downside",
+                         requires_reply=True)
+
+    # A request that does not demand a reply was never bounded by this.
+    mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
+                         kind="note", body="no answer needed on this one")

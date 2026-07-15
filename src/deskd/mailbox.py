@@ -461,6 +461,7 @@ def _insert_message(conn: sqlite3.Connection, thread: sqlite3.Row, *, sender: st
                     artifact_path: str | None = None,
                     requires_reply: bool = False, reply_to: int | None = None,
                     allow_authenticated_supervisor: bool = False,
+                    allow_supervisor_recipient: bool = False,
                     allow_reference_reply: bool = False,
                     now: dt.datetime | None = None) -> int:
     """Append one message to an open thread, enforcing every budget.
@@ -473,6 +474,15 @@ def _insert_message(conn: sqlite3.Connection, thread: sqlite3.Row, *, sender: st
     ``CONFIG.supervisor_role`` may author a message. Only the meetings module
     may open it, and only after verifying an Ed25519 assertion and burning its
     nonce — never in response to an agent's say-so.
+
+    ``allow_supervisor_recipient`` is the mirror door on the *addressing* side:
+    it lets an agent send a message TO the supervisor. The invariant these gates
+    protect is sender authenticity — an agent must never *speak as* the
+    supervisor — and naming the supervisor as a recipient forges nothing and
+    confers no authority. Only the meetings module may open it, and only for a
+    meeting the supervisor has actually checked into: a one-to-one meeting with
+    the supervisor mandates an explicit reply, so without this door that reply
+    is unsendable and the protocol deadlocks.
     """
     now = now or _now()
     if thread["status"] != "open":
@@ -484,7 +494,10 @@ def _insert_message(conn: sqlite3.Connection, thread: sqlite3.Row, *, sender: st
             raise ValueError(f"{sender} is not an agent role")
     else:
         sender = _role(conn, sender)
-    recipient = _role(conn, recipient, recipient=True)
+    if recipient == CONFIG.supervisor_role and allow_supervisor_recipient:
+        recipient = CONFIG.supervisor_role
+    else:
+        recipient = _role(conn, recipient, recipient=True)
     if sender == recipient:
         raise ValueError("sender and recipient must differ")
     if kind not in MESSAGE_KINDS:

@@ -372,6 +372,54 @@ def _resolve_obligations(conn, thread_id: str, role: str, *,
     return int(cursor.rowcount)
 
 
+def _discharge_obligations(conn, thread_id: str, role: str,
+                           message_ids: Sequence[int], by_message_id: int,
+                           now: str | None = None) -> list[int]:
+    """Settle obligations owed BY `role`, citing `role`'s own covering message.
+
+    Judgement decides what answers what; the transport cannot. One reply
+    routinely settles several outstanding questions, and only its author knows
+    that it did — so the engine refuses to guess. It checks only what is
+    checkable, and each refusal below is a caller bug, not a protocol bound:
+
+    * the obligation is this thread's, still pending, and owed by this role —
+      discharging someone else's debt would let an agent answer for a
+      counterpart it cannot speak for ("never create both sides");
+    * the citing message came AFTER the question. A message cannot have
+      answered one asked later, and allowing it would make the ledger's
+      resolved_by_message_id lie about causality.
+
+    Blanket auto-settling on any outgoing message was the tempting shortcut and
+    is exactly wrong: an agent that changes the subject would silently mark the
+    question answered, which is a dropped message wearing a clean ledger.
+    """
+    now = now or _iso()
+    discharged = []
+    for message_id in message_ids:
+        row = conn.execute(
+            "SELECT * FROM meeting_response_obligations WHERE message_id=? AND thread_id=?",
+            (message_id, thread_id),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"#{message_id} carries no response obligation in this meeting")
+        if row["owed_by"] != role:
+            raise ValueError(
+                f"#{message_id} is owed by {row['owed_by']}, not {role}")
+        if row["status"] != "pending":
+            raise ValueError(f"#{message_id} is already {row['status']}")
+        if by_message_id <= message_id:
+            raise ValueError(
+                f"#{by_message_id} cannot answer #{message_id}: it did not come after it")
+        conn.execute(
+            """UPDATE meeting_response_obligations
+               SET status='resolved',resolved_at=?,resolution=?,resolved_by_message_id=?
+               WHERE message_id=?""",
+            (now, f"covered by #{by_message_id}", by_message_id, message_id),
+        )
+        discharged.append(message_id)
+    return discharged
+
+
 def _waive_pending_obligations(conn, thread_id: str, reason: str) -> int:
     now = _iso()
     cursor = conn.execute(
@@ -1212,7 +1260,8 @@ def wait_for_updates(thread_id: str, *, role: str, wait_seconds: int = 0,
 
 def _send_update(conn, thread_id: str, role: str, body: str, kind: str,
                  auth_nonce: str | None = None,
-                 reply_to: int | None = None) -> tuple[int, int | None]:
+                 reply_to: int | None = None,
+                 resolves: Sequence[int] | None = None) -> tuple[int, int | None]:
     supervisor = CONFIG.supervisor_role
     meeting = _meeting(conn, thread_id)
     _attendee(conn, thread_id, role, checked_in=True)
@@ -1267,23 +1316,21 @@ def _send_update(conn, thread_id: str, role: str, body: str, kind: str,
     elif preamble:
         recipient = BROADCAST
     elif mode == "one_to_one":
-        # Strict turn-taking: an outstanding obligation must be discharged
-        # before anyone speaks again, so neither side can talk past the other.
-        pending = conn.execute(
-            """SELECT o.*,mm.sender FROM meeting_response_obligations o
-               JOIN mailbox_messages mm ON mm.id=o.message_id
-               WHERE o.thread_id=? AND o.status='pending' ORDER BY o.message_id LIMIT 1""",
-            (thread_id,),
-        ).fetchone()
-        if pending:
-            if pending["owed_by"] == role:
-                raise ValueError(
-                    f"one-to-one meeting requires a reply to message #{pending['message_id']}"
-                )
-            raise ValueError(
-                f"await the required response to message #{pending['message_id']} "
-                f"before sending again"
-            )
+        # No turn-taking gate here, deliberately. Strict alternation used to be
+        # enforced at this point: an outstanding obligation refused EVERY send,
+        # so whoever was still present got silenced on behalf of whoever had
+        # gone quiet — and when the debt was the supervisor's, the console could
+        # not speak at all. That gate was a pull-era proxy for "you may not have
+        # seen their message yet"; delivery receipts answer that question
+        # precisely now, and the orchestrator pushes.
+        #
+        # Liveness was never this gate's job: an obligation carries an SLA that
+        # becomes an urgent task and climbs the wake ladder. What the gate did
+        # produce was dropped messages, because a rejected insert is the ONE way
+        # a message is lost here — once the row exists, delivery + wake land it
+        # however late the sender was. So the debt is now tracked and nudged,
+        # never enforced at the door. See _discharge_obligations: settling it is
+        # the sender's judgement, which is the only place that knowledge lives.
         recipient = next(r for r in active_roles if r != role)
     else:
         recipient = BROADCAST
@@ -1294,6 +1341,11 @@ def _send_update(conn, thread_id: str, role: str, body: str, kind: str,
         conn, thread, sender=role, recipient=recipient, kind=kind,
         body=_clean(body, "message"), reply_to=reply_to,
         allow_authenticated_supervisor=(role == supervisor),
+        # An agent replying to the supervisor addresses a human who is sitting
+        # in this meeting; it never speaks as one. Gated on actual attendance so
+        # the supervisor cannot be addressed in a meeting it is not in.
+        allow_supervisor_recipient=(recipient == supervisor
+                                    and _has_supervisor(conn, thread_id)),
         allow_reference_reply=(reply_to is not None),
     )
     now = _iso()
@@ -1308,6 +1360,12 @@ def _send_update(conn, thread_id: str, role: str, body: str, kind: str,
             "INSERT INTO meeting_message_auth(message_id,auth_nonce) VALUES (?,?)",
             (message_id, auth_nonce),
         )
+    if resolves:
+        # Settled by the sender's own judgement, alongside (not instead of) the
+        # reply_to link below: one answer routinely closes several outstanding
+        # questions, and reply_to points at exactly one. Conflating "what am I
+        # replying to" with "what did I just settle" is what forced the ping-pong.
+        _discharge_obligations(conn, thread_id, role, resolves, message_id, now)
     if reply_to is not None:
         conn.execute(
             """UPDATE meeting_response_obligations
@@ -1348,11 +1406,17 @@ def _send_update(conn, thread_id: str, role: str, body: str, kind: str,
 
 def send_update(thread_id: str, *, role: str, body: str, kind: str = "evidence",
                 reply_to: int | None = None,
+                resolves: Sequence[int] | None = None,
                 db_path: Path | str | None = None) -> dict:
+    """Say something. `reply_to` threads it; `resolves` settles the debts this
+    message discharges — several at once, and independently of what it replies
+    to. Nothing here is refused for speaking out of turn.
+    """
     with connect(db_path, write=True) as conn:
         role = _agent_role(conn, role)
         message_id, escalation_id = _send_update(
             conn, thread_id, role, body, kind, reply_to=reply_to,
+            resolves=resolves,
         )
     if escalation_id:
         dispatch_escalation(escalation_id, db_path=db_path)
@@ -1366,6 +1430,41 @@ def send_update(thread_id: str, *, role: str, body: str, kind: str = "evidence",
             f"request + escalation"
         )
     return out
+
+
+def resolve_obligations(thread_id: str, *, role: str, message_ids: Sequence[int],
+                        covered_by: int,
+                        db_path: Path | str | None = None) -> dict:
+    """Settle debts an already-sent message of yours turned out to answer.
+
+    The retroactive half of `send_update(resolves=...)`, for when you notice
+    after the fact — a question you had already covered, or two questions your
+    one answer addressed. Saying nothing new is the point: forcing a fresh
+    message just to clear the ledger trains agents to emit "as I said above"
+    noise, and an obligation left pending because replying felt redundant is a
+    reply the counterpart never gets.
+
+    The debt must be yours and the citing message must post-date it; see
+    _discharge_obligations.
+    """
+    with connect(db_path, write=True) as conn:
+        role = _agent_role(conn, role)
+        _attendee(conn, thread_id, role, checked_in=True)
+        covering = conn.execute(
+            "SELECT * FROM mailbox_messages WHERE id=? AND thread_id=?",
+            (covered_by, thread_id),
+        ).fetchone()
+        if not covering:
+            raise ValueError(f"#{covered_by} is not a message in this meeting")
+        if covering["sender"] != role:
+            raise ValueError(
+                f"#{covered_by} is {covering['sender']}'s message; cite your own")
+        discharged = _discharge_obligations(
+            conn, thread_id, role, message_ids, covered_by)
+        _event(conn, thread_id, "obligations_discharged", role,
+               f"#{covered_by} covers " + ", ".join(f"#{m}" for m in discharged))
+    return {"discharged": discharged, "covered_by": covered_by,
+            "meeting": meeting_status(thread_id, db_path=db_path)}
 
 
 def submit_position(thread_id: str, *, role: str, body: str,
