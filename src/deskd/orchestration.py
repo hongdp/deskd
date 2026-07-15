@@ -151,7 +151,8 @@ CREATE TABLE IF NOT EXISTS message_delivery (
 CREATE TABLE IF NOT EXISTS wake_attempts (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     role                  TEXT NOT NULL,
-    reason_kind           TEXT NOT NULL,   -- meeting_wake / stuck_delivery / urgent_task / inbox
+    reason_kind           TEXT NOT NULL,   -- meeting_wake / stuck_delivery /
+                                          -- urgent_task / inbox / owed_reply
     source_ref            TEXT NOT NULL,
     channel               TEXT NOT NULL,   -- a CONFIG.wake_ladder rung channel
     level                 INTEGER NOT NULL,
@@ -944,6 +945,24 @@ def collect_wake_demand(conn) -> list[dict]:
         demands.append({"role": r["assignee_role"], "reason_kind": "urgent_task",
                         "source_ref": str(r["id"]), "label": r["title"],
                         "since_at": r["created_at"]})
+    # An owed meeting reply past its SLA. Distinct from stuck_delivery, which
+    # means "never read it": this one means "read it and has not answered", and
+    # only a wake fixes that. meetings used to page a human for this directly,
+    # skipping every machine rung; it now leaves the rows and lets the ladder do
+    # its job. Restricted to live meetings for the same reason stuck_delivery
+    # skips closed threads — an obligation in a stopped meeting cannot be
+    # discharged by anything the agent does, so it would regenerate every tick
+    # and climb forever.
+    for r in conn.execute(
+            """SELECT o.message_id, o.thread_id, o.owed_by, o.created_at, m.agenda
+               FROM meeting_response_obligations o
+               JOIN meetings m ON m.thread_id=o.thread_id
+               WHERE o.status='pending' AND o.due_at<=?
+                 AND m.state IN ('active','consensus')""", (now_iso,)):
+        demands.append({"role": r["owed_by"], "reason_kind": "owed_reply",
+                        "source_ref": f'{r["thread_id"]}:{r["message_id"]}',
+                        "label": f'owes a reply in {r["agenda"]}',
+                        "since_at": r["created_at"]})
     # Unified inbox — batched: an urgent item wakes now; non-urgent items wake
     # once the oldest has waited CONFIG.inbox_batch_seconds (or ride along with
     # any other demand for the role, since plan_wakes batches per role).
@@ -989,6 +1008,29 @@ def _demand_resolved(conn, role: str, reason_kind: str, source_ref: str,
         resolved = r is None or not (
             r["status"] == "pending" and r["priority"] == "urgent"
             and r["assignee_role"] == role)
+        return (resolved, "acked")
+    if reason_kind == "owed_reply":
+        # Mirrors collect_wake_demand's predicate clause for clause. The commit
+        # before this one exists because generation and resolution disagreed in
+        # five places; every WHERE above has a line here on purpose.
+        thread, _, msg = source_ref.partition(":")
+        try:
+            mid = int(msg)
+        except ValueError:
+            return (True, "acked")
+        r = conn.execute(
+            """SELECT o.status, o.owed_by, m.state
+               FROM meeting_response_obligations o
+               JOIN meetings m ON m.thread_id=o.thread_id
+               WHERE o.message_id=?""", (mid,)).fetchone()
+        # Gone, answered, reassigned, or the meeting stopped: collect_wake_demand
+        # raises none of these, so resolution must expect none of them either —
+        # an attempt outstanding when a meeting closes would otherwise strand
+        # pending and climb the ladder forever over a conversation nobody can
+        # rejoin.
+        resolved = r is None or not (
+            r["status"] == "pending" and r["owed_by"] == role
+            and r["state"] in ("active", "consensus"))
         return (resolved, "acked")
     if reason_kind == "stuck_delivery":
         thread, _, msg = source_ref.partition(":")

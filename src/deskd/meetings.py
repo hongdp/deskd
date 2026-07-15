@@ -787,25 +787,19 @@ def _sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
                 "UPDATE meetings SET waiting_escalated_at=? WHERE thread_id=?",
                 (now_iso, meeting["thread_id"]),
             )
-        # 2. Response obligations: an owed one-to-one reply past its due date.
-        overdue = conn.execute(
-            """SELECT o.message_id,o.thread_id,o.owed_by FROM meeting_response_obligations o
-               JOIN meetings m ON m.thread_id=o.thread_id
-               WHERE o.status='pending' AND o.escalated_at IS NULL AND o.due_at<=?
-                 AND m.state IN ('active','consensus')""",
-            (now_iso,),
-        ).fetchall()
-        for obligation in overdue:
-            escalation_ids.append(_queue_escalation(
-                conn, obligation["thread_id"], "system",
-                f"one-to-one response timeout: {obligation['owed_by']} owes a "
-                f"reply to message #{obligation['message_id']}",
-                "auto",
-            ))
-            conn.execute(
-                "UPDATE meeting_response_obligations SET escalated_at=? WHERE message_id=?",
-                (now_iso, obligation["message_id"]),
-            )
+        # 2. Response obligations are NOT swept here any more. An overdue reply
+        #    used to queue an escalation straight from this loop — one hop, in
+        #    the human's direction, jumping every machine rung of the wake
+        #    ladder (hook at 60s, resume at 120s, spawn at 180s) that exists to
+        #    fix precisely this without waking anybody. A slow agent is not an
+        #    incident, and paging a person for one trains them to ignore the
+        #    page that matters. The orchestrator collects the same overdue rows
+        #    as wake demand and climbs the ladder properly; it reaches a human at
+        #    the `human` rung, on the merits, once the machine has actually
+        #    failed. This layer cannot push that demand (it must never import
+        #    orchestration), so orchestration pulls it — see
+        #    collect_wake_demand's `owed_reply`, whose predicate mirrors this
+        #    one, and _demand_resolved, which mirrors it back.
         # 3. Stale attendees: checked in, but sitting on unread messages past
         #    the SLA. Re-arm a wake request only when the previous ack predates
         #    the oldest unread message, so an ack cannot silence new traffic.
@@ -948,8 +942,9 @@ def _call_meeting(*, agenda: str, called_by: str, attendees: list[str],
                 conn.execute(
                     """INSERT INTO meeting_attendees
                        (thread_id,role,required,invited_at,checked_in_at,checkin_auth_nonce)
-                       VALUES (?,?,1,?,?,?)""",
-                    (thread["id"], role, now, now if role == called_by else None,
+                       VALUES (?,?,?,?,?,?)""",
+                    (thread["id"], role, int(role != supervisor), now,
+                     now if role == called_by else None,
                      auth_nonce if role == supervisor and role == called_by else None),
                 )
             _event(conn, thread["id"], "called", called_by, agenda, auth_nonce)
@@ -1117,9 +1112,17 @@ def _supervisor_join(conn, thread_id: str, auth_nonce: str) -> None:
     ).fetchone()
     if attendee and attendee["checked_in_at"] and not attendee["stopped_at"]:
         return
+    # required=0: a human is not a quorum condition. `required` has existed since
+    # the first schema and every write hardcoded 1, so the knob was built and
+    # never turned — which is why a watching supervisor silently became something
+    # the agents had to wait for. Two places counted on it: `waiting` held the
+    # meeting until the human checked in, and _finalize_if_unanimous demanded the
+    # human's vote to close, so a supervisor who read the thread and walked away
+    # left the agents unable either to start or to finish. Neither is a decision
+    # anyone made; both fall out of the hardcoded 1.
     if attendee:
         conn.execute(
-            """UPDATE meeting_attendees SET required=1,checked_in_at=?,
+            """UPDATE meeting_attendees SET required=0,checked_in_at=?,
                checkin_auth_nonce=?,stopped_at=NULL WHERE thread_id=? AND role=?""",
             (now, auth_nonce, thread_id, supervisor),
         )
@@ -1127,7 +1130,7 @@ def _supervisor_join(conn, thread_id: str, auth_nonce: str) -> None:
         conn.execute(
             """INSERT INTO meeting_attendees
                (thread_id,role,required,invited_at,checked_in_at,checkin_auth_nonce)
-               VALUES (?,?,1,?,?,?)""",
+               VALUES (?,?,0,?,?,?)""",
             (thread_id, supervisor, now, now, auth_nonce),
         )
     _event(conn, thread_id, "join", supervisor, "supervisor joined meeting", auth_nonce)
@@ -1529,6 +1532,13 @@ def _pending_termination(conn, thread_id: str):
     ).fetchone()
 
 
+def _is_supervisor_one_to_one(conn, thread_id: str) -> bool:
+    """Exactly one agent, alone with the supervisor: a DM, not a work meeting."""
+    actives = _active_roles(conn, thread_id)
+    return (CONFIG.supervisor_role in actives
+            and len([r for r in actives if r != CONFIG.supervisor_role]) == 1)
+
+
 def _propose_end(conn, thread_id: str, role: str, resolution: str,
                  auth_nonce: str | None = None) -> int:
     supervisor = CONFIG.supervisor_role
@@ -1542,6 +1552,21 @@ def _propose_end(conn, thread_id: str, role: str, resolution: str,
         claim = _supervisor_claim(conn, auth_nonce, {"propose_end"}, thread_id=thread_id)
         if claim.get("resolution") != resolution:
             raise ValueError("supervisor assertion resolution mismatch")
+    elif _is_supervisor_one_to_one(conn, thread_id):
+        # A meeting that is just you and a person is that person's, and they end
+        # it when they are done — the way nobody hangs up a DM on a schedule.
+        # This is not symmetry with agent meetings, it is the absence of it: an
+        # agent-to-agent meeting is work with a defined end, and closing it is a
+        # duty (see the wake ladder's close nudge). This is a conversation.
+        #
+        # Without this the supervisor's required=0 turns straight into a bug —
+        # you are the only *required* attendee, and _propose_end auto-confirms
+        # its own proposer, so a single agent would silently close the human's
+        # thread mid-sentence and take the mailbox down with it. Left open costs
+        # nothing now: no obligation is owed by the human, and the idle deadline
+        # retires the thread on its own if it truly goes quiet.
+        raise ValueError(
+            "a one-to-one with the supervisor is theirs to end; leave it open")
     _resolve_obligations(
         conn, thread_id, role, resolution="termination proposal answered pending update",
     )
@@ -1946,9 +1971,34 @@ def _apply_supervisor_payload(verified: auth.VerifiedAssertion, *,
             )}
         elif action == "resume":
             meeting = _meeting(conn, thread_id)
+            now = _iso()
+            if meeting["state"] == "closed":
+                # Reopening a CLOSED meeting, not just un-pausing a live one.
+                # _close_meeting stops every attendee and spends the thread, so
+                # the old resume left a meeting that was open and empty: nobody
+                # active, `len(active_roles) < 2`, not a single message
+                # accepted. It looked resumed and could not be spoken in.
+                #
+                # This is the counterweight to agents closing meetings without
+                # the supervisor's vote (attendees.required=0). That is only
+                # safe if a person can get back in — otherwise "the agents
+                # agreed we were done" is final, and being outvoted about your
+                # own reading is not a thing a human should have to argue with.
+                conn.execute(
+                    "UPDATE meeting_attendees SET stopped_at=NULL WHERE thread_id=?",
+                    (thread_id,),
+                )
+                # Budget resets. It was spent reaching a conclusion that is now
+                # being reopened, and inheriting the remainder would reopen
+                # straight into `consensus` — or into "message budget
+                # exhausted", which is reopening into the closed state again.
+                conn.execute(
+                    "UPDATE mailbox_threads SET message_count=0 WHERE id=?",
+                    (thread_id,),
+                )
+                meeting = _meeting(conn, thread_id)
             next_state = ("consensus" if meeting["messages_remaining"] <=
                           meeting["consensus_threshold"] else "active")
-            now = _iso()
             conn.execute(
                 "UPDATE meetings SET state=?,updated_at=? WHERE thread_id=?",
                 (next_state, now, thread_id),

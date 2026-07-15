@@ -575,3 +575,78 @@ def test_terminal_rung_still_resolves_when_the_demand_dies(desk):
 
     assert _open_attempts() == []
     assert _attempts()[-1]["outcome"] == "acked"
+
+
+# --- an owed meeting reply is machine-recoverable demand ---------------------
+
+def _owed_setup() -> tuple[str, int]:
+    """A question alpha asked beta, whose reply SLA has already lapsed."""
+    status = meetings.call_meeting(agenda="sla", called_by="alpha",
+                                   attendees=["alpha", "beta"],
+                                   wait_timeout_seconds=30)
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    mid = meetings.send_update(thread_id, role="alpha", kind="question",
+                               body="a question that goes unanswered")["message_id"]
+    with orch.connect(write=True) as c:
+        c.execute("UPDATE meeting_response_obligations SET due_at=? WHERE message_id=?",
+                  (iso(-60), mid))
+    return thread_id, mid
+
+
+def test_an_overdue_reply_climbs_the_ladder_instead_of_paging_a_human(desk):
+    """meetings used to escalate this straight from its sweep — one hop, at a
+    human, past every machine rung built to fix it without waking anyone. It is
+    demand like any other now: it starts at the bottom of the ladder and only
+    reaches a person if the machine cannot deliver."""
+    thread_id, mid = _owed_setup()
+
+    with orch.connect() as c:
+        owed = [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"]
+    assert [(d["role"], d["source_ref"]) for d in owed] == [
+        ("beta", f"{thread_id}:{mid}")], "the debtor is woken, not the asker"
+
+    orch.plan_wakes()
+    attempt = [a for a in _open_attempts() if a["reason_kind"] == "owed_reply"]
+    assert len(attempt) == 1 and attempt[0]["role"] == "beta"
+    assert not CONFIG.wake_ladder[attempt[0]["level"]].leaves_machine, (
+        "a slow agent must not open on a rung that pulls a person in")
+
+
+def test_answering_retires_the_owed_reply_attempt(desk):
+    """Generation and resolution must agree clause for clause — the commit that
+    precedes this branch exists because they disagreed in five places. Answering
+    stops collect_wake_demand raising it, so resolution must stop expecting it."""
+    thread_id, mid = _owed_setup()
+    orch.plan_wakes()
+    assert [a["role"] for a in _open_attempts()] == ["beta"]
+
+    meetings.send_update(thread_id, role="beta", kind="answer", reply_to=mid,
+                         body="answering at last")
+
+    orch.plan_wakes()
+    assert [a for a in _open_attempts() if a["reason_kind"] == "owed_reply"] == []
+    assert _attempts()[-1]["outcome"] == "acked"
+
+
+def test_a_stopped_meetings_owed_reply_stops_waking_anyone(desk):
+    """Same trap the stuck_delivery branch documents: an obligation in a meeting
+    nobody can rejoin cannot be discharged by anything the agent does, so a
+    demand that kept raising it would climb the ladder forever over a dead
+    conversation — and reach a human, which is the outcome this whole branch is
+    trying to stop being routine."""
+    thread_id, _ = _owed_setup()
+    orch.plan_wakes()
+    assert [a["role"] for a in _open_attempts()] == ["beta"]
+
+    meetings.apply_simple_supervisor_action(
+        {"action": "force_close", "meeting_id": thread_id, "reason": "done here"})
+
+    with orch.connect() as c:
+        assert [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"] == []
+    orch.plan_wakes()
+    assert [a for a in _open_attempts() if a["reason_kind"] == "owed_reply"] == [], (
+        "an attempt outstanding when the meeting closed must retire, not strand"
+    )

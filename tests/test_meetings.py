@@ -268,26 +268,34 @@ def test_transport_rejects_duplicate_messages(desk):
                              body="the very same words")
 
 
-def test_an_unanswered_question_escalates_once_past_its_sla(desk):
-    """The obligation is what makes silence loud. It must escalate on its own —
-    the asker is not allowed to block waiting for it."""
+def test_an_unanswered_question_does_not_page_a_human_by_itself(desk):
+    """The obligation is still what makes silence loud, and the asker still must
+    not block waiting for it. What changed is who gets told.
+
+    This used to queue an escalation straight from the sweep: one hop, in a
+    human's direction, skipping every machine rung of the wake ladder — hook at
+    60s, resume at 120s, spawn at 180s — that exists to fix exactly this without
+    waking anybody. A slow agent is not an incident, and paging a person for one
+    trains them to ignore the page that matters. The obligation rows stay
+    exactly as they were; the orchestrator collects them as wake demand and
+    reaches a human at the `human` rung, on the merits, once the machine has
+    actually failed. That half is pinned in test_wake (this layer must never
+    import orchestration, so it cannot assert it here).
+    """
     thread_id = _start("sla", ["alpha", "beta"], wait_timeout_seconds=30)
-    sent = meetings.send_update(thread_id, role="alpha", kind="question",
-                                body="a question that goes unanswered")
+    meetings.send_update(thread_id, role="alpha", kind="question",
+                         body="a question that goes unanswered")
     with _db() as conn:
         conn.execute("UPDATE meeting_response_obligations SET due_at=? WHERE thread_id=?",
                      (_past(60), thread_id))
 
     meetings._sweep_timeouts()
 
-    reasons = [e["reason"] for e in meetings.list_escalations(thread_id)]
-    assert any(f"#{sent['message_id']}" in r and "beta" in r for r in reasons), reasons
+    assert meetings.list_escalations(thread_id) == [], (
+        "a slow reply must not page anyone from this layer")
     owed = meetings.meeting_status(thread_id)["response_obligations"]
-    assert owed[0]["escalated_at"] is not None
-
-    # Escalating twice for one silence would page a human on every read.
-    meetings._sweep_timeouts()
-    assert len(meetings.list_escalations(thread_id)) == len(reasons)
+    assert owed[0]["status"] == "pending", (
+        "the debt itself must survive the sweep — it is the demand")
 
 
 # --- 4. the message budget --------------------------------------------------
@@ -900,3 +908,86 @@ def test_reviving_an_idle_meeting_is_the_supervisors_alone(desk):
             {"action": "send", "meeting_id": parked, "body": "talk anyway"})
     assert _thread_row(parked)["status"] == "paused", (
         "a budget pause is a decision; a message must not quietly overturn it")
+
+
+# --- 9. the supervisor is present, not required ------------------------------
+
+def test_a_silent_supervisor_does_not_block_the_agents_from_closing(desk):
+    """A human reading along is not a quorum condition. `required` shipped in the
+    first schema and every write hardcoded 1, so the knob was built and never
+    turned — and a supervisor who joined, read, and went quiet left
+    _finalize_if_unanimous waiting on a vote that was never coming. The agents
+    could not finish, and the only cure was the person returning. That is the
+    dependency this desk exists to remove, and nobody ever decided to have it.
+    """
+    thread_id = _start("work meeting", ["alpha", "beta"])
+    meetings.apply_simple_supervisor_action(
+        {"action": "join", "meeting_id": thread_id})
+
+    meetings.propose_end(thread_id, role="alpha", resolution="we are done here")
+    assert meetings.confirm_end(thread_id, role="beta")["closed"] is True, (
+        "the agents agreed; a watching human owes them no vote")
+
+
+def test_an_agent_cannot_close_its_one_to_one_with_the_supervisor(desk):
+    """The mirror of the test above, and the reason it is safe.
+
+    required=0 means the human is not counted — so alone with them the single
+    agent IS the whole quorum, and _propose_end auto-confirms its own proposer.
+    Unguarded, one agent would close a person's thread mid-sentence, and closing
+    takes the mailbox with it, so the reply would be unsendable. A meeting that
+    is just you and a person is theirs to end.
+    """
+    called = meetings.apply_simple_supervisor_action(
+        {"action": "call", "agenda": "one on one", "attendees": ["alpha"]})
+    thread_id = called["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="alpha")
+
+    with pytest.raises(ValueError, match="theirs to end"):
+        meetings.propose_end(thread_id, role="alpha", resolution="done talking")
+    assert _state(thread_id) == "active", "the human's thread stays open"
+
+
+def test_a_second_agent_makes_it_a_work_meeting_the_agents_may_close(desk):
+    """The guard keys on shape, not on the supervisor merely being present: with
+    a colleague in the room it is work with a defined end, and the agents own
+    finishing it. Keying on "a supervisor is here" instead would hand every
+    meeting a human sat in back to the human to close, which is the dependency
+    required=0 just removed."""
+    called = meetings.apply_simple_supervisor_action(
+        {"action": "call", "agenda": "work, observed",
+         "attendees": ["alpha", "beta"]})
+    thread_id = called["meeting"]["thread_id"]
+    for role in ("alpha", "beta"):
+        meetings.check_in(thread_id, role=role)
+
+    meetings.propose_end(thread_id, role="alpha", resolution="concluded")
+    assert meetings.confirm_end(thread_id, role="beta")["closed"] is True
+
+
+def test_the_supervisor_can_reopen_a_meeting_the_agents_closed(desk):
+    """The counterweight to closing without the human's vote: they can get back
+    in. Reopening is not un-pausing. _close_meeting stops every attendee and the
+    old resume left them stopped, so the meeting came back open and empty —
+    nobody active, "needs at least two active attendees", not one message
+    accepted. It looked resumed and could not be spoken in.
+    """
+    thread_id = _start("closed by agents", ["alpha", "beta"])
+    meetings.send_update(thread_id, role="alpha", kind="evidence",
+                         body="a finding worth revisiting")
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+    assert meetings.confirm_end(thread_id, role="beta")["closed"] is True
+
+    meetings.apply_simple_supervisor_action(
+        {"action": "resume", "meeting_id": thread_id, "reason": "not done after all"})
+
+    assert _state(thread_id) in ("active", "consensus")
+    assert _thread_row(thread_id)["status"] == "open"
+    assert _thread_row(thread_id)["message_count"] == 0, (
+        "the budget was spent reaching a conclusion now being reopened; "
+        "inheriting the remainder reopens straight into consensus, or into "
+        "'budget exhausted', which is reopening into the closed state again")
+
+    # The proof the old resume could not pass: it accepts a message.
+    meetings.send_update(thread_id, role="beta", kind="evidence",
+                         body="picking the thread back up")
