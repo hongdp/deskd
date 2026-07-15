@@ -650,3 +650,91 @@ def test_a_stopped_meetings_owed_reply_stops_waking_anyone(desk):
     assert [a for a in _open_attempts() if a["reason_kind"] == "owed_reply"] == [], (
         "an attempt outstanding when the meeting closed must retire, not strand"
     )
+
+
+# --- an open work meeting is work, and lives in the work queue ---------------
+
+def _close_tasks(role: str | None = None) -> list[dict]:
+    sql = ("SELECT * FROM agent_tasks WHERE source_kind='meeting' "
+           "AND status='pending'")
+    rows = _rows(sql)
+    return [r for r in rows if role is None or r["assignee_role"] == role]
+
+
+def test_an_open_work_meeting_sits_in_its_attendees_task_lists_softly(desk):
+    """A meeting lives in its own tables, not in anyone's queue — so "I still owe
+    this a close" existed nowhere an agent looks between wakes, and the only
+    thing that noticed was the idle deadline retiring it an hour later.
+
+    Soft is the whole point. A conversation that is still going does not need an
+    interrupt telling you to end it, so this must surface WITHOUT waking: normal
+    priority, and the module's headline rule holds — only urgent wakes.
+    """
+    status = meetings.call_meeting(agenda="rotation review", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+
+    orch.plan_wakes()
+
+    owed = {t["assignee_role"]: t for t in _close_tasks()}
+    assert set(owed) == {"alpha", "beta"}, "both attendees own finishing it"
+    assert all(t["priority"] == "normal" for t in owed.values())
+    assert all(t["source_ref"] == thread_id for t in owed.values())
+    assert _open_attempts() == [], "a live meeting must not wake anyone to end it"
+
+
+def test_a_meeting_left_open_after_it_went_quiet_turns_urgent_and_wakes(desk):
+    """The escalation the supervisor never has to make. Idle means the
+    conversation is over in every sense except the ledger's: it stopped, nobody
+    ended it, and a reminder sitting in a list the agent is not reading has
+    already failed. Only then does it become an interrupt."""
+    status = meetings.call_meeting(agenda="forgotten", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    orch.plan_wakes()
+    assert [t["priority"] for t in _close_tasks()] == ["normal", "normal"]
+
+    with orch.connect(write=True) as c:
+        c.execute("UPDATE mailbox_threads SET expires_at=? WHERE id=?",
+                  (iso(-3600), thread_id))
+    meetings.meeting_status(thread_id)  # a read is what retires an idle thread
+
+    orch.plan_wakes()
+
+    assert [t["priority"] for t in _close_tasks()] == ["urgent", "urgent"]
+    woken = {a["role"] for a in _open_attempts() if a["reason_kind"] == "urgent_task"}
+    assert woken == {"alpha", "beta"}
+
+
+def test_a_dm_with_the_supervisor_never_becomes_a_close_task(desk):
+    """The agent is refused if it tries (meetings._propose_end: theirs to end),
+    so a task demanding it would be one the agent cannot discharge — pending
+    forever, and once urgent climbing the ladder to the very human it was told
+    not to bother."""
+    called = meetings.apply_simple_supervisor_action(
+        {"action": "call", "agenda": "one on one", "attendees": ["alpha"]})
+    meetings.check_in(called["meeting"]["thread_id"], role="alpha")
+
+    orch.plan_wakes()
+
+    assert _close_tasks() == [], "a DM is not the agent's to close"
+
+
+def test_closing_the_meeting_retires_the_close_task(desk):
+    """Generation and resolution agree here too. A queue that fills with closes
+    nobody can perform is worse than no queue, and any that had gone urgent
+    would climb the ladder over a finished conversation."""
+    status = meetings.call_meeting(agenda="finished properly", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    orch.plan_wakes()
+    assert len(_close_tasks()) == 2
+
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+    assert meetings.confirm_end(thread_id, role="beta")["closed"] is True
+
+    orch.plan_wakes()
+    assert _close_tasks() == []

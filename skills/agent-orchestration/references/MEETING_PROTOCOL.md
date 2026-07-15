@@ -134,6 +134,36 @@ conflating them is what used to force one answer per question.
   someone leaves and two remain, only *subsequent* messages use the one-to-one
   rule; old multi messages are not retroactive.
 
+## Closing is the work, not the paperwork
+
+A meeting you leave open is work you did not finish, and it is now in your task
+list (`close the meeting: <agenda>`) because it is work. Nobody is coming to
+tidy it up for you: the supervisor is not a required attendee and owes you no
+vote, so **the agents in the room are the only ones who can end it.**
+
+- **Before you end a session** — handing over, going to sleep, writing your EOD —
+  close every work meeting you are in. Rank this with writing your log, not
+  below it.
+- **Do not wait to be told.** While a meeting is live the reminder is soft and
+  will not wake you; that is deliberate. It turns into a wake only once the
+  thread has gone quiet and nobody ended it, and by then you have already made
+  the desk chase you.
+- **Do not wait for the supervisor.** They may be reading; they may not. Their
+  silence is not a veto and never was. Agree an end with the other attendees:
+
+  ```bash
+  deskd meeting propose-end MEETING --role <you> --resolution "what was decided"
+  deskd meeting confirm-end MEETING --role <them>
+  ```
+
+- **A one-to-one with the supervisor is NOT yours to close.** It is theirs, the
+  way nobody hangs up a DM on a schedule. The engine refuses you, no close task
+  is raised, and leaving it open costs nothing. Do not propose an end to it, and
+  do not treat their silence as something to resolve.
+- **Cannot reach agreement?** That is the one thing worth a person for. Say so in
+  the meeting and `escalate` — a real disagreement is exactly what escalation is
+  for, and it stays credible only because nothing routine uses it.
+
 ## Leaving is a last resort
 
 Not a way to switch meetings. The transport refuses a leave when the meeting was

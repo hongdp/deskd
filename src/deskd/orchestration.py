@@ -907,6 +907,92 @@ def _human_level(ladder) -> int:
     return max(0, len(ladder) - 2)
 
 
+
+def sync_meeting_close_tasks(conn) -> int:
+    """Project every live work meeting into its attendees' task lists.
+
+    An open meeting is unfinished work and closing it is the agents' job — but a
+    meeting lives in its own tables, not in anyone's queue. "I still owe this a
+    close" therefore existed nowhere an agent looks between wakes, and the only
+    thing that ever noticed was the idle deadline retiring it an hour later.
+    This is the durable, poll-free version of remembering.
+
+    Soft on purpose. priority='normal' surfaces the item and wakes nobody — the
+    module's headline rule is that only urgent wakes, and a conversation that is
+    still going does not need an interrupt telling you to end it. It turns urgent
+    exactly when the thread goes idle: nobody is talking, nobody closed it, and a
+    reminder in a list an agent is not currently reading has already failed. Then
+    it is demand like any other and climbs the ladder.
+
+    DMs are excluded. A one-to-one with the supervisor is theirs to end
+    (meetings._propose_end refuses the agent), so a close task there would be one
+    the agent cannot discharge: it would sit pending forever, and once urgent it
+    would climb the ladder to the very human it was told not to bother.
+
+    Idempotent and self-healing, like sync_delivery: the meeting rows are the
+    truth and this only mirrors them. Requires a write transaction.
+    """
+    now = _iso()
+    supervisor = CONFIG.supervisor_role
+    live: dict[str, dict] = {}
+    for m in conn.execute(
+            """SELECT m.thread_id, m.agenda, t.stop_reason, t.status AS thread_status
+               FROM meetings m JOIN mailbox_threads t ON t.id=m.thread_id
+               WHERE m.state IN ('active','consensus')"""):
+        agents = [r["role"] for r in conn.execute(
+            """SELECT role FROM meeting_attendees
+               WHERE thread_id=? AND checked_in_at IS NOT NULL
+                 AND stopped_at IS NULL AND role!=?""",
+            (m["thread_id"], supervisor))]
+        if len(agents) < 2:
+            continue  # a DM, or nobody to hold to it
+        # Idle means the conversation is over in every sense except the ledger's:
+        # it stopped, nobody ended it, and it is now stale work only a wake will
+        # clear. `meetings.state` stays 'active' through an idle timeout, so the
+        # meeting is still closeable — the task remains dischargeable.
+        idle = m["thread_status"] == "paused" and m["stop_reason"] == "idle timeout"
+        live[m["thread_id"]] = {"agenda": m["agenda"], "agents": agents,
+                                "priority": "urgent" if idle else "normal"}
+
+    touched = 0
+    for thread_id, info in live.items():
+        for role in info["agents"]:
+            row = conn.execute(
+                """SELECT id, status, priority FROM agent_tasks
+                   WHERE source_kind='meeting' AND source_ref=? AND assignee_role=?""",
+                (thread_id, role)).fetchone()
+            if row is None:
+                conn.execute(
+                    """INSERT INTO agent_tasks
+                       (title,detail,assignee_role,status,priority,source_kind,
+                        source_ref,created_by,created_at,updated_at)
+                       VALUES (?,?,?,'pending',?,'meeting',?,'orchestrator',?,?)""",
+                    (f"close the meeting: {info['agenda']}"[:200],
+                     "Agree an end with the other attendees (propose-end / "
+                     "confirm-end). Leaving it open is the work not finished.",
+                     role, info["priority"], thread_id, now, now))
+                touched += 1
+            elif row["status"] == "pending" and row["priority"] != info["priority"]:
+                conn.execute(
+                    "UPDATE agent_tasks SET priority=?,updated_at=? WHERE id=?",
+                    (info["priority"], now, row["id"]))
+                touched += 1
+
+    # Retire what is no longer owed: the meeting closed, or this role left it.
+    # Without this the queue fills with closes nobody can perform, and any that
+    # had gone urgent would climb the ladder over a finished conversation.
+    for row in conn.execute(
+            "SELECT id, source_ref, assignee_role FROM agent_tasks "
+            "WHERE source_kind='meeting' AND status='pending'").fetchall():
+        info = live.get(row["source_ref"])
+        if info is None or row["assignee_role"] not in info["agents"]:
+            conn.execute(
+                """UPDATE agent_tasks SET status='done',updated_at=?,
+                   result_note='meeting is no longer open to this role' WHERE id=?""",
+                (now, row["id"]))
+            touched += 1
+    return touched
+
 def collect_wake_demand(conn) -> list[dict]:
     """Unify the DB-derived wake demands.
 
@@ -1174,6 +1260,7 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
     resolved, changed = [], []
     with _planning_txn(db_path, record=record) as conn:
         sync_delivery(conn)
+        sync_meeting_close_tasks(conn)
         # Agent-registered wake hooks fire first (same txn), so their inbox items
         # are visible to this tick's demand collection. Evaluated only in record
         # mode: a dry preview must not run probes or advance timers.
