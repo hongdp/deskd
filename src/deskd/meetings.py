@@ -372,6 +372,47 @@ def _resolve_obligations(conn, thread_id: str, role: str, *,
     return int(cursor.rowcount)
 
 
+def _revive_idle_thread(conn, thread_id: str) -> bool:
+    """A supervisor message IS the supervisor resuming. Idle-paused only.
+
+    The idle deadline retires a thread lazily, on read, and touches only
+    `mailbox_threads` — `meetings.state` stays `active`. The console reads state,
+    so it renders a live composer and no resume button, then the send fails with
+    "thread is paused: idle timeout" and offers no way out. That is the same
+    dead end the turn-taking gate produced, reached from a different direction:
+    the one surface a human has, refusing the human.
+
+    Resuming stays a human act (agents open a new meeting instead) — this does
+    not widen that, it just stops making the human say it twice. Writing to the
+    thread IS the intent; a button that only ever gets pressed immediately before
+    the message is ceremony.
+
+    Idle ONLY. A budget-exhausted or explicitly paused thread stays paused: those
+    are decisions, not lapsed attention, and a message must not quietly overturn
+    them. Refreshing `expires_at` is mandatory, not tidiness — a thread paused ON
+    its deadline still carries a past one, so the very next read would retire it
+    again and this would be a no-op (the same trap `resume` documents).
+    """
+    thread = conn.execute(
+        "SELECT * FROM mailbox_threads WHERE id=?", (thread_id,)).fetchone()
+    # Direct read, deliberately: _meeting() already refreshed this thread, so the
+    # status below is current — and the retiring helper cannot report WHY it
+    # paused, which is the one thing this needs to know.
+    if not thread or thread["status"] != "paused":
+        return False
+    if thread["stop_reason"] != "idle timeout":
+        return False
+    now = _now()
+    conn.execute(
+        """UPDATE mailbox_threads SET status='open',stop_reason=NULL,stopped_by=NULL,
+           updated_at=?,expires_at=? WHERE id=?""",
+        (_iso(now), mailbox._deadline(now, thread["idle_minutes"]), thread_id),
+    )
+    _event(conn, thread_id, "resumed", CONFIG.supervisor_role,
+           "supervisor wrote to an idle-paused meeting")
+    return True
+
+
 def _discharge_obligations(conn, thread_id: str, role: str,
                            message_ids: Sequence[int], by_message_id: int,
                            now: str | None = None) -> list[int]:
@@ -1334,6 +1375,8 @@ def _send_update(conn, thread_id: str, role: str, body: str, kind: str,
         recipient = next(r for r in active_roles if r != role)
     else:
         recipient = BROADCAST
+    if role == supervisor:
+        _revive_idle_thread(conn, thread_id)
     # _insert_message documents that callers "must ... have refreshed `thread`";
     # handing it a raw row is what let a meeting write past its idle deadline.
     thread = mailbox._refresh_thread(conn, thread_id)

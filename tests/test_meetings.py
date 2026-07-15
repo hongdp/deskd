@@ -836,3 +836,67 @@ def test_addressing_the_supervisor_stays_shut_outside_a_meeting_it_sits_in(desk)
             mailbox._insert_message(conn, thread, sender="alpha",
                                     recipient=CONFIG.supervisor_role,
                                     kind="evidence", body="psst")
+
+
+def test_a_supervisor_message_revives_an_idle_paused_meeting(desk):
+    """The idle deadline touches mailbox_threads only — meetings.state stays
+    `active`. The console reads state, so it draws a live composer and no resume
+    button, then the send dies on "thread is paused: idle timeout" with no way
+    out. Same dead end the turn-taking gate produced, reached from the other
+    side: the one surface a human has, refusing the human.
+
+    Resuming stays a human act. Writing IS that act; a button pressed only ever
+    immediately before the message is ceremony. Agents get no such revival —
+    they open a new meeting (see the companion test below).
+    """
+    called = meetings.apply_simple_supervisor_action(
+        {"action": "call", "agenda": "gone quiet", "attendees": ["alpha"]})
+    thread_id = called["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="alpha")
+    _expire(thread_id)
+    assert meetings.meeting_status(thread_id)["meeting"]["state"] == "active", (
+        "the trap's premise: state still reads active while the thread is retired")
+
+    sent = meetings.apply_simple_supervisor_action(
+        {"action": "send", "meeting_id": thread_id, "body": "still here?"})
+
+    assert sent["message_id"]
+    assert _thread_row(thread_id)["status"] == "open"
+    assert _thread_row(thread_id)["expires_at"] > dt.datetime.now(
+        dt.timezone.utc).isoformat(timespec="seconds"), (
+        "a revived thread needs a fresh deadline, or the next read retires it "
+        "again and the revival is decorative")
+
+
+def test_reviving_an_idle_meeting_is_the_supervisors_alone(desk):
+    """An agent that wandered back must not reopen what went quiet: it starts a
+    new meeting instead. Nor may a message overturn a pause that was a decision
+    rather than lapsed attention — only 'idle timeout' revives."""
+    thread_id = _start("agents only", ["alpha", "beta"])
+    _expire(thread_id)
+    with pytest.raises(ValueError, match="idle|expired|paused"):
+        meetings.send_update(thread_id, role="alpha", kind="evidence",
+                             body="wandering back in")
+    # Asserted on the deadline, not on `status`: the refusal rolls its own
+    # transaction back, taking the 'paused' write with it, so the row reads
+    # `open` with a deadline still in the past — retired again on the next read.
+    # What matters is that the agent got no fresh window.
+    assert _thread_row(thread_id)["expires_at"] < dt.datetime.now(
+        dt.timezone.utc).isoformat(timespec="seconds"), (
+        "an agent must not get the fresh deadline a revival grants")
+
+    # A supervisor message revives idle, but must not revive a deliberate pause.
+    called = meetings.apply_simple_supervisor_action(
+        {"action": "call", "agenda": "deliberately parked", "attendees": ["alpha"]})
+    parked = called["meeting"]["thread_id"]
+    meetings.check_in(parked, role="alpha")
+    with _db() as conn:
+        conn.execute(
+            """UPDATE mailbox_threads SET status='paused',
+               stop_reason='message budget exhausted',stopped_by='system' WHERE id=?""",
+            (parked,))
+    with pytest.raises(ValueError, match="paused|budget"):
+        meetings.apply_simple_supervisor_action(
+            {"action": "send", "meeting_id": parked, "body": "talk anyway"})
+    assert _thread_row(parked)["status"] == "paused", (
+        "a budget pause is a decision; a message must not quietly overturn it")

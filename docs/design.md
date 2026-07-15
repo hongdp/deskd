@@ -115,7 +115,13 @@ all waking.
 
 Bounded by construction: idle deadline, message budget, automatic consensus at a
 threshold, one position each, and a mutual propose/confirm termination handshake.
-The transport rejects duplicates and stacked unresolved questions. Termination
+The transport rejects duplicates, and rejects stacked unresolved questions for
+callers that ask for a reply — meetings deliberately do not, tracking each as
+its own obligation instead, so one answer may settle several. Turn-taking is
+NOT a bound: refusing to let a present party speak because an absent one owes
+a reply drops messages rather than preventing them, since a rejected insert is
+the only way a message is lost once delivery and the wake ladder are carrying
+it. An owed reply is nudged, never enforced at the door. Termination
 votes don't consume the budget, so a meeting can always stop. The tally counts
 only *active* attendees, so someone leaving can never deadlock closure.
 

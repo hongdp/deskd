@@ -28,6 +28,8 @@ waiting → active → consensus? → termination_pending → closed
 in one. A supervisor-authenticated resume may reopen it; a new subject must not
 be used to bypass a stop.
 
+**A stopped meeting is not yours to restart.** Resuming is the supervisor's alone. If a topic still needs work, **call a new meeting** — do not wait for someone to revive the old one, and never sit on a stopped thread hoping. (A meeting that merely went idle is revived automatically the moment the supervisor writes to it; that is the supervisor resuming, not you.)
+
 Mode is derived from active-attendee count: `waiting` (<2), `one_to_one` (2),
 `multi` (3+). A supervisor joining a two-agent meeting makes it `multi`; when a
 participant leaves three actives, the remaining two return to `one_to_one`.
@@ -94,15 +96,38 @@ still a violation.
 
 ## One-to-one and multi
 
-- With exactly two active attendees, **every** new message requires an explicit
-  response to that exact id:
+With exactly two active attendees, every new message books the other side a
+tracked reply obligation with its own SLA. The debt is real; the door is not
+barred. **You are never refused for speaking out of turn** — change the subject,
+ask a second question, answer three at once. The engine used to reject any send
+while a reply was outstanding; it no longer does, and nothing you write should
+assume it might.
 
-  ```bash
-  deskd meeting send <MEETING> --role <you> --kind answer --reply-to <MSG_ID> --body "..."
-  ```
+Settle debts yourself, because you are the only one who knows what your message
+actually answered:
 
-- Do not open a new topic while either side owes the mandatory reply. A
-  termination proposal, confirmation, or rejection counts as a response.
+```bash
+# reply to one message, and settle several debts with it
+deskd meeting send <MEETING> --role <you> --kind answer \
+  --reply-to <MSG_ID> --resolves <MSG_ID> <MSG_ID> --body "..."
+
+# settle a debt an EARLIER message of yours already answered — no new message
+deskd meeting resolve <MEETING> --role <you> --covered-by <YOUR_MSG_ID> --resolves <MSG_ID>
+```
+
+`--reply-to` threads at exactly one message. `--resolves` says what you settled,
+which is any number of messages and often not the same set. Keep them separate:
+conflating them is what used to force one answer per question.
+
+- **Do not send "as I said above".** If an earlier message of yours already
+  answered it, `meeting resolve` it. A redundant restatement is noise; a debt
+  left pending because replying felt silly is a reply your counterpart never gets.
+- Answer or settle — do not leave it pending and hope. An unmet obligation is not
+  a locked door, it is a task that comes back to wake you.
+- Never settle a debt your message did not actually answer. The gate is gone
+  precisely so the ledger can be honest; a false settle is a dropped message
+  wearing clean books, and nothing downstream can tell.
+- A termination proposal, confirmation, or rejection also counts as a response.
 - With three actives, you may omit a reply when the topic is irrelevant to you or
   needs no response. Never send empty acknowledgements.
 - When the supervisor joins, pending one-to-one obligations are waived. When
@@ -119,8 +144,12 @@ completely silent may be left.
 
 ## Bounded discussion and consensus
 
-Every meeting has an idle limit and a message budget. Duplicate messages and
-stacked unresolved reply-required questions are rejected by the transport. When
+Every meeting has an idle limit and a message budget. Duplicate messages are
+rejected by the transport (a woken agent that cannot tell whether it already
+spoke would otherwise repeat itself verbatim). Stacked questions are **not**
+rejected here: meetings track each one as its own obligation with its own SLA,
+and one answer may settle several — the transport's stacked-request bound guards
+`mailbox.send_message` callers, which this layer is not. When
 the remaining budget hits the consensus threshold the meeting enters `consensus`
 automatically, and each required attendee gets **one** concise position:
 
