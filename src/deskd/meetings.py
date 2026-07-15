@@ -406,6 +406,21 @@ def _supervisor_claim(conn, auth_nonce: str | None, actions: set[str], *,
 
 
 def _meeting(conn, thread_id: str):
+    """Read the meeting joined to its thread, retiring the thread if it went idle.
+
+    The refresh is what makes the idle deadline one of the four bounds design.md
+    §Meetings claims. The deadline is enforced lazily on read (no daemon owns the
+    mailbox), so a raw `SELECT ... FROM mailbox_threads` here would report a stale
+    status='open' and let `_insert_message` write to a thread that expired — the
+    exact bypass `mailbox._refresh_thread` exists to close ("Every read path goes
+    through here so a stale thread can never be written to"). Every meetings read
+    of the thread funnels through this helper for that reason; none may go direct.
+    """
+    try:
+        mailbox._refresh_thread(conn, thread_id)
+    except ValueError:
+        # No thread means no meeting; keep this helper's own error contract.
+        raise ValueError(f"unknown meeting: {thread_id}") from None
     row = conn.execute(
         """SELECT m.*, t.status AS thread_status, t.phase AS review_phase,
                   t.max_messages, t.message_count,
@@ -907,6 +922,16 @@ def discover(role: str, *, include_closed: bool = False,
     with connect(db_path, write=True) as conn:
         role = _agent_role(conn, role)
         _stamp_notifications(conn, role)
+        # Refresh before the join: discovery is how a woken agent learns a meeting
+        # went idle, so the deadline must be applied before thread_status is read
+        # — the same rule _meeting enforces, and mailbox.list_threads before it.
+        for r in conn.execute(
+            """SELECT m.thread_id FROM meetings m
+               JOIN meeting_attendees a ON a.thread_id=m.thread_id
+               WHERE a.role=?""",
+            (role,),
+        ).fetchall():
+            mailbox._refresh_thread(conn, r["thread_id"])
         state_filter = "" if include_closed else "AND m.state!='closed'"
         visible_sql, visible_params = _visible_message_sql(conn, "mm")
         rows = conn.execute(
@@ -1262,9 +1287,9 @@ def _send_update(conn, thread_id: str, role: str, body: str, kind: str,
         recipient = next(r for r in active_roles if r != role)
     else:
         recipient = BROADCAST
-    thread = conn.execute(
-        "SELECT * FROM mailbox_threads WHERE id=?", (thread_id,)
-    ).fetchone()
+    # _insert_message documents that callers "must ... have refreshed `thread`";
+    # handing it a raw row is what let a meeting write past its idle deadline.
+    thread = mailbox._refresh_thread(conn, thread_id)
     message_id = mailbox._insert_message(
         conn, thread, sender=role, recipient=recipient, kind=kind,
         body=_clean(body, "message"), reply_to=reply_to,
@@ -1786,10 +1811,16 @@ def _apply_supervisor_payload(verified: auth.VerifiedAssertion, *,
                 "UPDATE meetings SET state=?,updated_at=? WHERE thread_id=?",
                 (next_state, now, thread_id),
             )
+            # Reopening must also grant a fresh idle window, as every mailbox
+            # status write does. A thread paused ON the deadline still carries an
+            # expires_at in the past, so leaving it would have the next read
+            # retire the meeting again immediately — resumption would be a no-op
+            # and the supervisor's override decorative.
+            thread = mailbox._refresh_thread(conn, thread_id)
             conn.execute(
                 """UPDATE mailbox_threads SET status='open',stop_reason=NULL,
-                   stopped_by=NULL,updated_at=? WHERE id=?""",
-                (now, thread_id),
+                   stopped_by=NULL,updated_at=?,expires_at=? WHERE id=?""",
+                (now, mailbox._deadline(_now(), thread["idle_minutes"]), thread_id),
             )
             _event(conn, thread_id, "resumed", supervisor,
                    payload.get("reason", "supervisor resumed"), nonce)

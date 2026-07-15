@@ -25,7 +25,7 @@ records its auth mode and a single-use nonce.
   supported commands. It is **not** cryptographic isolation from hostile code on
   the same host.
 - **signed** — short-lived (≤10 min) Ed25519 assertions from a trusted device.
-  The public key path is fixed at `/etc/deskd/boss_ed25519.pub`, must be
+  The public key path is fixed at `/etc/deskd/supervisor_ed25519.pub`, must be
   root-owned and not group/world-writable, and is **not** environment-overridable —
   otherwise an agent could point verification at a key it wrote. Nonces are
   single-use; expiry, tampering, wrong action/content, and replay all fail closed.

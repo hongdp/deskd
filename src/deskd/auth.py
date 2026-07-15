@@ -21,7 +21,7 @@ supervisor action it observed. That yields four invariants:
    reason...). Downstream code must read those fields from the *signed* payload,
    never from an unsigned sidecar, or the signature guarantees nothing.
 3. **Assertions are short-lived and single-use.** Validity is capped at
-   ``BOSS_ASSERTION_MAX_SECONDS``, and every nonce is burned into the
+   ``SUPERVISOR_ASSERTION_MAX_SECONDS``, and every nonce is burned into the
    ``supervisor_nonces`` ledger by a PRIMARY KEY insert. The insert happens
    *before* the action runs: a nonce is spent whether or not the action
    succeeds, so a failed action can never be retried by replaying its assertion.
@@ -68,10 +68,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
 from .config import (
-    BOSS_ASSERTION_MAX_SECONDS,
-    BOSS_KEY_REQUIRE_ROOT,
-    BOSS_PUBLIC_KEY_PATH,
     CONFIG,
+    SUPERVISOR_ASSERTION_MAX_SECONDS,
+    SUPERVISOR_KEY_REQUIRE_ROOT,
+    SUPERVISOR_PUBLIC_KEY_PATH,
     env,
 )
 
@@ -274,20 +274,20 @@ def _load_trusted_key() -> Ed25519PublicKey:
     mode are re-checked on every verification, not cached: a key that becomes
     agent-writable after startup must stop being trusted immediately.
     """
-    if not BOSS_PUBLIC_KEY_PATH.is_file():
+    if not SUPERVISOR_PUBLIC_KEY_PATH.is_file():
         raise AuthError(
             "supervisor identity is disabled: trusted public key missing at "
-            f"{BOSS_PUBLIC_KEY_PATH}"
+            f"{SUPERVISOR_PUBLIC_KEY_PATH}"
         )
-    stat = BOSS_PUBLIC_KEY_PATH.stat()
+    stat = SUPERVISOR_PUBLIC_KEY_PATH.stat()
     # st_mode & 0o022 == group- or world-writable. Either would let an
     # unprivileged agent replace the key with one it holds the private half of.
-    if BOSS_KEY_REQUIRE_ROOT and (stat.st_uid != 0 or stat.st_mode & 0o022):
+    if SUPERVISOR_KEY_REQUIRE_ROOT and (stat.st_uid != 0 or stat.st_mode & 0o022):
         raise AuthError(
             "supervisor public key must be root-owned and not group/world writable"
         )
     try:
-        key = load_pem_public_key(BOSS_PUBLIC_KEY_PATH.read_bytes())
+        key = load_pem_public_key(SUPERVISOR_PUBLIC_KEY_PATH.read_bytes())
     except Exception as exc:
         raise AuthError("supervisor public key is not a readable PEM public key") from exc
     # Not merely a type nit: an RSA/EC key here would mean verify() below runs a
@@ -304,9 +304,9 @@ def key_status() -> dict:
     never key bytes, and never the access code.
     """
     status: dict = {
-        "path": str(BOSS_PUBLIC_KEY_PATH),
-        "present": BOSS_PUBLIC_KEY_PATH.is_file(),
-        "require_root": BOSS_KEY_REQUIRE_ROOT,
+        "path": str(SUPERVISOR_PUBLIC_KEY_PATH),
+        "present": SUPERVISOR_PUBLIC_KEY_PATH.is_file(),
+        "require_root": SUPERVISOR_KEY_REQUIRE_ROOT,
         "usable": False,
         "problem": None,
     }
@@ -379,7 +379,7 @@ def verify_bytes(raw: bytes, signature_raw: bytes, *, actions: ActionAllowlist,
     ``version == 1``; action is in ``actions``; the action's ``required_fields``
     are present and signed; the assertion is currently valid (``issued_at`` no
     more than 60s in the future, ``expires_at`` not past) with a lifetime <=
-    ``BOSS_ASSERTION_MAX_SECONDS``; nonce is 16..128 characters. Single-use is
+    ``SUPERVISOR_ASSERTION_MAX_SECONDS``; nonce is 16..128 characters. Single-use is
     enforced separately, by :func:`consume_nonce`.
 
     The mode gate is re-checked here as well as in the Web adapter (which needs
@@ -412,10 +412,10 @@ def verify_bytes(raw: bytes, signature_raw: bytes, *, actions: ActionAllowlist,
     expires = _parse_time(payload.get("expires_at"), "expires_at")
     if issued > now + dt.timedelta(seconds=_ISSUED_AT_SKEW_SECONDS) or expires < now:
         raise AuthError("supervisor assertion is not currently valid")
-    if expires - issued > dt.timedelta(seconds=BOSS_ASSERTION_MAX_SECONDS):
+    if expires - issued > dt.timedelta(seconds=SUPERVISOR_ASSERTION_MAX_SECONDS):
         raise AuthError(
             "supervisor assertion lifetime exceeds "
-            f"{BOSS_ASSERTION_MAX_SECONDS // 60} minutes"
+            f"{SUPERVISOR_ASSERTION_MAX_SECONDS // 60} minutes"
         )
     _check_nonce(payload)
     return VerifiedAssertion(payload=payload, raw=raw, signature=signature)
@@ -504,7 +504,7 @@ def mint_simple(action_payload: dict, *, actions: ActionAllowlist,
                 required_fields: RequiredFields | None = None) -> VerifiedAssertion:
     """Mint a claim for an action authenticated only by the access code.
 
-    Explicitly the weak path, and only reachable when ``DESKD_BOSS_AUTH_MODE``
+    Explicitly the weak path, and only reachable when ``DESKD_SUPERVISOR_AUTH_MODE``
     is ``simple`` or ``hybrid``. The caller (the Web adapter) MUST have already
     checked the access code with :func:`verify_access_code`; the mode gate is
     re-checked here so a host that forgets cannot open the weak path by accident.
@@ -545,20 +545,23 @@ _EPHEMERAL_CODE: str | None = None
 
 
 def auth_mode() -> str:
-    """``simple`` | ``signed`` | ``hybrid`` from ``DESKD_BOSS_AUTH_MODE``.
+    """``simple`` | ``signed`` | ``hybrid`` from ``DESKD_SUPERVISOR_AUTH_MODE``.
 
-    The ``BOSS_`` env family is deliberate: it matches the fixed
-    ``config.BOSS_PUBLIC_KEY_PATH`` / ``config.BOSS_CODE_HEADER`` constants, so
-    an operator configures one consistently-named set of knobs. The *role* is
-    still ``CONFIG.supervisor_role`` everywhere in the API.
+    One name runs through the whole trust boundary: the ``SUPERVISOR_`` env
+    knobs, the ``config.SUPERVISOR_*`` constants, the role
+    ``CONFIG.supervisor_role``, and the ``supervisor_nonces`` ledger. An
+    operator reading a variable name never has to map it onto a different term
+    to find what it controls. Note that only the *mode* and the access code are
+    env-settable — ``config.SUPERVISOR_PUBLIC_KEY_PATH`` is fixed on purpose, so
+    no env var can point verification at an agent-written key.
 
     Note the default (``simple``) leaves the signed path DISABLED. Set
     ``signed`` or ``hybrid`` to accept Ed25519 assertions.
     """
-    mode = (env("BOSS_AUTH_MODE") or "simple").strip().lower()
+    mode = (env("SUPERVISOR_AUTH_MODE") or "simple").strip().lower()
     if mode not in _VALID_MODES:
         raise AuthError(
-            "DESKD_BOSS_AUTH_MODE must be one of: " + ", ".join(_VALID_MODES)
+            "DESKD_SUPERVISOR_AUTH_MODE must be one of: " + ", ".join(_VALID_MODES)
         )
     return mode
 
@@ -574,7 +577,7 @@ def signed_auth_enabled() -> bool:
 def simple_access_code() -> str | None:
     """The shared access code for ``simple`` mode, or None if the mode is off.
 
-    Sourced from ``DESKD_BOSS_ACCESS_CODE``. If simple mode is enabled but no
+    Sourced from ``DESKD_SUPERVISOR_ACCESS_CODE``. If simple mode is enabled but no
     code is configured, one random code is generated per process — never a
     literal default, because a checked-in default code is a published password.
     The caller decides how to surface it (typically printed once at startup);
@@ -583,7 +586,7 @@ def simple_access_code() -> str | None:
     global _EPHEMERAL_CODE
     if not simple_auth_enabled():
         return None
-    configured = env("BOSS_ACCESS_CODE")
+    configured = env("SUPERVISOR_ACCESS_CODE")
     if configured:
         return configured
     if _EPHEMERAL_CODE is None:
@@ -594,7 +597,7 @@ def simple_access_code() -> str | None:
 def access_code_is_ephemeral() -> bool:
     """True when the code was generated for this process rather than configured
     — i.e. it dies on restart and should be shown to the operator."""
-    return simple_auth_enabled() and not env("BOSS_ACCESS_CODE")
+    return simple_auth_enabled() and not env("SUPERVISOR_ACCESS_CODE")
 
 
 def verify_access_code(presented: str | None) -> bool:

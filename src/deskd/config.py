@@ -36,10 +36,10 @@ DB_PATH = Path(env("DB") or (BASE_DIR / "data" / f"{PROJECT_NAME}.db"))
 # The supervisor's Ed25519 public key path is INTENTIONALLY fixed and NOT
 # environment-overridable: an agent must not be able to point verification at a
 # key it generated in a writable workspace. Keep the private key off this host.
-BOSS_PUBLIC_KEY_PATH = Path(f"/etc/{PROJECT_NAME}/boss_ed25519.pub")
-BOSS_KEY_REQUIRE_ROOT = True
-BOSS_ASSERTION_MAX_SECONDS = 600
-BOSS_CODE_HEADER = f"X-{PROJECT_NAME.capitalize()}-Supervisor-Code"
+SUPERVISOR_PUBLIC_KEY_PATH = Path(f"/etc/{PROJECT_NAME}/supervisor_ed25519.pub")
+SUPERVISOR_KEY_REQUIRE_ROOT = True
+SUPERVISOR_ASSERTION_MAX_SECONDS = 600
+SUPERVISOR_CODE_HEADER = f"X-{PROJECT_NAME.capitalize()}-Supervisor-Code"
 
 # Role-scoped process lock: every path that can start a session for a role
 # (scheduler, wake driver, host runner) MUST flock this same file, so at most
@@ -68,9 +68,16 @@ class RoleSpec:
 
 @dataclass(frozen=True)
 class WakeRung:
-    """One rung of the escalation ladder. `sla_seconds=None` = terminal."""
+    """One rung of the escalation ladder. `sla_seconds=None` = terminal.
+
+    A rung DECLARES whether reaching it pulls a human in (`leaves_machine`)
+    rather than the engine recognising it by name: the ladder is the host's to
+    define, so channel names carry no meaning to the engine. Defaults to False,
+    so an existing ladder keeps its previous (positional-fallback) behaviour.
+    """
     channel: str
     sla_seconds: int | None
+    leaves_machine: bool = False
 
 
 #: L0 in-session hook → L1 resume → L2 spawn → L3 human → L4 supervisor badge.
@@ -78,8 +85,10 @@ DEFAULT_WAKE_LADDER: tuple[WakeRung, ...] = (
     WakeRung("hook", 60),            # agent online — its in-session hook delivers
     WakeRung("resume", 120),         # resume the role's existing session
     WakeRung("spawn", 180),          # spawn a fresh session for the role
-    WakeRung("human", 300),          # human channel (Discord/email)
-    WakeRung("supervisor_badge", None),  # terminal: persistent red on the console
+    # From here up a person is being pulled in — the rungs that should make
+    # someone look at the board.
+    WakeRung("human", 300, leaves_machine=True),      # human channel (Discord/email)
+    WakeRung("supervisor_badge", None, leaves_machine=True),  # terminal: red on the console
 )
 
 
@@ -134,6 +143,12 @@ class EngineConfig:
     inbox_sources: tuple[str, ...] = (
         "alert", "signal", "system", "meeting", "supervisor",
     )
+
+    #: Allowed task provenance kinds. The host may extend with its own, exactly
+    #: like inbox_sources — agent_tasks.source_kind carries no CHECK constraint
+    #: precisely so the host owns this enumeration. `supervisor_role` is always
+    #: accepted on top of these (it is configurable, so it cannot be a literal).
+    task_sources: tuple[str, ...] = ("meeting", "self", "system")
 
     #: Escalation ladder.
     wake_ladder: tuple[WakeRung, ...] = DEFAULT_WAKE_LADDER

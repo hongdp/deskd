@@ -45,9 +45,19 @@ TASK_STATUSES = {"pending", "in_progress", "blocked", "done", "cancelled"}
 TASK_OPEN_STATUSES = {"pending", "in_progress", "blocked"}
 TASK_PRIORITIES = {"urgent", "normal", "low"}
 
-#: Task provenance kinds that are engine-intrinsic. The supervisor role name is
-#: added at validation time (see ``_task_sources``) because it is configurable.
-TASK_SOURCES_BASE = {"meeting", "self", "system"}
+#: Liveness values that mean a session is executing RIGHT NOW, so its work
+#: breakdown may be shown as current (design.md: the board shows "now executing"
+#: only for a live session). Every surface that renders session_todos shares this
+#: one predicate: a crashed session never calls end_session to clear the mirror,
+#: so the gate — not the cleanup — is what upholds the invariant.
+LIVE_LIVENESS = ("online", "suspect")
+
+#: States in which a session has DECLARED it is not working. Going quiet from one
+#: of these is expected, so it reads `idle` rather than `dead` — the session is
+#: between wakes, which is this engine's normal resting condition, and its id is
+#: still resumable. Going quiet from any other state means it said it was working
+#: and then stopped proving it: that is `dead`, and it should look alarming.
+RESTING_STATES = ("idle_standby", "stopping")
 
 #: Mailbox recipient token meaning "every attendee". Engine-level (defined by
 #: the mailbox transport), not a role. Taken from the module that owns it so a
@@ -77,8 +87,9 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     phase                 TEXT     -- active | draining | closed
 );
 
--- No CHECK on source_kind: a host defines its own task provenance kinds and its
--- own supervisor role name, so the enumeration is validated in Python instead.
+-- No CHECK on source_kind: a host defines its own task provenance kinds
+-- (CONFIG.task_sources) and its own supervisor role name, so the enumeration is
+-- validated in Python instead (see _task_sources).
 CREATE TABLE IF NOT EXISTS agent_tasks (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     title                 TEXT NOT NULL,
@@ -422,7 +433,14 @@ def _agent_role(conn, role: str) -> str:
 
 
 def _task_sources() -> set[str]:
-    return TASK_SOURCES_BASE | {CONFIG.supervisor_role}
+    """Valid ``agent_tasks.source_kind`` values.
+
+    Read from CONFIG at call time, never frozen at import: the host owns this
+    enumeration (that is why the DDL carries no CHECK on the column). The
+    supervisor role is always accepted — it is configurable, so it cannot be one
+    of the literals.
+    """
+    return set(CONFIG.task_sources) | {CONFIG.supervisor_role}
 
 
 # --- presence ---------------------------------------------------------------
@@ -499,7 +517,20 @@ def end_session(role: str, *, db_path: Path | str | None = None) -> None:
 
 
 def _presence_row(row: dict, now: dt.datetime) -> dict:
-    """Attach derived liveness to a raw agent_sessions row."""
+    """Attach derived liveness to a raw agent_sessions row.
+
+    `dead` means "it claims to be working and has stopped heartbeating". It must
+    NOT mean "no process exists": between wakes there is never a process, and
+    this engine's whole premise is that this is normal. A session that parked
+    itself in a resting state and then went quiet is doing exactly what it was
+    told to, so it reads `idle` — and, crucially, stays RESUMABLE.
+
+    Without that distinction a driver has only one way to stop a finished turn
+    looking like a crash: call end_session, which sets ended_at and thereby
+    destroys resumability. That trade was being made silently, and it made the
+    ladder's `resume` rung dead code — every wake paid a cold start while
+    design.md advertised "within a day, resume (context is preserved, cheap)".
+    """
     hb = row.get("last_heartbeat_at")
     age = None
     liveness = "never"
@@ -511,6 +542,8 @@ def _presence_row(row: dict, now: dt.datetime) -> dict:
             liveness = "online"
         elif age < CONFIG.suspect_max_seconds:
             liveness = "suspect"
+        elif row.get("state") in RESTING_STATES:
+            liveness = "idle"
         else:
             liveness = "dead"
     return {
@@ -773,10 +806,22 @@ def sync_delivery(conn) -> int:
 
 
 def _wake_keys(conn) -> set:
-    """(thread, role) pairs with a wake request — the PER-ROLE signal that the
-    system is actively re-driving delivery to that specific role."""
+    """(thread, role) pairs with a PENDING wake request — the per-role signal that
+    the system is actively re-driving delivery to that specific role RIGHT NOW.
+
+    `status='pending'` is the whole point and was once missing. Without it the set
+    answers "has this role ever been woken on this thread?" instead of "is
+    something reacting?" — so the first wake permanently pins every later unread
+    message on that thread to `escalated`, it can never become `overdue`, and no
+    demand is ever raised again. The delivery guarantee dies for that (thread,
+    role) pair after its first success, silently, forever.
+
+    Observed live, not in review: nine messages past SLA on a real desk — one of
+    them nine hours old — with every wake request in the table `acknowledged` and
+    plan_wakes returning zero actions.
+    """
     return {(r["thread_id"], r["role"]) for r in conn.execute(
-        "SELECT thread_id, role FROM meeting_wake_requests")}
+        "SELECT thread_id, role FROM meeting_wake_requests WHERE status='pending'")}
 
 
 def _delivery_state(row, now_iso: str, wake: set) -> str:
@@ -848,9 +893,15 @@ def _human_level(ladder) -> int:
 
     Used for the 'wakes at human level' health counter — the number that should
     make someone look at the board.
+
+    The rung declares this itself (``WakeRung.leaves_machine``) for the same
+    reason ``_channel_level`` looks channels up by name: the ladder is the host's
+    to define, so matching on the default ladder's channel NAMES would silently
+    mis-count the moment a host renamed or reordered its own rungs. A ladder that
+    marks nothing keeps the historical positional guess.
     """
     for i, rung in enumerate(ladder):
-        if rung.channel in ("human", "supervisor_badge"):
+        if rung.leaves_machine:
             return i
     return max(0, len(ladder) - 2)
 
@@ -871,7 +922,18 @@ def collect_wake_demand(conn) -> list[dict]:
                         "source_ref": r["thread_id"], "label": r["agenda"],
                         "since_at": r["created_at"]})
     wake = _wake_keys(conn)
-    for r in conn.execute("SELECT * FROM message_delivery"):
+    # A CLOSED thread raises no wake. Its ledger rows still read `overdue` — that
+    # is an honest record that the message was never read — but waking an agent
+    # to go and read a conversation that has already concluded accomplishes
+    # nothing, and the demand cannot be resolved by anything the agent does, so it
+    # regenerates every tick: a permanent wake loop over dead threads.
+    # `paused` and `escalated` threads DO wake: they can still resume, so an
+    # unread message in one is genuinely undelivered.
+    for r in conn.execute(
+            """SELECT d.* FROM message_delivery d
+               JOIN mailbox_messages mm ON mm.id=d.message_id
+               JOIN mailbox_threads t ON t.id=mm.thread_id
+               WHERE t.status != 'closed'"""):
         if _delivery_state(r, now_iso, wake) == "overdue":
             demands.append({"role": r["recipient_role"], "reason_kind": "stuck_delivery",
                             "source_ref": f'{r["thread_id"]}:{r["message_id"]}',
@@ -916,12 +978,17 @@ def _demand_resolved(conn, role: str, reason_kind: str, source_ref: str,
             tid = int(source_ref)
         except ValueError:
             return (True, "acked")
-        r = conn.execute("SELECT status, priority FROM agent_tasks WHERE id=?",
-                         (tid,)).fetchone()
-        # Resolved when the task is gone OR no longer an urgent-pending demand
-        # (mirror collect_wake_demand's predicate so a de-prioritized-but-still-
-        # pending task retires its attempt instead of orphaning it).
-        resolved = r is None or not (r["status"] == "pending" and r["priority"] == "urgent")
+        r = conn.execute(
+            "SELECT status, priority, assignee_role FROM agent_tasks WHERE id=?",
+            (tid,)).fetchone()
+        # Resolved when the task is gone OR is no longer an urgent-pending demand
+        # FOR THIS ROLE. Every clause here mirrors collect_wake_demand's
+        # predicate, and `assignee_role` is a clause: reassign a task away and
+        # the old assignee's attempt would otherwise escalate forever over work
+        # that is no longer theirs.
+        resolved = r is None or not (
+            r["status"] == "pending" and r["priority"] == "urgent"
+            and r["assignee_role"] == role)
         return (resolved, "acked")
     if reason_kind == "stuck_delivery":
         thread, _, msg = source_ref.partition(":")
@@ -934,11 +1001,34 @@ def _demand_resolved(conn, role: str, reason_kind: str, source_ref: str,
             (mid, role)).fetchone()
         if r is None or r["read_at"]:
             return (True, "read")
-        # Another channel took over (a wake request / escalation now exists).
-        if conn.execute("SELECT 1 FROM meeting_wake_requests WHERE thread_id=? AND role=?",
-                        (thread, role)).fetchone() or \
-           conn.execute("SELECT 1 FROM meeting_escalations WHERE thread_id=?",
+        # The thread closed: collect_wake_demand stops raising this, so resolution
+        # must stop expecting it — otherwise every attempt outstanding at the
+        # moment a thread closes is stranded pending and climbs the ladder
+        # forever over a conversation nobody can rejoin. Another clause of
+        # collect_wake_demand's predicate, and another one that had to be
+        # mirrored by hand.
+        if conn.execute("SELECT 1 FROM mailbox_threads WHERE id=? AND status='closed'",
                         (thread,)).fetchone():
+            return (True, "superseded")
+        # Another channel took over: a PENDING wake request for THIS role.
+        #
+        # Two independent things have to be right here, and each was wrong once:
+        #  - SCOPE: (recipient, item), never the thread that contains it
+        #    (design.md §Delivery rule 2). A thread-level escalation is raised BY
+        #    one role and says nothing about whether anything is re-driving
+        #    delivery to another.
+        #  - TENSE: is something reacting NOW, not has something ever reacted.
+        #    Without status='pending' this asks the second question, and a single
+        #    acknowledged wake — i.e. one that already SUCCEEDED — closes this
+        #    demand forever.
+        # This predicate must stay identical to _delivery_state()'s `wake` test:
+        # collect_wake_demand raises this demand exactly when that returns
+        # 'overdue', so any disagreement closes the attempt every tick and
+        # re-inserts it at the start rung — the demand looks busy and never
+        # climbs the ladder. Identical to a WRONG test is still wrong, though:
+        # both read the same table, so both must ask the same, present-tense
+        # question. Use _wake_keys() semantics, not a hand-rolled copy.
+        if (thread, role) in _wake_keys(conn):
             return (True, "superseded")
         return (False, "")
     if reason_kind == "inbox":
@@ -1005,6 +1095,27 @@ def _wake_prompt(role: str, ds: list[dict], inbox_items: list[dict] | None = Non
     return CONFIG.prompt_builder.wake(role, _wake_reasons_text(ds), titles)
 
 
+@contextmanager
+def _planning_txn(db_path, *, record: bool):
+    """The transaction one tick of ``plan_wakes`` runs in.
+
+    A dry run does the SAME work — it must, because the plan needs the delivery
+    projection to see stuck deliveries, so skipping sync_delivery would change
+    the decision the preview is supposed to be previewing — and then throws the
+    writes away. That makes record=False inert BY CONSTRUCTION instead of by
+    auditing every write on the path (sync_delivery stamps first_projected_at,
+    which is never re-stamped, so a preview would otherwise start the SLA clock).
+    Probes stay gated on `record` at the call site: a rollback cannot undo a
+    network call.
+    """
+    with connect(db_path, write=True) as conn:
+        try:
+            yield conn
+        finally:
+            if not record:
+                conn.rollback()
+
+
 def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dict:
     """The four-step loop as one step: collect demand, close resolved attempts,
     create/escalate the rest, and RETURN a driver plan. Records to wake_attempts
@@ -1019,7 +1130,7 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
     now_iso = _iso(now)
     ladder = _ladder()
     resolved, changed = [], []
-    with connect(db_path, write=record) as conn:
+    with _planning_txn(db_path, record=record) as conn:
         sync_delivery(conn)
         # Agent-registered wake hooks fire first (same txn), so their inbox items
         # are visible to this tick's demand collection. Evaluated only in record
@@ -1677,9 +1788,26 @@ def _meeting_load(conn) -> dict:
 
 def _delivery_health(conn, now_iso: str) -> dict:
     """Delivery health from the projected ledger. `stuck_deliveries` is the
-    invariant-breach surface: past SLA, unread, and NOT yet escalated."""
+    invariant-breach surface: past SLA, unread, and NOT yet escalated.
+
+    CLOSED threads are excluded, and for a different reason than the ledger has.
+    `delivery_ledger()` keeps reporting a closed thread's unread message as
+    `overdue` because that is honest history — it really never was read. This is
+    an ALARM, and an alarm may only count what someone can still act on. A closed
+    conversation cannot be un-missed: counting it means this number ratchets up
+    the first time any thread closes with an unread message and never returns to
+    zero. A gauge that can never read zero is not a gauge, and the only thing
+    worse than no alarm is one everyone has learned to ignore.
+
+    Record and alarm are different jobs. This does the second, so it scopes to
+    the same set the wake path acts on.
+    """
     wake = _wake_keys(conn)
-    rows = conn.execute("SELECT * FROM message_delivery").fetchall()
+    rows = conn.execute(
+        """SELECT d.* FROM message_delivery d
+           JOIN mailbox_messages mm ON mm.id=d.message_id
+           JOIN mailbox_threads t ON t.id=mm.thread_id
+           WHERE t.status != 'closed'""").fetchall()
     oldest_unread = None
     unread = stuck = escalated = 0
     for r in rows:
@@ -1750,7 +1878,8 @@ def board(db_path: Path | str | None = None) -> dict:
             "tasks": role_tasks,
             "task_counts": _count_by_status(all_tasks, role),
             "overdue_count": sum(1 for t in role_tasks if t["overdue"]),
-            "session_todos": todos.get(role),
+            "session_todos": (todos.get(role)
+                              if p["liveness"] in LIVE_LIVENESS else None),
             "wake": wake_pending.get(role, {"pending": 0, "max_level": None}),
             "inbox": _inbox_view(role_inbox),
             "hooks": [h for h in hook_rows if h["owner_role"] == role],
@@ -1804,7 +1933,7 @@ def agent_detail(role: str, db_path: Path | str | None = None) -> dict:
                 "activity": None, "started_at": None, "last_heartbeat_at": None,
                 "ended_at": None}
         pres = _presence_row(dict(sess) if sess else base, now)
-        live = pres["liveness"] in ("online", "suspect")
+        live = pres["liveness"] in LIVE_LIVENESS
 
         td = conn.execute(
             "SELECT snapshot, updated_at FROM session_todos WHERE role=?", (role,)).fetchone()

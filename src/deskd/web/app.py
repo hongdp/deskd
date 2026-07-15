@@ -17,7 +17,7 @@ engines (different DBs/configs) in one process, and tests need a fresh app per
 config. Uvicorn users: `uvicorn --factory deskd.web.app:create_app` (which is
 exactly what `deskd serve` runs).
 
-Two supervisor auth modes, selected by DESKD_BOSS_AUTH_MODE:
+Two supervisor auth modes, selected by DESKD_SUPERVISOR_AUTH_MODE:
 
   signed  — the supervisor signs a JSON assertion with an Ed25519 key that lives
             OFF this host; the engine verifies it against a root-owned public key
@@ -84,7 +84,7 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     """Build the console app. `config` defaults to the process-wide CONFIG."""
     cfg = _install_config(config)
 
-    # Resolve the mode once, at construction: an invalid DESKD_BOSS_AUTH_MODE
+    # Resolve the mode once, at construction: an invalid DESKD_SUPERVISOR_AUTH_MODE
     # must be a loud startup failure, never a surprise 500 mid-meeting.
     auth_mode = auth.auth_mode()
     if auth.simple_auth_enabled() and auth.access_code_is_ephemeral():
@@ -150,15 +150,15 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
                 {"role": p["role"], "display_name": p.get("display_name") or p["role"]}
                 for p in orchestration.presence()
             ],
-            "boss_auth_mode": auth_mode,
+            "supervisor_auth_mode": auth_mode,
             "simple_auth_enabled": auth.simple_auth_enabled(),
             # Usable, not merely enabled: a signed mode whose key is missing or
             # agent-writable is not a working mode, and the console must not
             # advertise it as one.
             "signed_auth_enabled": (auth.signed_auth_enabled()
                                     and auth.key_status()["usable"]),
-            "boss_public_key_path": str(config_mod.BOSS_PUBLIC_KEY_PATH),
-            "code_header": config_mod.BOSS_CODE_HEADER,
+            "supervisor_public_key_path": str(config_mod.SUPERVISOR_PUBLIC_KEY_PATH),
+            "code_header": config_mod.SUPERVISOR_CODE_HEADER,
             "wait_timeout_seconds": meetings.DEFAULT_WAIT_TIMEOUT_SECONDS,
             # Invariant worth stating to the operator: signing happens off-host.
             "private_key_on_server": False,
@@ -183,7 +183,7 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     @app.post("/api/meetings/supervisor-action")
     def api_supervisor_action(
         req: SupervisorActionRequest,
-        code: str = Header(default="", alias=config_mod.BOSS_CODE_HEADER),
+        code: str = Header(default="", alias=config_mod.SUPERVISOR_CODE_HEADER),
     ):
         """Simple mode: shared access code in a header."""
         if not auth.simple_auth_enabled():

@@ -311,7 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
     mt_b = mt.add_parser(
         "supervisor-apply",
         help="apply a supervisor assertion signed by the external key "
-             f"(requires {PROJECT_NAME.upper()}_BOSS_AUTH_MODE=signed|hybrid)")
+             f"(requires {PROJECT_NAME.upper()}_SUPERVISOR_AUTH_MODE=signed|hybrid)")
     mt_b.add_argument("--assertion", required=True, metavar="PATH",
                       help="path to the raw JSON assertion")
     mt_b.add_argument("--signature", required=True, metavar="PATH",

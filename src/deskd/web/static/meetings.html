@@ -122,7 +122,7 @@ async function meta(){
   var n=$("#security");
   if(META.simple_auth_enabled){
     n.className="security";
-    n.textContent="simple auth: one access code authorizes supervisor actions. The code is never written into a meeting, and never embedded in this page. Set DESKD_BOSS_AUTH_MODE=signed or hybrid to require an Ed25519 assertion signed off-host.";
+    n.textContent="simple auth: one access code authorizes supervisor actions. The code is never written into a meeting, and never embedded in this page. Set DESKD_SUPERVISOR_AUTH_MODE=signed or hybrid to require an Ed25519 assertion signed off-host.";
   }else{
     n.className="security bad";
     n.textContent="simple auth is disabled; supervisor actions require the signed assertion endpoint (/api/meetings/supervisor-apply). This console cannot sign — the private key must stay off this host.";

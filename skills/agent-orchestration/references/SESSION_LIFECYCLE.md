@@ -44,7 +44,7 @@ Keep a TodoWrite list. It is the truest signal of what you're doing.
 
 ## Cross-day rollover
 
-Each session is stamped with the trading/working **day** it belongs to (in the
+Each session is stamped with the working **day** it belongs to (in the
 configured timezone) and a phase (`active` → `draining` → `closed`).
 
 On the first tick of a new day, a session left over from a prior day is detected,

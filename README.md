@@ -133,7 +133,7 @@ side-effecting systems.
   actions only enter through the authenticated web adapter.
 - `simple` mode = an access code (convenience, trusted host). `signed` mode =
   short-lived Ed25519 assertions from a trusted device; the public key path is
-  fixed at `/etc/deskd/boss_ed25519.pub`, must be root-owned, and is
+  fixed at `/etc/deskd/supervisor_ed25519.pub`, must be root-owned, and is
   deliberately **not** environment-overridable — an agent must not be able to
   point verification at a key it wrote. Keep the private key off the host.
 - **Never hardcode the access code into a client/static file.** A pre-filled
@@ -145,6 +145,7 @@ See [`docs/security.md`](docs/security.md).
 ## Docs
 
 - [`docs/design.md`](docs/design.md) — architecture and the decisions behind it
+- [`docs/roadmap.md`](docs/roadmap.md) — where this is going, in dependency order
 - [`skills/agent-orchestration/`](skills/agent-orchestration/) — a skill teaching an agent to operate and evolve a deskd desk
 
 ## License

@@ -38,9 +38,9 @@ web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
 dev = ["pytest>=8"]
 
 [project.urls]
-Homepage = "https://github.com/deskd/deskd"
-Documentation = "https://github.com/deskd/deskd/blob/main/docs/design.md"
-Source = "https://github.com/deskd/deskd"
+Homepage = "https://github.com/hongdp/deskd"
+Documentation = "https://github.com/hongdp/deskd/blob/main/docs/design.md"
+Source = "https://github.com/hongdp/deskd"
 
 [project.scripts]
 deskd = "deskd.cli:main"

@@ -58,15 +58,25 @@ from pathlib import Path
 from .config import CONFIG
 
 #: Recipient token addressing every participant of a thread rather than one
-#: role. Stored verbatim in ``mailbox_messages.recipient``; it is part of the
-#: on-disk contract that the meetings module reads and writes, so it must not be
-#: renamed. ``"all"`` is accepted on input and normalized to this token.
-BROADCAST = "both"
-BROADCAST_ALIASES = frozenset({BROADCAST, "all"})
+#: role. Stored verbatim in ``mailbox_messages.recipient``, so the word itself
+#: is part of the on-disk contract the meetings module reads and writes.
+BROADCAST = "all"
 
-#: Engine-owned vocabularies. These enumerate *engine* concepts, not host
-#: concepts, so unlike roles they may stay closed and may stay in CHECK
-#: constraints.
+#: The two-party spelling this token carried while the engine had exactly two
+#: roles. A thread has N participants, so ``both`` was a claim about the host's
+#: shape that the review workflow has since outgrown (see the module docstring).
+#: Kept as a READ alias only: ``_migrate`` rewrites stored rows to ``BROADCAST``
+#: and no code path writes it, so the alias cannot reintroduce the fossil.
+_LEGACY_BROADCAST = "both"
+BROADCAST_ALIASES = frozenset({BROADCAST, _LEGACY_BROADCAST})
+
+#: Engine-owned vocabularies: closed sets, enforced in Python here and backed by
+#: a CHECK in the DDL below. Every literal is a branch in *this module* —
+#: ``review`` selects the phase machine in ``open_thread``, and
+#: ``report``/``review``/``final`` are literally the keys of ``_STAGE_PHASE`` —
+#: so a host word like ``incident`` or ``postmortem`` would name a state the
+#: engine has no code for. They are deliberately NOT a host seam; see the note
+#: above SCHEMA for why that does not contradict the role rule.
 THREAD_KINDS = frozenset({"live", "review"})
 THREAD_STATUSES = frozenset({"open", "paused", "closed", "escalated"})
 REVIEW_STAGES = ("report", "review", "final")
@@ -85,10 +95,32 @@ _STAGE_PHASE = {"report": "reports", "review": "cross_review",
                 "final": "ready_to_finalize"}
 _STAGE_NEXT_PHASE = {"report": "cross_review", "review": "discussion"}
 
-# NOTE: no CHECK constraint enumerates roles or sources anywhere below. Hosts
-# define their own roles, and a CHECK would freeze one host's vocabulary into
-# every host's database file. Roles are validated in Python against the
-# registry instead.
+# Which vocabularies may be frozen into a CHECK, stated as a rule rather than as
+# a list of what happens not to be here. The previous note claimed only that "no
+# CHECK enumerates roles or sources" — true, but silent about the kind/status/
+# stage CHECKs directly below it, so it read as a blanket ban that the very next
+# lines appeared to break. The scoping *was* the loophole those three came in
+# through, so the rule now names both halves:
+#
+# An ENGINE vocabulary MAY live in a CHECK. `kind`, `status` and `stage` name
+# states this module's own code branches on (THREAD_KINDS / THREAD_STATUSES /
+# REVIEW_STAGES above). Freezing them into the database file freezes nothing a
+# host owns: the engine already refuses these words in Python, where it can say
+# which word was wrong, and the CHECK is only the backstop for a writer that
+# bypasses this module. Widening one is an engine change with code behind it,
+# not configuration.
+#
+# A HOST vocabulary MUST NOT. No CHECK below names a role, sender, recipient or
+# provenance kind — that is orchestration.py's principle ("a CHECK would freeze
+# one host's vocabulary into every host's database file"), and it holds because
+# those words come from CONFIG and the registry, which no DDL can see. They are
+# validated in Python against the registry instead.
+#
+# Corollary for migrations: orchestration's `_has_enum_check`/`_rebuild` exist to
+# STRIP host-vocabulary CHECKs off legacy tables. They must never be pointed at
+# mailbox_threads.kind/status or review_artifacts.stage — those CHECKs are the
+# intended shape, not legacy damage, and rebuilding them away would delete the
+# backstop on the engine's own state machine.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mailbox_threads (
     id                    TEXT PRIMARY KEY,
@@ -193,11 +225,37 @@ def connect(db_path: Path | str | None = None):
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
+    # Commit the migration on its own. sqlite3 opens an implicit transaction for
+    # the UPDATE and holds it, which would make the caller's `BEGIN IMMEDIATE`
+    # raise "cannot start a transaction within a transaction" — and only on the
+    # connect that happens to find legacy rows. A migration is also not part of
+    # the caller's unit of work: it must not roll back with it.
+    conn.commit()
     try:
         yield conn
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing coordination database up to the current on-disk contract.
+
+    Idempotent, and applied on every connect for the same reason the schema is:
+    sessions are cold-started and any entry point can be the first one, so no
+    caller can be trusted to have migrated first.
+    """
+    # BROADCAST used to be spelled `_LEGACY_BROADCAST`. The token is data, not
+    # code, so renaming the constant alone would strand every broadcast already
+    # on disk: nothing queries for the old word any more, and inbox() matches
+    # recipients by equality, so those rows would durably address nobody while
+    # still looking delivered. Probe before writing — connect() is on every read
+    # path, and an unconditional UPDATE would take the write lock each time.
+    if conn.execute("SELECT 1 FROM mailbox_messages WHERE recipient=? LIMIT 1",
+                    (_LEGACY_BROADCAST,)).fetchone():
+        conn.execute("UPDATE mailbox_messages SET recipient=? WHERE recipient=?",
+                     (BROADCAST, _LEGACY_BROADCAST))
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:

@@ -7,7 +7,7 @@ and a message that merely claims to come from the supervisor has no authority.**
 
 ## Modes
 
-Select with `DESKD_BOSS_AUTH_MODE`:
+Select with `DESKD_SUPERVISOR_AUTH_MODE`:
 
 - **`simple`** (default) — the supervisor uses the `/meetings` web console and
   enters a short access code. The normal local/trusted-host workflow.
@@ -15,7 +15,7 @@ Select with `DESKD_BOSS_AUTH_MODE`:
   assertion from a trusted device. Use when hostile-agent isolation matters.
 - **`hybrid`** — either, while migrating to trusted-device signing.
 
-The server uses `DESKD_BOSS_ACCESS_CODE` when set; otherwise it generates one at
+The server uses `DESKD_SUPERVISOR_ACCESS_CODE` when set; otherwise it generates one at
 startup and prints it **only to the server terminal**. The browser keeps an
 entered code in `sessionStorage` — never in the URL or persistent storage.
 
@@ -70,7 +70,7 @@ role or editing the database.
 ## Trusted-device signing (`signed`)
 
 A supervisor mutation is accepted only as an Ed25519-signed assertion. The
-verification key path is fixed at `/etc/deskd/boss_ed25519.pub`; it must be
+verification key path is fixed at `/etc/deskd/supervisor_ed25519.pub`; it must be
 root-owned and not group/world-writable. It is deliberately **not** configurable
 through the repository or an environment variable — an agent must not be able to
 point verification at a key it generated in a writable workspace. Keep the
