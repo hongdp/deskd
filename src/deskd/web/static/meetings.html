@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting Console</title>
+<style>
+:root{--bg:#0a0d10;--panel:#12171d;--panel2:#181f27;--line:#2a3540;--text:#f3f7fa;--muted:#94a2af;--green:#70e1b3;--blue:#65adff;--yellow:#f5c56d;--red:#ff8078;--shadow:0 18px 50px rgba(0,0,0,.3)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,rgba(101,173,255,.12),transparent 32rem),radial-gradient(circle at 100% 15%,rgba(112,225,179,.08),transparent 30rem),var(--bg);color:var(--text);font:14px/1.5 Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+button,input,select,textarea{font:inherit}.shell{min-height:100vh;display:grid;grid-template-columns:310px minmax(0,1fr)}
+aside{height:100vh;position:sticky;top:0;overflow:auto;padding:20px 15px;border-right:1px solid var(--line);background:rgba(9,12,15,.9);backdrop-filter:blur(16px)}
+.brand{display:flex;justify-content:space-between;align-items:flex-start;padding:0 7px 16px}.brand h1{font-size:18px;margin:0}.brand p{font-size:12px;color:var(--muted);margin:2px 0}.brand a{color:var(--blue);text-decoration:none}
+.toolbar,.actions{display:flex;gap:8px;flex-wrap:wrap}.toolbar{padding:0 7px 14px}.btn{cursor:pointer;border:1px solid var(--line);border-radius:9px;padding:8px 11px;background:var(--panel2);color:var(--text)}.btn:hover{border-color:#4b5a69}.btn.primary{background:var(--green);color:#062218;border-color:transparent;font-weight:750}.btn.danger{color:var(--red)}
+.meeting-list{display:grid;gap:7px}.meeting{cursor:pointer;width:100%;text-align:left;border:1px solid transparent;border-radius:11px;padding:11px;background:transparent;color:var(--text)}.meeting:hover,.meeting.active{background:var(--panel2);border-color:#34414e}.meeting .line{display:flex;gap:9px;justify-content:space-between}.agenda{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta{font-size:11px;color:var(--muted);margin-top:5px}.dot{height:8px;width:8px;min-width:8px;border-radius:50%;background:var(--muted);margin-top:6px}.dot.active,.dot.consensus{background:var(--green);box-shadow:0 0 12px rgba(112,225,179,.55)}.dot.waiting,.dot.termination_pending{background:var(--yellow)}.dot.escalated,.dot.paused{background:var(--red)}
+main{padding:24px clamp(16px,3vw,42px) 64px;overflow:hidden}.header{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:17px}.eyebrow{font-size:11px;color:var(--green);font-weight:800;letter-spacing:.12em;text-transform:uppercase}h2{font-size:clamp(25px,3vw,36px);line-height:1.12;letter-spacing:-.035em;margin:5px 0}.sub{color:var(--muted)}
+.auth{display:grid;grid-template-columns:1fr auto;gap:9px;align-items:end;min-width:min(390px,100%)}label{display:block;color:var(--muted);font-size:12px;margin:9px 0 5px}input,select,textarea{width:100%;border:1px solid var(--line);border-radius:8px;background:#0b1015;color:var(--text);padding:9px 10px;outline:none}input:focus,select:focus,textarea:focus{border-color:var(--blue)}textarea{resize:vertical;min-height:88px}
+.security{border:1px solid rgba(112,225,179,.3);background:rgba(112,225,179,.06);border-radius:11px;padding:10px 12px;margin:0 0 17px;color:#ccf6e5;font-size:12px}.security.bad{border-color:rgba(255,128,120,.35);background:rgba(255,128,120,.07);color:#ffd2ce}
+.layout{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(340px,.8fr);gap:17px;align-items:start}.card{border:1px solid var(--line);border-radius:14px;background:linear-gradient(180deg,rgba(24,31,39,.97),rgba(16,21,26,.97));box-shadow:var(--shadow);padding:16px;margin-bottom:17px}.card-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.card h3{font-size:14px;margin:0}.quiet{font-size:12px;color:var(--muted)}
+.chips{display:flex;gap:7px;flex-wrap:wrap}.chip{border:1px solid var(--line);border-radius:999px;padding:3px 8px;font-size:11px;color:var(--muted)}.chip.good{color:var(--green);border-color:rgba(112,225,179,.35)}.chip.warn{color:var(--yellow);border-color:rgba(245,197,109,.35)}.chip.bad{color:var(--red);border-color:rgba(255,128,120,.35)}
+.people{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:13px}.person{border:1px solid var(--line);border-radius:10px;background:#0f1419;padding:9px}.person b{display:block;text-transform:capitalize}.person span{font-size:11px;color:var(--muted)}
+.timeline{display:grid;gap:9px;max-height:58vh;overflow:auto}.msg{border-left:2px solid var(--blue);background:#0e1419;border-radius:3px 9px 9px 3px;padding:9px 11px}.msg.sup{border-left-color:var(--green)}.msg-head{display:flex;justify-content:space-between;gap:10px;font-size:11px;color:var(--muted)}.msg-body{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:4px}.receipts{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.rpill{font-size:10px;padding:1px 6px;border-radius:6px;border:1px solid var(--line);color:var(--muted)}.rpill.good{color:var(--green);border-color:var(--green)}.rpill.warn{color:var(--yellow);border-color:var(--yellow)}.rpill.bad{color:var(--red);border-color:var(--red)}.event{color:var(--muted);font-size:12px;padding:2px 8px}.event b{color:#cad4dd}.empty{padding:25px 8px;text-align:center;color:var(--muted)}
+.composer{border-top:1px solid var(--line);margin-top:13px;padding-top:13px}.composer textarea{min-height:72px}.composer-bar{display:flex;gap:8px;align-items:center;margin-top:8px}.composer-bar select{width:auto;min-width:112px}.composer-bar input{width:150px}.composer-bar .btn{margin-left:auto}.composer-hint{font-size:12px;color:var(--muted);margin-top:8px}.composer-hint.bad{color:var(--yellow)}
+.obligation{display:flex;gap:9px;padding:9px 0;border-bottom:1px solid var(--line)}.obligation:last-child{border-bottom:0}.sla{color:var(--yellow);font-variant-numeric:tabular-nums}.row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.result{min-height:28px;color:var(--muted);font-size:12px;margin-top:10px;white-space:pre-wrap;overflow-wrap:anywhere}.result.bad{color:var(--red)}
+dialog{width:min(620px,calc(100vw - 24px));border:1px solid var(--line);border-radius:14px;background:var(--panel);color:var(--text);padding:19px;box-shadow:var(--shadow)}dialog::backdrop{background:rgba(0,0,0,.72);backdrop-filter:blur(4px)}
+@media(max-width:980px){.shell{grid-template-columns:1fr}aside{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line)}.meeting-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.layout{grid-template-columns:1fr}.header{display:block}.auth{margin-top:14px}}@media(max-width:600px){main{padding:17px 11px 48px}.people,.row{grid-template-columns:1fr}.auth{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="shell">
+<aside>
+  <div class="brand"><div><h1>Meeting Console</h1><p>Supervisor oversight</p></div><div style="display:flex;gap:10px"><a href="/">← Board</a></div></div>
+  <div class="toolbar"><button class="btn primary" id="open-call">Call meeting</button><button class="btn" id="refresh">Refresh</button></div>
+  <label style="padding:0 7px 8px"><input id="show-closed" type="checkbox" style="width:auto"> Show closed</label>
+  <div class="meeting-list" id="meeting-list"></div>
+</aside>
+<main>
+  <div class="header">
+    <div><div class="eyebrow">Supervisor oversight</div><h2 id="title">Select a meeting</h2><div class="sub" id="subtitle">Watch, call, and join agent meetings</div></div>
+    <div class="auth"><div><label>Supervisor access code</label><input id="access-code" type="password" autocomplete="current-password" placeholder="printed by the server at startup, or set in .env"></div><button class="btn" id="remember">Keep for session</button></div>
+  </div>
+  <div class="security" id="security">Reading auth mode…</div>
+  <div class="layout">
+    <section>
+      <div class="card">
+        <div class="card-head"><h3>Meeting status</h3><span class="quiet" id="updated">—</span></div>
+        <div class="chips" id="status"></div><div class="people" id="people"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Meeting thread</h3><span class="quiet">non-blocking refresh every 5s</span></div>
+        <div class="timeline" id="timeline"><div class="empty">Select a meeting</div></div>
+        <div class="composer">
+          <textarea id="message-body" placeholder="Send a message… (Enter to send, Shift+Enter for a newline)"></textarea>
+          <div class="composer-bar"><button class="btn primary" id="send-message">Send</button></div>
+          <div class="composer-hint" id="composer-hint">Select a meeting</div>
+        </div>
+      </div>
+    </section>
+    <section>
+      <div class="card">
+        <div class="card-head"><h3>Response SLA</h3><span class="quiet" id="sla-quiet">—</span></div>
+        <div id="obligations"><div class="empty">Nothing owed</div></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Meeting controls</h3><span class="quiet">actions available for the current state</span></div>
+        <div class="actions" id="sup-actions"><div class="empty">Select a meeting</div></div>
+        <div class="result" id="result"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Escalations</h3><span class="quiet">human channels / outbox</span></div>
+        <div id="escalations"><div class="empty">No escalations</div></div>
+      </div>
+    </section>
+  </div>
+</main>
+</div>
+
+<dialog id="call-dialog">
+  <div class="card-head"><h3>Call a meeting</h3><button class="btn" id="close-call">Close</button></div>
+  <label>Agenda</label><input id="call-agenda" placeholder="e.g. urgent review">
+  <div class="row"><div><label>Type</label><select id="call-type"><option value="ad-hoc">ad-hoc</option><option value="live">live</option><option value="review">review</option></select></div><div><label>Priority</label><select id="call-priority"><option value="urgent">urgent</option><option value="normal">normal</option></select></div></div>
+  <label>Attendees</label>
+  <!-- Populated from the agent registry via /api/meeting-meta — never hardcoded. -->
+  <div class="chips" id="call-roles"><span class="chip">loading…</span></div>
+  <div class="row"><div><label>Message limit</label><input id="call-limit" type="number" min="2" value="20"></div><div><label>Consensus threshold</label><input id="call-threshold" type="number" min="2" value="4"></div></div>
+  <div class="actions" style="margin-top:13px"><button class="btn primary" id="call">Call now</button></div>
+  <div class="result" id="call-result"></div>
+</dialog>
+
+<script>
+var meetings=[],selected=null,detail=null,delivery={};
+// META comes from /api/meeting-meta: the supervisor identity, the registered
+// roles, the auth modes in force, and the name of the access-code header (it is
+// derived from the project name server-side). Nothing here is hardcoded.
+var META={supervisor_role:"supervisor",roles:[],code_header:"",wait_timeout_seconds:300};
+function $(s){return document.querySelector(s)}
+function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function fmt(v){return v?new Date(v).toLocaleString([],{month:"short",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}):"—"}
+function code(){return $("#access-code").value}
+function setResult(text,bad){$("#result").textContent=text;$("#result").className="result"+(bad?" bad":"")}
+function stateChip(state){var c=["active","closed"].includes(state)?"good":["waiting","consensus","termination_pending"].includes(state)?"warn":"bad";return '<span class="chip '+c+'">'+esc(state)+'</span>'}
+function activePeople(s){return s.attendees.filter(function(a){return a.checked_in_at&&!a.stopped_at})}
+async function api(url,opts){var r=await fetch(url,opts);var data=await r.json();if(!r.ok)throw new Error(data.detail||JSON.stringify(data));return data}
+// Every supervisor mutation goes through the authenticated adapter; the code is
+// sent per-request and never stored anywhere but this browser session.
+async function supervisor(payload){
+  if(!code())throw new Error("enter the supervisor access code");
+  var headers={"Content-Type":"application/json"};
+  headers[META.code_header]=code();
+  return api("/api/meetings/supervisor-action",{method:"POST",headers:headers,body:JSON.stringify({payload:payload})});
+}
+function renderCallRoles(){
+  var n=$("#call-roles");
+  var agents=(META.roles||[]).filter(function(r){return r.role!==META.supervisor_role});
+  if(!agents.length){n.innerHTML='<span class="chip bad">no agent roles registered</span>';return}
+  n.innerHTML=agents.map(function(r){return '<label class="chip"><input type="checkbox" class="call-role" value="'+esc(r.role)+'" checked style="width:auto"> '+esc(r.display_name||r.role)+'</label>'}).join("")
+    +'<span class="chip good">'+esc(META.supervisor_role)+'</span>';
+}
+async function meta(){
+  META=await api("/api/meeting-meta");
+  $("#sla-quiet").textContent=(META.wait_timeout_seconds||300)+"s";
+  renderCallRoles();
+  var n=$("#security");
+  if(META.simple_auth_enabled){
+    n.className="security";
+    n.textContent="simple auth: one access code authorizes supervisor actions. The code is never written into a meeting, and never embedded in this page. Set DESKD_BOSS_AUTH_MODE=signed or hybrid to require an Ed25519 assertion signed off-host.";
+  }else{
+    n.className="security bad";
+    n.textContent="simple auth is disabled; supervisor actions require the signed assertion endpoint (/api/meetings/supervisor-apply). This console cannot sign — the private key must stay off this host.";
+  }
+}
+async function load(preserve){var closed=$("#show-closed").checked;meetings=await api("/api/meetings?include_closed="+closed);if(!preserve||!selected||!meetings.some(function(x){return x.meeting.thread_id===selected})){selected=meetings.length?meetings[0].meeting.thread_id:null}renderList();if(selected)await loadOne();else empty()}
+function renderList(){var n=$("#meeting-list");if(!meetings.length){n.innerHTML='<div class="empty">No meetings</div>';return}n.innerHTML=meetings.map(function(s){var m=s.meeting;return '<button class="meeting '+(m.thread_id===selected?"active":"")+'" data-id="'+esc(m.thread_id)+'"><div class="line"><span class="agenda">'+esc(m.agenda)+'</span><span class="dot '+esc(m.state)+'"></span></div><div class="meta">'+esc(s.mode)+' · '+activePeople(s).length+' active · '+m.messages_remaining+' msgs left</div></button>'}).join("");n.querySelectorAll("[data-id]").forEach(function(el){el.onclick=async function(){selected=el.dataset.id;renderList();await loadOne()}})}
+function empty(){$("#title").textContent="No active meeting";$("#subtitle").textContent="Press “Call meeting” to start one";$("#timeline").innerHTML='<div class="empty">No thread</div>';$("#people").innerHTML="";$("#status").innerHTML="";$("#obligations").innerHTML='<div class="empty">Nothing owed</div>';selected=null;detail=null;renderActions();updateComposer()}
+async function loadOne(){detail=await api("/api/meetings/"+encodeURIComponent(selected));try{delivery=await api("/api/delivery?meeting="+encodeURIComponent(selected))}catch(e){delivery={}}renderOne()}
+function renderOne(){var s=detail.status,m=s.meeting;$("#title").textContent=m.agenda;$("#subtitle").textContent=m.meeting_type+" · called by "+m.called_by+" · "+m.thread_id;$("#updated").textContent="updated "+fmt(m.updated_at);$("#status").innerHTML=stateChip(m.state)+'<span class="chip">'+esc(s.mode)+'</span><span class="chip">'+m.messages_remaining+' messages left</span><span class="chip">'+m.wait_timeout_seconds+'s SLA</span>';$("#people").innerHTML=s.attendees.map(function(a){var st=a.stopped_at?"left":a.checked_in_at?"present":"invited";return '<div class="person"><b>'+esc(a.role)+'</b><span>'+st+' · '+fmt(a.checked_in_at||a.invited_at)+'</span></div>'}).join("");timeline();obligations();escalations();renderActions();updateComposer()}
+// Per-recipient receipts: prefer the delivery ledger (it knows the SLA hops),
+// fall back to the thread's own read_state when the ledger has no row yet.
+function readPills(x){if(!detail||!detail.status)return"";var att=detail.status.attendees||[];var roles=att.map(function(a){return a.role}).filter(function(r){return r!==x.sender&&(x.recipient==="both"||x.recipient==="all"||x.recipient===r)});if(!roles.length)return"";var dv=(delivery||{})[String(x.id)]||{};var rs=x.read_state||{};return '<div class="receipts">'+roles.map(function(r){var d=dv[r];if(d){var cls="",lbl;if(d.state==="read"){cls="good";lbl="read"}else if(d.state==="escalated"){cls="bad";lbl="escalated · unread"}else if(d.state==="overdue"){cls="bad";lbl="overdue · unread!"}else if(d.state==="notified"){cls="warn";lbl="notified · unread"}else{lbl="queued"}var tip=[d.queued_at?"queued "+d.queued_at:"",d.notified_at?"notified "+d.notified_at:"",d.read_at?"read "+d.read_at:"","SLA "+d.sla_due_at].filter(Boolean).join(" · ");return '<span class="rpill '+cls+'" title="'+esc(tip)+'">'+esc(r)+' '+lbl+'</span>'}var s=rs[r],cls2="",lbl2="not notified";if(s&&s.state==="read"){cls2="good";lbl2="read"}else if(s&&s.state==="notified"){cls2="warn";lbl2="notified · unread"}return '<span class="rpill '+cls2+'" title="'+(s?esc(s.at):"")+'">'+esc(r)+' '+lbl2+'</span>'}).join("")+'</div>'}
+function timeline(){var all=detail.messages.map(function(x){return{type:"m",time:x.created_at,id:x.id,x:x}}).concat(detail.events.map(function(x){return{type:"e",time:x.created_at,id:x.id,x:x}}));all.sort(function(a,b){return a.time.localeCompare(b.time)||a.type.localeCompare(b.type)||a.id-b.id});$("#timeline").innerHTML=all.length?all.map(function(i){var x=i.x;if(i.type==="m")return '<div class="msg '+(x.sender===META.supervisor_role?"sup":"")+'"><div class="msg-head"><span>#'+x.id+' · '+esc(x.sender)+' → '+esc(x.recipient)+' · '+esc(x.kind)+(x.reply_to?" · reply #"+x.reply_to:"")+'</span><span>'+fmt(x.created_at)+'</span></div><div class="msg-body">'+esc(x.body)+'</div>'+readPills(x)+'</div>';return '<div class="event"><b>'+esc(x.actor)+'</b> · '+esc(x.event)+' · '+esc(x.detail)+' · '+fmt(x.created_at)+'</div>'}).join(""):'<div class="empty">No messages yet</div>';$("#timeline").scrollTop=$("#timeline").scrollHeight}
+function obligations(){var p=detail.status.response_obligations.filter(function(o){return o.status==="pending"});$("#obligations").innerHTML=p.length?p.map(function(o){var sec=Math.floor((new Date(o.due_at)-Date.now())/1000);var sla=sec<0?"overdue by "+Math.abs(sec)+"s":sec+"s left";return '<div class="obligation"><span class="dot waiting"></span><div><b>'+esc(o.owed_by)+'</b> must answer #'+o.message_id+'<div class="quiet">'+esc(o.sender)+' · '+esc(o.kind)+' · <span class="sla">'+sla+'</span></div></div></div>'}).join(""):'<div class="empty">No mandatory responses pending</div>'}
+function escalations(){var e=detail.escalations;$("#escalations").innerHTML=e.length?e.map(function(x){return '<div class="obligation"><span class="dot '+(x.status==="sent"?"active":"waiting")+'"></span><div>'+esc(x.reason)+'<div class="quiet">'+esc(x.channel)+' · '+esc(x.status)+' · '+fmt(x.created_at)+'</div></div></div>'}).join(""):'<div class="empty">No escalations</div>'}
+function updateComposer(){var button=$("#send-message"),hint=$("#composer-hint");if(!selected||!detail){button.disabled=true;hint.className="composer-hint";hint.textContent="Select a meeting";return}var s=detail.status,m=s.meeting,missing=s.attendees.filter(function(a){return a.required&&!a.checked_in_at&&!a.stopped_at}).map(function(a){return a.role});var allowed=["active","consensus","escalated","waiting"].includes(m.state);button.disabled=!allowed;hint.className="composer-hint"+(allowed?"":" bad");hint.textContent=m.state==="waiting"?"Meeting has not started (waiting for "+(missing.join(", ")||"attendees")+" to check in) — your message is kept as an opening remark and is readable once they arrive.":allowed?"Sent as "+META.supervisor_role+"; you are joined automatically if needed.":"State is "+m.state+"; messages cannot be sent right now."}
+async function joinIfNeeded(){var me=detail.status.attendees.find(function(a){return a.role===META.supervisor_role&&!a.stopped_at});if(!me)await supervisor({action:"join",meeting_id:selected})}
+async function sendMessage(){var body=$("#message-body").value.trim();if(!selected)throw new Error("select a meeting");if(!body)throw new Error("enter a message");await joinIfNeeded();await supervisor({action:"send",meeting_id:selected,body:body,kind:"decision"});$("#message-body").value="";setResult("Message sent.",false);await load(true)}
+async function runAction(payload,needJoin){try{setResult("Working…",false);if(needJoin)await joinIfNeeded();await supervisor(payload);setResult("Done.",false);await load(true)}catch(e){setResult(e.message,true)}}
+function renderActions(){var n=$("#sup-actions");if(!selected||!detail){n.innerHTML='<div class="empty">Select a meeting</div>';return}var m=detail.status.meeting,t=detail.status.termination,html="";if(t&&m.state==="termination_pending")html+='<button class="btn primary" id="act-confirm">Confirm end</button><button class="btn" id="act-reject">Reject end</button>';if(["paused","escalated"].includes(m.state))html+='<button class="btn" id="act-resume">Resume</button>';if(m.state!=="closed")html+='<button class="btn danger" id="act-close">Force close</button>';n.innerHTML=html||'<div class="empty">Meeting is closed</div>';var b;if(b=$("#act-confirm"))b.onclick=function(){if(confirm("End this meeting?"))runAction({action:"confirm_end",meeting_id:selected,proposal_id:t.id},true)};if(b=$("#act-reject"))b.onclick=function(){runAction({action:"reject_end",meeting_id:selected,proposal_id:t.id,reason:"supervisor rejected the end proposal; continue"},true)};if(b=$("#act-resume"))b.onclick=function(){runAction({action:"resume",meeting_id:selected,reason:"supervisor resumed the meeting"})};if(b=$("#act-close"))b.onclick=function(){var reason=prompt("Reason for closing","supervisor closed the meeting");if(reason&&reason.trim())runAction({action:"force_close",meeting_id:selected,reason:reason.trim()},true)}}
+$("#remember").onclick=function(){sessionStorage.setItem("deskdSupervisorCode",code());setResult("Access code kept for this browser session only.",false)}
+$("#open-call").onclick=function(){$("#call-dialog").showModal()} ;$("#close-call").onclick=function(){$("#call-dialog").close()}
+$("#call").onclick=async function(){var out=$("#call-result");try{var agenda=$("#call-agenda").value.trim();if(!agenda)throw new Error("agenda is required");var attendees=[META.supervisor_role];document.querySelectorAll(".call-role:checked").forEach(function(el){attendees.push(el.value)});if(attendees.length<2)throw new Error("select at least one agent");var res=await supervisor({action:"call",agenda:agenda,attendees:attendees,meeting_type:$("#call-type").value,priority:$("#call-priority").value,idle_minutes:60,max_messages:Number($("#call-limit").value),consensus_threshold:Number($("#call-threshold").value),wait_timeout_seconds:META.wait_timeout_seconds||300});out.textContent="Meeting created: "+res.meeting.thread_id;$("#call-dialog").close();await load(false)}catch(e){out.textContent=e.message}}
+$("#send-message").onclick=async function(){try{$("#send-message").disabled=true;setResult("Sending…",false);await sendMessage()}catch(e){setResult(e.message,true)}finally{updateComposer()}}
+$("#message-body").onkeydown=function(e){if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();if(!$("#send-message").disabled)$("#send-message").click()}}
+$("#refresh").onclick=function(){load(true)};$("#show-closed").onchange=function(){load(false)}
+// NO hardcoded access-code default, ever. A client-side pre-fill of the real
+// code IS the code: this page is served to anyone who can reach the server, so
+// a literal here publishes the credential to every reader of the page source.
+// (The upstream project shipped exactly that bug once — the literal in this file
+// was the server's live access code.) Convenience is preserved by sessionStorage
+// instead: enter the code once, press "Keep for session", and it persists for the
+// browser session only. Do NOT re-introduce a literal default.
+async function init(){$("#access-code").value=sessionStorage.getItem("deskdSupervisorCode")||"";await meta();await load(false);setInterval(function(){load(true).catch(function(){})},5000)}
+init().catch(function(e){setResult(e.message,true)})
+</script>
+</body>
+</html>

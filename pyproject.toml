@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deskd"
+description = "A domain-agnostic orchestration engine for multi-agent desks: presence, a unified inbox, bounded meetings, and a wake ladder that proves delivery."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "deskd contributors" }]
+keywords = ["agents", "orchestration", "multi-agent", "scheduling", "sqlite"]
+# No "License :: OSI Approved :: MIT License" classifier: PEP 639 supersedes it
+# with the SPDX `license` field above, and PyPI rejects an upload that carries
+# both a License-Expression and a license classifier.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: System :: Distributed Computing",
+]
+# The engine core is stdlib + cryptography, and that is a deliberate constraint:
+# it stores state in SQLite and holds the supervisor trust boundary, so it must
+# be installable anywhere without dragging in a web stack. cryptography is NOT
+# optional — Ed25519 verification is the trust boundary, and an install that
+# silently degraded to "no signature checking" is worse than one that fails.
+dependencies = ["cryptography>=41"]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+# The console (board / agent detail / meetings + the supervisor adapter).
+web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/deskd/deskd"
+Documentation = "https://github.com/deskd/deskd/blob/main/docs/design.md"
+Source = "https://github.com/deskd/deskd"
+
+[project.scripts]
+deskd = "deskd.cli:main"
+
+[tool.hatch.version]
+path = "src/deskd/config.py"
+
+# This ships every file under src/deskd, including web/static/*.html — the
+# console's pages are data, not code, and a wheel without them would leave
+# `deskd serve` returning a FileResponse to a path that does not exist. Do not
+# add a force-include for them: they are already here, and hatchling refuses to
+# write the same archive path twice.
+[tool.hatch.build.targets.wheel]
+packages = ["src/deskd"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/scripts",
+    "/docs",
+    "/skills",
+    "/README.md",
+    "/LICENSE",
+    "/.env.example",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

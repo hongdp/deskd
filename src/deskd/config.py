@@ -1,0 +1,183 @@
+"""deskd configuration — the single contract every engine module codes against.
+
+deskd is a domain-agnostic orchestration engine for multi-agent desks: it owns
+agent presence, a unified notification inbox, cross-session tasks, bounded
+meetings, wake orchestration (timers/cron/probes + an escalation ladder), a
+delivery ledger, and session lifecycle. It knows nothing about any domain — a
+host application supplies the roles, the notification sources, and the prompt
+that boots a woken session.
+
+Nothing here is domain-specific. If you find yourself adding a domain concept
+to this file, it belongs in the host application instead.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+PROJECT_NAME = "deskd"
+ENV_PREFIX = "DESKD_"
+__version__ = "0.1.0"
+
+
+def env(name: str, default: str | None = None) -> str | None:
+    """Read a deskd env var (DESKD_<NAME>)."""
+    return os.environ.get(ENV_PREFIX + name, default)
+
+
+# --- paths ------------------------------------------------------------------
+
+BASE_DIR = Path(env("HOME") or Path.cwd())
+DB_PATH = Path(env("DB") or (BASE_DIR / "data" / f"{PROJECT_NAME}.db"))
+
+# The supervisor's Ed25519 public key path is INTENTIONALLY fixed and NOT
+# environment-overridable: an agent must not be able to point verification at a
+# key it generated in a writable workspace. Keep the private key off this host.
+BOSS_PUBLIC_KEY_PATH = Path(f"/etc/{PROJECT_NAME}/boss_ed25519.pub")
+BOSS_KEY_REQUIRE_ROOT = True
+BOSS_ASSERTION_MAX_SECONDS = 600
+BOSS_CODE_HEADER = f"X-{PROJECT_NAME.capitalize()}-Supervisor-Code"
+
+# Role-scoped process lock: every path that can start a session for a role
+# (scheduler, wake driver, host runner) MUST flock this same file, so at most
+# one session per role ever runs.
+def role_lock_path(role: str) -> Path:
+    return Path(f"/tmp/{PROJECT_NAME}-role-{role}.lock")
+
+
+def driver_lock_path() -> Path:
+    return Path(f"/tmp/{PROJECT_NAME}-wake-driver.lock")
+
+
+# --- role registry ----------------------------------------------------------
+
+@dataclass(frozen=True)
+class RoleSpec:
+    """One agent role. `authority` is an opaque dict the engine stores and
+    surfaces but never interprets — the host decides what it means."""
+    name: str
+    display_name: str = ""
+    capabilities: tuple[str, ...] = ()
+    authority: dict = field(default_factory=dict)
+
+
+# --- wake ladder ------------------------------------------------------------
+
+@dataclass(frozen=True)
+class WakeRung:
+    """One rung of the escalation ladder. `sla_seconds=None` = terminal."""
+    channel: str
+    sla_seconds: int | None
+
+
+#: L0 in-session hook → L1 resume → L2 spawn → L3 human → L4 supervisor badge.
+DEFAULT_WAKE_LADDER: tuple[WakeRung, ...] = (
+    WakeRung("hook", 60),            # agent online — its in-session hook delivers
+    WakeRung("resume", 120),         # resume the role's existing session
+    WakeRung("spawn", 180),          # spawn a fresh session for the role
+    WakeRung("human", 300),          # human channel (Discord/email)
+    WakeRung("supervisor_badge", None),  # terminal: persistent red on the console
+)
+
+
+# --- prompts ----------------------------------------------------------------
+
+class PromptBuilder:
+    """How a woken session is booted. A cold-spawned session has NO context, so
+    the host must tell it what it is and where its instructions live.
+
+    Subclass and pass via EngineConfig.prompt_builder to inject your own
+    bootstrap (e.g. "load the <x> skill, declare role=<role>, follow <playbook>").
+    """
+
+    def bootstrap(self, role: str) -> str:
+        return (f"Headless orchestrator wake. You are role={role}. "
+                f"Load your role's instructions before acting.")
+
+    def wake(self, role: str, reasons: str, inbox_titles: list[str]) -> str:
+        lines = "; ".join(inbox_titles[:5])
+        more = f" (+{len(inbox_titles) - 5} more)" if len(inbox_titles) > 5 else ""
+        notes = f" Notifications: {lines}{more}." if inbox_titles else ""
+        return (f"{self.bootstrap(role)} Woken because: {reasons}.{notes} "
+                f"First: `{PROJECT_NAME} wake sources --role {role}`, then handle "
+                f"your inbox and ack it. End your turn when done — never sleep, "
+                f"poll, or self-schedule; the orchestrator wakes you.")
+
+
+# --- engine config ----------------------------------------------------------
+
+@dataclass
+class EngineConfig:
+    """Everything domain-specific the engine needs, injected by the host."""
+
+    #: Roles seeded into agent_registry. EMPTY by default — the host supplies
+    #: them; the engine never assumes any particular role exists.
+    roles: tuple[RoleSpec, ...] = ()
+
+    #: The human/supervisor identity. NEVER a valid agent role: agent-facing
+    #: APIs reject it, and supervisor actions only enter via the authenticated
+    #: Web adapter.
+    supervisor_role: str = "supervisor"
+
+    #: Timezone for the session-rollover day boundary and cron hook defaults.
+    timezone: str = env("TZ") or "UTC"
+
+    #: Dotted-path prefixes a `probe` wake-hook may import, e.g.
+    #: ("myapp.watchers",). EMPTY = deny all probes. The engine only ever runs
+    #: code the host explicitly allows; a probe may observe and notify, nothing else.
+    probe_allowlist: tuple[str, ...] = ()
+
+    #: Allowed inbox source kinds. The host may extend with its own.
+    inbox_sources: tuple[str, ...] = (
+        "alert", "signal", "system", "meeting", "supervisor",
+    )
+
+    #: Escalation ladder.
+    wake_ladder: tuple[WakeRung, ...] = DEFAULT_WAKE_LADDER
+
+    #: Non-urgent inbox items coalesce for this long before they wake anyone.
+    inbox_batch_seconds: int = 180
+
+    #: Presence liveness thresholds (seconds since last heartbeat).
+    online_max_seconds: int = 120
+    suspect_max_seconds: int = 600
+
+    #: Minimum interval for recurring hooks; probe default interval.
+    min_hook_every: int = 60
+    default_probe_every: int = 600
+    #: Consecutive probe errors before the hook is auto-disabled + owner notified.
+    max_error_streak: int = 3
+
+    #: Session bootstrap / wake prompt construction.
+    prompt_builder: PromptBuilder = field(default_factory=PromptBuilder)
+
+    #: Coordination DB.
+    db_path: Path = field(default_factory=lambda: DB_PATH)
+
+    def role_names(self) -> tuple[str, ...]:
+        return tuple(r.name for r in self.roles)
+
+    def tzinfo(self):
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(self.timezone)
+        except Exception:
+            return dt.timezone.utc
+
+
+#: Process-wide default. A host may mutate this at startup, or pass an explicit
+#: EngineConfig into the API.
+CONFIG = EngineConfig()
+
+
+def configure(**kwargs) -> EngineConfig:
+    """Convenience: mutate the process-wide default config."""
+    global CONFIG
+    for k, v in kwargs.items():
+        if not hasattr(CONFIG, k):
+            raise ValueError(f"unknown config field: {k}")
+        setattr(CONFIG, k, v)
+    return CONFIG

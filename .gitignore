@@ -1,0 +1,28 @@
+# --- data / secrets: NEVER commit ---
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+data/
+logs/
+*.log
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- os / editor ---
+.DS_Store
+*.swp
+.idea/
+.vscode/

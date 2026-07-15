@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Board</title>
+<style>
+:root{--bg:#0a0d10;--panel:#12171d;--panel2:#181f27;--line:#2a3540;--text:#f3f7fa;--muted:#94a2af;--green:#70e1b3;--blue:#65adff;--yellow:#f5c56d;--red:#ff8078;--shadow:0 18px 50px rgba(0,0,0,.3)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,rgba(101,173,255,.12),transparent 32rem),radial-gradient(circle at 100% 15%,rgba(112,225,179,.08),transparent 30rem),var(--bg);color:var(--text);font:14px/1.5 Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--blue);text-decoration:none}button{font:inherit}
+.wrap{max-width:1180px;margin:0 auto;padding:22px clamp(14px,3vw,34px) 60px}
+.top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:16px}
+.eyebrow{font-size:11px;color:var(--green);font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+h1{font-size:clamp(24px,3vw,34px);letter-spacing:-.035em;margin:5px 0}.sub{color:var(--muted)}
+.nav{display:flex;gap:10px;flex-wrap:wrap}.nav a{border:1px solid var(--line);border-radius:9px;padding:7px 11px;background:var(--panel2)}
+.banner{display:flex;gap:16px;flex-wrap:wrap;align-items:center;border:1px solid rgba(112,225,179,.3);background:rgba(112,225,179,.06);border-radius:12px;padding:11px 15px;margin-bottom:18px;font-size:13px}
+.banner.warn{border-color:rgba(245,197,109,.4);background:rgba(245,197,109,.07)}.banner.bad{border-color:rgba(255,128,120,.4);background:rgba(255,128,120,.08)}
+.banner b{color:var(--text)}.banner .metric{color:var(--muted)}.banner .metric b{font-variant-numeric:tabular-nums}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}
+.card{border:1px solid var(--line);border-radius:14px;background:linear-gradient(180deg,rgba(24,31,39,.97),rgba(16,21,26,.97));box-shadow:var(--shadow);padding:16px}
+.chead{display:flex;align-items:center;gap:10px;margin-bottom:4px}.chead h2{font-size:18px;margin:0}
+.dot{height:11px;width:11px;min-width:11px;border-radius:50%;background:var(--muted)}
+.dot.online{background:var(--green);box-shadow:0 0 12px rgba(112,225,179,.6)}.dot.suspect{background:var(--yellow)}.dot.dead,.dot.offline{background:var(--red)}
+.liveness{font-size:12px;color:var(--muted);margin-left:auto;text-align:right}
+.activity{background:#0e1419;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:10px 0}
+.activity .now{font-weight:650}.activity .meta{font-size:12px;color:var(--muted);margin-top:3px}
+.nowbox{background:linear-gradient(180deg,rgba(101,173,255,.10),rgba(101,173,255,.03));border:1px solid rgba(101,173,255,.3);border-radius:10px;padding:10px 12px;margin:2px 0}
+.now-item{font-weight:600;overflow-wrap:anywhere}.now-item+.now-item{margin-top:4px}.now-item::before{content:"▶ ";color:var(--blue)}
+.qsum{display:flex;gap:13px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:2px 0 6px;padding:6px 10px;border:1px dashed var(--line);border-radius:9px}.qsum b{color:var(--text);font-variant-numeric:tabular-nums}
+.wbreak{font-size:12px;color:var(--muted);margin:6px 0 0;padding-left:18px}.wbreak li{margin:2px 0}.wbreak .ip{color:var(--blue);font-weight:600}.wbreak .dn{text-decoration:line-through;opacity:.55}
+.section{margin-top:12px}.section h3{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:0 0 7px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}.chip{border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:11px;color:var(--muted)}
+.chip.good{color:var(--green);border-color:rgba(112,225,179,.35)}.chip.warn{color:var(--yellow);border-color:rgba(245,197,109,.35)}.chip.bad{color:var(--red);border-color:rgba(255,128,120,.4)}
+.mrow{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted)}.mrow b{color:var(--text);font-variant-numeric:tabular-nums}
+.mtg{font-size:12px;color:var(--muted);margin-top:6px}.mtg a{color:var(--blue)}
+.tasks{display:grid;gap:7px}
+.task{border-left:3px solid var(--line);background:#0e1419;border-radius:3px 9px 9px 3px;padding:8px 10px}
+.task.urgent{border-left-color:var(--red)}.task.overdue{border-left-color:var(--red);background:rgba(255,128,120,.06)}
+.task .t-top{display:flex;gap:8px;align-items:baseline;justify-content:space-between}
+.task .title{font-weight:600;overflow-wrap:anywhere}.task .t-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+.badge{font-size:10px;padding:1px 6px;border-radius:6px;border:1px solid var(--line);color:var(--muted)}
+.badge.urgent{color:var(--red);border-color:var(--red)}.badge.low{color:var(--muted)}
+.badge.overdue{color:#062218;background:var(--red);border-color:transparent;font-weight:700}
+.badge.due{color:var(--yellow);border-color:rgba(245,197,109,.4)}
+.badge.src{color:var(--blue);border-color:rgba(101,173,255,.35)}
+.todos{font-size:12px;color:var(--muted)}.todos summary{cursor:pointer}.todos li{margin:2px 0}
+.empty{color:var(--muted);font-size:12px;padding:4px 0}
+.events{margin-top:20px}.events .card{padding:14px 16px}
+.evline{font-size:12px;color:var(--muted);padding:3px 0;border-bottom:1px solid rgba(42,53,64,.5)}.evline:last-child{border-bottom:0}.evline b{color:#cad4dd}
+.foot{color:var(--muted);font-size:12px;margin-top:14px;text-align:center}
+@media(max-width:560px){.grid{grid-template-columns:1fr}.top{display:block}.nav{margin-top:12px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div><div class="eyebrow">Orchestration</div><h1>Agent Board</h1><div class="sub">Live state and queued work for every agent · refreshes every 5s</div></div>
+    <div class="nav"><a href="/meetings">Meeting console</a></div>
+  </div>
+  <div class="banner" id="banner">Loading…</div>
+  <div class="grid" id="grid"></div>
+  <div class="events"><div class="card"><h3 style="margin:0 0 8px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Wake hooks (registered · all agents)</h3><div id="hooks"><div class="empty">Loading…</div></div></div></div>
+  <div class="events"><div class="card"><h3 style="margin:0 0 8px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Wake orchestration activity</h3><div id="wake"><div class="empty">No wakes yet</div></div></div></div>
+  <div class="events"><div class="card"><h3 style="margin:0 0 8px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Orchestration event stream</h3><div id="events"><div class="empty">No events yet</div></div></div></div>
+  <div class="foot" id="foot"></div>
+</div>
+<script>
+function $(s){return document.querySelector(s)}
+function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function ago(sec){if(sec==null)return"—";sec=Math.abs(Math.round(sec));if(sec<60)return sec+"s";if(sec<3600)return Math.floor(sec/60)+"m";if(sec<86400)return Math.floor(sec/3600)+"h";return Math.floor(sec/86400)+"d"}
+function agoTs(ts){if(!ts)return"—";return ago((Date.now()-new Date(ts))/1000)+" ago"}
+function dueLabel(t){if(!t.due_at)return"";var sec=(new Date(t.due_at)-Date.now())/1000;if(t.overdue||sec<0)return '<span class="badge overdue">'+ago(sec)+' overdue</span>';return '<span class="badge due">due in '+ago(sec)+'</span>'}
+function livenessText(a){var s={online:"online",suspect:"suspect",dead:"presumed offline",offline:"session ended",never:"never seen"}[a.liveness]||a.liveness;var age=a.heartbeat_age_seconds!=null?" · heartbeat "+ago(a.heartbeat_age_seconds)+" ago":"";var life=a.phase==="draining"?' · <span style="color:var(--yellow)">handing off</span>':a.stale_day?' · <span style="color:var(--yellow)">stale session, rollover due</span>':(a.session_day?" · "+a.session_day:"");return s+age+life}
+
+function renderBanner(h,gen){
+  var b=$("#banner"),cls="banner";
+  // stuck_deliveries = a message past its SLA, still unread, with NO escalation
+  // yet: the delivery-guarantee breach. That is the only hard-red condition.
+  if(h.stuck_deliveries>0)cls="banner bad";
+  else if(h.total_overdue>0||h.unsent_escalations>0||h.escalated_deliveries>0||(h.oldest_unread_age_seconds!=null&&h.oldest_unread_age_seconds>300))cls="banner warn";
+  b.className=cls;
+  var unread=h.oldest_unread_age_seconds!=null?("<b>"+ago(h.oldest_unread_age_seconds)+"</b>"):"<b>none</b>";
+  b.innerHTML='<b>System health</b>'
+    +'<span class="metric">open tasks <b>'+h.total_open_tasks+'</b></span>'
+    +'<span class="metric">overdue <b>'+h.total_overdue+'</b></span>'
+    +'<span class="metric">unread deliveries <b>'+(h.unread_deliveries||0)+'</b></span>'
+    +'<span class="metric">stuck <b>'+(h.stuck_deliveries||0)+'</b></span>'
+    +'<span class="metric">escalating <b>'+(h.escalated_deliveries||0)+'</b></span>'
+    +'<span class="metric">inbox queued <b>'+(h.inbox_queued||0)+'</b></span>'
+    +'<span class="metric">pending wakes <b>'+(h.pending_wakes||0)+'</b></span>'
+    +'<span class="metric">at human level <b>'+(h.wakes_at_human_level||0)+'</b></span>'
+    +'<span class="metric">oldest unread '+unread+'</span>'
+    +'<span class="metric">unsent escalations <b>'+h.unsent_escalations+'</b></span>';
+}
+// Friendly labels for the DEFAULT wake ladder. The ladder is host-configurable,
+// so anything unknown falls back to the raw channel name rather than "".
+var WAKE_CH={hook:"in-session hook",resume:"resume",spawn:"spawn",human:"human channel",supervisor_badge:"supervisor badge"};
+function wakeChip(w){if(!w||!w.pending)return"";var lvl=w.max_level==null?"":" L"+w.max_level;var cls=w.max_level>=3?"bad":w.max_level>=1?"warn":"";return '<span class="chip '+cls+'">waking'+lvl+' ('+w.pending+')</span>'}
+// Inbox source kinds are host-extensible: render whatever the engine reports.
+function inboxRow(i,delivered){
+  var cls="task"+(i.priority==="urgent"?" urgent":"");
+  var pri=i.priority==="urgent"?'<span class="badge urgent">urgent</span>':"";
+  var src='<span class="badge src">'+esc(i.source_kind)+(i.ref&&i.ref!=="*"?" · "+esc(i.ref):"")+'</span>';
+  var st=delivered?'<span class="badge">delivered · awaiting ack</span>':'<span class="badge due">queued</span>';
+  return '<div class="'+cls+'"'+(delivered?' style="opacity:.55"':'')+'><div class="t-top"><span class="title">'+esc(i.title)+'</span></div><div class="t-meta">'+pri+st+src+' · '+agoTs(i.enqueued_at)+'</div></div>';
+}
+function inboxHtml(ib){
+  if(!ib||(!ib.queued_count&&!ib.delivered_count))return'<div class="empty">Inbox empty</div>';
+  return '<div class="tasks">'+ib.queued.map(function(i){return inboxRow(i,false)}).join("")+ib.delivered.map(function(i){return inboxRow(i,true)}).join("")+'</div>';
+}
+var HOOK_KIND={at:"timer",interval:"interval",probe:"probe"};
+function hookNext(h){return h.next_fire_at?(new Date(h.next_fire_at)-Date.now()>0?"in "+ago((new Date(h.next_fire_at)-Date.now())/1000):"due"):"—"}
+function hookLine(h,withOwner){
+  var err=h.last_error?' · <span style="color:var(--yellow)">last run errored</span>':"";
+  var own=withOwner?'<b>'+esc(h.owner_role)+'</b> · ':"";
+  return '<div class="evline">'+own+'#'+h.id+' <b>'+esc(HOOK_KIND[h.kind]||h.kind)+'</b> · '+esc(h.title)+(h.priority==="urgent"?' <span class="badge urgent">urgent</span>':"")+' · next '+esc(hookNext(h))+' · fired '+h.fire_count+err+'</div>';
+}
+// Per-card section — ALWAYS visible (empty state included) so the hooks feature
+// is discoverable even before any hook is registered.
+function hooksHtml(hs){
+  var body=(hs&&hs.length)?hs.map(function(h){return hookLine(h,false)}).join("")
+    :'<div class="empty">No hooks (<code>deskd hook add</code> registers timer / interval / probe wakes)</div>';
+  return '<div class="section"><h3>Wake hooks'+(hs&&hs.length?' · '+hs.length:"")+'</h3>'+body+'</div>';
+}
+// Consolidated panel — every agent's currently-registered hooks in one place.
+function renderHooks(agents){
+  var all=[];(agents||[]).forEach(function(a){(a.hooks||[]).forEach(function(h){all.push(Object.assign({owner_role:a.role},h))})});
+  var n=$("#hooks");
+  if(!all.length){n.innerHTML='<div class="empty">No hooks registered. An agent registers one with <code>deskd hook add --for ROLE --title "…" (--at ISO | --every SECONDS | --probe module.path:&lt;fn&gt;)</code>.</div>';return}
+  n.innerHTML=all.map(function(h){return hookLine(h,true)}).join("");
+}
+
+function taskHtml(t){
+  var cls="task"+(t.overdue?" overdue":t.priority==="urgent"?" urgent":"");
+  var pri=t.priority==="urgent"?'<span class="badge urgent">urgent</span>':t.priority==="low"?'<span class="badge low">low</span>':"";
+  var src='<span class="badge src">'+esc(t.source_kind)+(t.source_ref?" · "+esc(t.source_ref):"")+'</span>';
+  var st=t.status!=="pending"?'<span class="badge">'+esc(t.status)+'</span>':"";
+  return '<div class="'+cls+'"><div class="t-top"><span class="title">'+esc(t.title)+'</span></div>'
+    +'<div class="t-meta">'+(t.overdue?dueLabel(t):pri)+(t.overdue?pri:dueLabel(t))+st+src+'</div>'
+    +(t.detail?'<div class="mtg">'+esc(t.detail)+'</div>':"")+'</div>';
+}
+
+function meetingHtml(m){
+  if(!m)return'<div class="empty">—</div>';
+  var chips="";
+  var wake=m.pending_wakes||0,unread=m.unread_messages||0,ob=(m.response_obligations||{}).pending||0;
+  chips+='<span class="chip'+(wake?" bad":"")+'">pending wakes '+wake+'</span>';
+  chips+='<span class="chip'+(unread?" warn":"")+'">unread '+unread+'</span>';
+  chips+='<span class="chip'+(ob?" warn":"")+'">response owed '+ob+'</span>';
+  var mtgs=(m.active_meetings||[]).map(function(x){return '<a href="/meetings">'+esc(x.agenda)+'</a>'}).join(", ");
+  return '<div class="chips">'+chips+'</div>'+(mtgs?'<div class="mtg">In: '+mtgs+'</div>':'<div class="mtg">No meetings in progress</div>');
+}
+
+function todoSplit(td){
+  var out={inprog:[],pending:[],done:[]};
+  if(td&&Array.isArray(td.snapshot))td.snapshot.forEach(function(x){
+    var s=String((x&&(x.status||x.state))||"").toLowerCase();
+    var c=(x&&(x.content||x.activeForm||x.title||x.text))||(typeof x==="string"?x:"");
+    if(!c)return;
+    if(s==="in_progress"||s==="active"||s==="doing")out.inprog.push(c);
+    else if(s==="completed"||s==="done")out.done.push(c);
+    else out.pending.push(c);
+  });
+  return out;
+}
+function isLive(a){return a.liveness==="online"||a.liveness==="suspect"}
+// Now executing: ONLY for a live session — in-progress todo(s) if the agent keeps
+// a todo list, else its self-reported activity. An ended/offline session shows
+// "session ended" with its last report dimmed (never as current execution).
+function nowHtml(a){
+  if(!isLive(a)){
+    var last=a.activity?'<div class="meta" style="margin-top:6px">Last report: '+esc(a.activity)+'</div>':"";
+    return '<div class="section"><h3>Now executing</h3><div class="nowbox"><div class="empty">Session ended / standing by</div>'+last+'</div></div>';
+  }
+  var t=todoSplit(a.session_todos);
+  var body=t.inprog.length
+    ? t.inprog.map(function(c){return '<div class="now-item">'+esc(c)+'</div>'}).join("")
+    : (a.activity?'<div class="now-item">'+esc(a.activity)+'</div>':'<div class="empty">Idle / standing by</div>');
+  var meta='<div class="meta" style="margin-top:6px">'+esc(a.state||"—")+(a.harness?" · "+esc(a.harness):"")+(a.started_at?" · started "+agoTs(a.started_at):"")+(a.session_todos&&a.session_todos.updated_at?" · todo "+agoTs(a.session_todos.updated_at):"")+'</div>';
+  return '<div class="section"><h3>Now executing</h3><div class="nowbox">'+body+meta+'</div></div>';
+}
+// Queue: one-line summary of everything waiting to reach this agent.
+function queueSummaryHtml(a){
+  var t=isLive(a)?todoSplit(a.session_todos):{inprog:[],pending:[],done:[]};
+  var ib=(a.inbox&&a.inbox.queued_count)||0, pend=(a.task_counts&&a.task_counts.pending)||0, hk=(a.hooks&&a.hooks.length)||0;
+  var next=hk?a.hooks.map(function(h){return h.next_fire_at}).filter(Boolean).sort()[0]:null;
+  var nx=next&&(new Date(next)-Date.now()>0)?" · next in "+ago((new Date(next)-Date.now())/1000):"";
+  return '<div class="qsum"><span><b>Queue</b></span><span>inbox <b>'+ib+'</b></span><span>open tasks <b>'+pend+'</b></span><span>next steps <b>'+t.pending.length+'</b></span><span>hooks <b>'+hk+'</b>'+nx+'</span></div>';
+}
+function workBreakdownHtml(a){
+  if(!isLive(a))return"";
+  var t=todoSplit(a.session_todos);
+  if(!t.inprog.length&&!t.pending.length&&!t.done.length)return"";
+  function li(arr,cls){return arr.map(function(c){return '<li class="'+cls+'">'+esc(c)+'</li>'}).join("")}
+  return '<div class="section"><details class="todos"><summary>Work breakdown (session todos · in progress '+t.inprog.length+' / pending '+t.pending.length+' / done '+t.done.length+', '+agoTs(a.session_todos&&a.session_todos.updated_at)+')</summary><ul class="wbreak">'+li(t.inprog,"ip")+li(t.pending,"")+li(t.done,"dn")+'</ul></details></div>';
+}
+
+function cardHtml(a){
+  var tasks=a.tasks&&a.tasks.length?'<div class="tasks">'+a.tasks.map(taskHtml).join("")+'</div>':'<div class="empty">No open tasks</div>';
+  var c=a.task_counts||{};
+  var counts='<div class="mrow" style="margin-top:7px"><span>pending <b>'+(c.pending||0)+'</b></span><span>in-progress <b>'+(c.in_progress||0)+'</b></span><span>blocked <b>'+(c.blocked||0)+'</b></span><span>done <b>'+(c.done||0)+'</b></span></div>';
+  return '<div class="card">'
+    +'<div class="chead"><span class="dot '+esc(a.liveness)+'"></span><h2><a href="/agent/'+encodeURIComponent(a.role)+'" style="color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted)">'+esc(a.display_name||a.role)+'</a> <a href="/agent/'+encodeURIComponent(a.role)+'" style="font-size:12px;color:var(--blue);text-decoration:none;font-weight:400">details →</a></h2><span class="liveness">'+livenessText(a)+'</span></div>'
+    +nowHtml(a)
+    +queueSummaryHtml(a)
+    +'<div class="section"><h3>Inbox'+(a.inbox&&a.inbox.urgent_queued?' · <span style="color:var(--red)">'+a.inbox.urgent_queued+' urgent</span>':(a.inbox&&a.inbox.queued_count?' · '+a.inbox.queued_count+' queued':""))+'</h3>'+inboxHtml(a.inbox)+'</div>'
+    +'<div class="section"><h3>Meeting obligations &amp; wakes</h3>'+meetingHtml(a.meeting)+(wakeChip(a.wake)?'<div class="chips" style="margin-top:6px">'+wakeChip(a.wake)+'</div>':"")+'</div>'
+    +hooksHtml(a.hooks)
+    +'<div class="section"><h3>Tasks'+(a.overdue_count?' · <span style="color:var(--red)">'+a.overdue_count+' overdue</span>':"")+'</h3>'+tasks+counts+'</div>'
+    +workBreakdownHtml(a)
+    +'</div>';
+}
+
+function renderEvents(evs){
+  var n=$("#events");
+  if(!evs||!evs.length){n.innerHTML='<div class="empty">No events yet</div>';return}
+  n.innerHTML=evs.map(function(e){var p=e.payload&&typeof e.payload==="object"?" · "+esc(Object.entries(e.payload).filter(function(kv){return kv[1]!=null}).map(function(kv){return kv[0]+"="+kv[1]}).join(" ")):"";return '<div class="evline"><b>'+esc(e.actor)+'</b> · '+esc(e.kind)+(e.ref?" · "+esc(e.ref):"")+p+' · '+agoTs(e.created_at)+'</div>'}).join("");
+}
+function renderWake(ws){
+  var n=$("#wake");
+  if(!ws||!ws.length){n.innerHTML='<div class="empty">No wakes yet</div>';return}
+  n.innerHTML=ws.map(function(w){var oc=w.outcome==="pending"?'<span style="color:'+(w.level>=3?"var(--red)":"var(--yellow)")+'">in progress</span>':w.outcome==="acked"||w.outcome==="read"?'<span style="color:var(--green)">delivered'+(w.latency_seconds!=null?" "+ago(w.latency_seconds):"")+'</span>':esc(w.outcome);return '<div class="evline"><b>'+esc(w.role)+'</b> · '+esc(w.reason_kind)+' · '+esc(WAKE_CH[w.channel]||w.channel)+' L'+w.level+' · '+oc+' · '+agoTs(w.attempted_at)+'</div>'}).join("");
+}
+
+async function load(){
+  try{
+    var r=await fetch("/api/board");
+    var b=null;try{b=await r.json()}catch(_){}
+    if(!r.ok)throw new Error((b&&b.detail)||("HTTP "+r.status));
+    if(!b)throw new Error("response could not be parsed");
+    renderBanner(b.health,b.generated_at);
+    $("#grid").innerHTML=b.agents.length?b.agents.map(cardHtml).join(""):'<div class="empty">No agents registered yet.</div>';
+    renderHooks(b.agents);
+    renderWake(b.wake_activity);
+    renderEvents(b.recent_events);
+    $("#foot").textContent="updated "+new Date(b.generated_at).toLocaleTimeString();
+  }catch(e){$("#banner").className="banner bad";$("#banner").textContent="Failed to load: "+e.message}
+}
+load();setInterval(load,5000);
+</script>
+</body>
+</html>

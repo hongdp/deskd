@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent detail</title>
+<style>
+:root{--bg:#0a0d10;--panel:#12171d;--panel2:#181f27;--line:#2a3540;--text:#f3f7fa;--muted:#94a2af;--green:#70e1b3;--blue:#65adff;--yellow:#f5c56d;--red:#ff8078;--shadow:0 18px 50px rgba(0,0,0,.3)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,rgba(101,173,255,.12),transparent 32rem),radial-gradient(circle at 100% 15%,rgba(112,225,179,.08),transparent 30rem),var(--bg);color:var(--text);font:14px/1.5 Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--blue);text-decoration:none}
+.wrap{max-width:1120px;margin:0 auto;padding:20px clamp(14px,3vw,34px) 60px}
+.top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px;flex-wrap:wrap}
+.back{border:1px solid var(--line);border-radius:9px;padding:7px 11px;background:var(--panel2)}
+.nav{display:flex;gap:10px;flex-wrap:wrap}
+.eyebrow{font-size:11px;color:var(--green);font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+h1{font-size:clamp(22px,3vw,32px);letter-spacing:-.035em;margin:5px 0}
+.dot{height:11px;width:11px;min-width:11px;border-radius:50%;background:var(--muted);display:inline-block;vertical-align:middle;margin-right:7px}
+.dot.online{background:var(--green);box-shadow:0 0 12px rgba(112,225,179,.6)}.dot.suspect{background:var(--yellow)}.dot.dead,.dot.offline{background:var(--red)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
+.card{border:1px solid var(--line);border-radius:14px;background:linear-gradient(180deg,rgba(24,31,39,.97),rgba(16,21,26,.97));box-shadow:var(--shadow);padding:16px;margin-bottom:16px}
+.card h2{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:0 0 10px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}.chip{border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:11px;color:var(--muted)}
+.chip.good{color:var(--green);border-color:rgba(112,225,179,.35)}.chip.warn{color:var(--yellow);border-color:rgba(245,197,109,.35)}.chip.bad{color:var(--red);border-color:rgba(255,128,120,.4)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}.kv .k{color:var(--muted)}.kv .v{overflow-wrap:anywhere}
+.nowbox{background:linear-gradient(180deg,rgba(101,173,255,.10),rgba(101,173,255,.03));border:1px solid rgba(101,173,255,.3);border-radius:10px;padding:10px 12px;margin-top:6px}
+.now-item{font-weight:600;overflow-wrap:anywhere}.now-item::before{content:"▶ ";color:var(--blue)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{text-align:left;padding:5px 8px;border-bottom:1px solid rgba(42,53,64,.6);vertical-align:top;overflow-wrap:anywhere}
+th{color:var(--muted);font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.05em}
+tr:last-child td{border-bottom:0}
+.tblwrap{overflow-x:auto}
+.badge{font-size:10px;padding:1px 6px;border-radius:6px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.badge.urgent,.badge.bad{color:var(--red);border-color:var(--red)}.badge.good{color:var(--green);border-color:var(--green)}.badge.warn{color:var(--yellow);border-color:var(--yellow)}
+.empty{color:var(--muted);font-size:12px;padding:8px 0}
+.evline{font-size:12px;color:var(--muted);padding:3px 0;border-bottom:1px solid rgba(42,53,64,.5)}.evline:last-child{border-bottom:0}.evline b{color:#cad4dd}
+.foot{color:var(--muted);font-size:12px;margin-top:14px;text-align:center}
+.full{grid-column:1/-1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div><div class="eyebrow">Agent detail</div><h1 id="title">…</h1><div id="subtitle" class="chips"></div></div>
+    <div class="nav"><a class="back" href="/">← Agent Board</a><a class="back" href="/meetings">Meetings</a></div>
+  </div>
+  <div id="body"><div class="empty">Loading…</div></div>
+  <div class="foot" id="foot"></div>
+</div>
+<script>
+function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function ago(sec){if(sec==null)return"—";sec=Math.abs(Math.round(sec));if(sec<60)return sec+"s";if(sec<3600)return Math.floor(sec/60)+"m";if(sec<86400)return Math.floor(sec/3600)+"h";return Math.floor(sec/86400)+"d"}
+function agoTs(ts){if(!ts)return"—";return ago((Date.now()-new Date(ts))/1000)+" ago"}
+function fmt(ts){return ts?new Date(ts).toLocaleString([],{month:"short",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}):"—"}
+// The page is served at /agent/<role>; the role is the last path segment.
+function role(){return decodeURIComponent(location.pathname.split("/").filter(Boolean).pop()||"")}
+function card(title,inner,full){return '<div class="card'+(full?' full':'')+'"><h2>'+esc(title)+'</h2>'+inner+'</div>'}
+function tbl(head,rows){if(!rows.length)return'<div class="empty">No records</div>';return '<div class="tblwrap"><table><thead><tr>'+head.map(function(h){return '<th>'+esc(h)+'</th>'}).join("")+'</tr></thead><tbody>'+rows.join("")+'</tbody></table></div>'}
+
+// Inbox source kinds are host-extensible — render whatever the engine reports.
+var HOOK_KIND={at:"timer",interval:"interval",probe:"probe"};
+function inboxState(i){if(i.acked_at)return'<span class="badge good">acked</span>';if(i.delivered_at)return'<span class="badge warn">delivered</span>';return'<span class="badge">queued</span>'}
+function delivState(s){var c=s==="read"?"good":s==="overdue"?"bad":s==="escalated"?"warn":"";return '<span class="badge '+c+'">'+esc(s)+'</span>'}
+function taskState(s){var c=s==="done"?"good":s==="cancelled"?"":s==="blocked"?"bad":s==="in_progress"?"warn":"";return '<span class="badge '+c+'">'+esc(s)+'</span>'}
+function wkOutcome(o){var c=(o==="acked"||o==="read")?"good":o==="pending"?"warn":o==="failed"?"bad":"";return '<span class="badge '+c+'">'+esc(o)+'</span>'}
+
+function profileCard(d){
+  var p=d.profile||{},pr=d.presence||{};
+  var caps=(p.capabilities||[]).map(function(c){return '<span class="chip">'+esc(c)+'</span>'}).join("");
+  // `authority` is an opaque host-defined dict: display, never interpret.
+  var auth=Object.entries(p.authority||{}).map(function(kv){return '<span class="chip '+(kv[1]?"good":"")+'">'+esc(kv[0])+"="+esc(kv[1])+'</span>'}).join("");
+  return card("Profile / authority",
+    '<div class="kv"><span class="k">Role</span><span class="v">'+esc(d.role)+'</span>'
+    +'<span class="k">Capabilities</span><span class="v"><div class="chips">'+(caps||"—")+'</div></span>'
+    +'<span class="k">Authority</span><span class="v"><div class="chips">'+(auth||"—")+'</div></span></div>');
+}
+function sessionCard(d){
+  var p=d.presence||{},live=p.liveness==="online"||p.liveness==="suspect";
+  var now;
+  if(live){
+    var ip=[];(d.session_todos&&Array.isArray(d.session_todos.snapshot)?d.session_todos.snapshot:[]).forEach(function(x){if(String(x.status||"").toLowerCase()==="in_progress")ip.push(x.content||x.activeForm||"")});
+    now=ip.length?ip.map(function(c){return '<div class="now-item">'+esc(c)+'</div>'}).join("")
+       :(p.activity?'<div class="now-item">'+esc(p.activity)+'</div>':'<div class="empty">Idle</div>');
+  }else{
+    now='<div class="empty">Session ended / standing by</div>'+(p.activity?'<div class="evline" style="margin-top:6px">Last report: '+esc(p.activity)+'</div>':"");
+  }
+  return card("Current session & now executing",
+    '<div class="kv"><span class="k">Liveness</span><span class="v"><span class="dot '+esc(p.liveness)+'"></span>'+esc(p.liveness)+(p.heartbeat_age_seconds!=null?" · heartbeat "+ago(p.heartbeat_age_seconds)+" ago":"")+'</span>'
+    +'<span class="k">Phase</span><span class="v">'+esc(p.phase||"—")+(p.stale_day?' <span class="badge warn">stale session</span>':"")+'</span>'
+    +'<span class="k">Session day</span><span class="v">'+esc(p.session_day||"—")+'</span>'
+    +'<span class="k">Session</span><span class="v">'+esc(p.session_id||"—")+' · '+esc(p.harness||"")+'</span>'
+    +'<span class="k">Start / end</span><span class="v">'+fmt(p.started_at)+' → '+(p.ended_at?fmt(p.ended_at):"in progress")+'</span></div>'
+    +'<div class="nowbox">'+now+'</div>');
+}
+function meetingCard(d){
+  var m=d.meeting||{};
+  var mtgs=(m.active_meetings||[]).map(function(x){return '<a href="/meetings">'+esc(x.agenda)+'</a>'}).join(", ")||"none";
+  return card("Meetings",
+    '<div class="chips"><span class="chip'+(m.pending_wakes?" bad":"")+'">pending wakes '+(m.pending_wakes||0)+'</span><span class="chip'+(m.unread_messages?" warn":"")+'">unread '+(m.unread_messages||0)+'</span><span class="chip'+((m.response_obligations||{}).pending?" warn":"")+'">response owed '+((m.response_obligations||{}).pending||0)+'</span></div>'
+    +'<div class="kv" style="margin-top:8px"><span class="k">Attending</span><span class="v">'+mtgs+'</span></div>');
+}
+function inboxCard(d){
+  var rows=(d.inbox||[]).map(function(i){return '<tr><td>'+inboxState(i)+'</td><td>'+esc(i.source_kind)+(i.priority==="urgent"?' <span class="badge urgent">!</span>':"")+'</td><td>'+esc(i.title)+(i.ref&&i.ref!=="*"?' <span class="badge">'+esc(i.ref)+'</span>':"")+'</td><td>'+agoTs(i.enqueued_at)+'</td></tr>'});
+  return card("Inbox (all, latest 100)",tbl(["State","Source","Item","Enqueued"],rows),true);
+}
+function tasksCard(d){
+  var c=d.task_counts||{};
+  var head='<div class="chips" style="margin-bottom:8px"><span class="chip">pending '+(c.pending||0)+'</span><span class="chip warn">in-progress '+(c.in_progress||0)+'</span><span class="chip bad">blocked '+(c.blocked||0)+'</span><span class="chip good">done '+(c.done||0)+'</span><span class="chip">cancelled '+(c.cancelled||0)+'</span></div>';
+  var rows=(d.tasks||[]).map(function(t){return '<tr><td>#'+t.id+'</td><td>'+taskState(t.status)+(t.overdue?' <span class="badge bad">overdue</span>':"")+'</td><td>'+esc(t.priority)+'</td><td>'+esc(t.title)+(t.result_note?'<div class="evline">'+esc(t.result_note)+'</div>':"")+'</td><td>'+esc(t.source_kind)+(t.source_ref?"·"+esc(t.source_ref):"")+'</td><td>created '+agoTs(t.created_at)+'<br>updated '+agoTs(t.updated_at)+'</td></tr>'});
+  return card("Tasks (all + execution history)",head+tbl(["id","State","Priority","Title / result","Source","Time"],rows),true);
+}
+function wakeCard(d){
+  var rows=(d.wake_history||[]).map(function(w){return '<tr><td>'+esc(w.reason_kind)+'</td><td>'+esc(w.channel)+' L'+w.level+'</td><td>'+wkOutcome(w.outcome)+'</td><td>'+(w.latency_seconds!=null?ago(w.latency_seconds):"—")+'</td><td>'+esc(w.source_ref||"")+'</td><td>'+fmt(w.attempted_at)+'</td></tr>'});
+  return card("Wake history (latest 80)",tbl(["Reason","Channel / level","Outcome","Latency","Source","Time"],rows),true);
+}
+function deliveryCard(d){
+  var rows=(d.delivery||[]).map(function(x){return '<tr><td>#'+x.message_id+'</td><td>'+delivState(x.state)+'</td><td>'+esc(x.thread_id)+'</td><td>queued '+agoTs(x.queued_at)+'</td><td>'+(x.read_at?"read "+agoTs(x.read_at):(x.notified_at?"notified "+agoTs(x.notified_at):"—"))+'</td></tr>'});
+  return card("Message delivery ledger (latest 80)",tbl(["msg","State","Thread","Queued","Read / notified"],rows),true);
+}
+function hooksCard(d){
+  var rows=(d.hooks||[]).map(function(h){var sp=h.spec||{};var spec=h.kind==="probe"?esc(sp.callable||"")+" /"+(sp.every||"?")+"s":h.kind==="interval"?("every "+(sp.every||"?")+"s"):("@"+esc(sp.at||""));return '<tr><td>#'+h.id+'</td><td>'+esc(HOOK_KIND[h.kind]||h.kind)+'</td><td>'+esc(h.title)+'</td><td>'+spec+'</td><td>'+esc(h.status)+(h.last_error?' <span class="badge bad" title="'+esc(h.last_error)+'">err</span>':"")+'</td><td>'+(h.next_fire_at?agoTs(h.next_fire_at):"—")+' · x'+h.fire_count+'</td></tr>'});
+  return card("Wake hooks (all)",tbl(["id","Kind","Title","Spec","Status","Next / fires"],rows),true);
+}
+function eventsCard(d){
+  var rows=(d.events||[]).map(function(e){var p=e.payload&&typeof e.payload==="object"?" · "+esc(Object.entries(e.payload).filter(function(kv){return kv[1]!=null}).map(function(kv){return kv[0]+"="+kv[1]}).join(" ")):"";return '<div class="evline"><b>'+esc(e.actor)+'</b> · '+esc(e.kind)+(e.ref?" · "+esc(e.ref):"")+p+' · '+fmt(e.created_at)+'</div>'}).join("");
+  return card("Orchestration events (latest 100, this agent)",rows||'<div class="empty">No events</div>',true);
+}
+
+async function load(){
+  var r=role();
+  if(!r){document.getElementById("body").innerHTML='<div class="empty">No role in URL</div>';return}
+  try{
+    var res=await fetch("/api/agent/"+encodeURIComponent(r));
+    var d=null;try{d=await res.json()}catch(_){}
+    if(!res.ok)throw new Error((d&&d.detail)||("HTTP "+res.status));
+    var p=d.presence||{};
+    document.getElementById("title").innerHTML='<span class="dot '+esc(p.liveness)+'"></span>'+esc(d.profile&&d.profile.display_name||d.role);
+    document.getElementById("subtitle").innerHTML='<span class="chip">'+esc(p.liveness)+'</span><span class="chip">'+esc(p.phase||"—")+'</span>'+(p.session_day?'<span class="chip">'+esc(p.session_day)+'</span>':"");
+    document.getElementById("body").innerHTML=
+      '<div class="grid2">'+profileCard(d)+sessionCard(d)+meetingCard(d)+hooksCard(d)+'</div>'
+      +inboxCard(d)+tasksCard(d)+wakeCard(d)+deliveryCard(d)+eventsCard(d);
+    document.getElementById("foot").textContent="updated "+new Date(d.generated_at).toLocaleTimeString();
+  }catch(e){document.getElementById("body").innerHTML='<div class="empty">Failed to load: '+esc(e.message)+'</div>'}
+}
+load();setInterval(load,5000);
+</script>
+</body>
+</html>
