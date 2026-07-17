@@ -833,6 +833,18 @@ def _sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
         # 3. Stale attendees: checked in, but sitting on unread messages past
         #    the SLA. Re-arm a wake request only when the previous ack predates
         #    the oldest unread message, so an ack cannot silence new traffic.
+        #
+        #    Re-arm ONLY — no escalation from here, for exactly the reason
+        #    branch 2 stopped escalating: a page queued in the same breath as
+        #    the machine remedy races it, and the machine usually wins. Measured
+        #    on a live desk the day its escalations first reached a phone: page
+        #    at 20:24:15, messages read at 20:24:32 — seventeen seconds — four
+        #    pages in one ordinary working meeting, every one self-resolved.
+        #    An attendee mid-turn is not an incident; it is how headless agents
+        #    work between wakes. The re-armed wake request below IS the fix:
+        #    the orchestrator collects it, climbs hook -> resume -> spawn, and
+        #    reaches the human rung on the merits once the machine has actually
+        #    failed to make the agent read.
         role_in, role_params = _in_clause("a.role", sorted(agent_roles))
         visible_sql, visible_params = _visible_message_sql(conn, "mm")
         stale = conn.execute(
@@ -855,7 +867,7 @@ def _sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
             oldest = _parse_time(row["oldest_unread"])
             if oldest + dt.timedelta(seconds=row["wait_timeout_seconds"]) > now:
                 continue
-            cursor = conn.execute(
+            conn.execute(
                 """INSERT INTO meeting_wake_requests(thread_id,role,status,created_at)
                    VALUES (?,?,'pending',?)
                    ON CONFLICT(thread_id,role) DO UPDATE
@@ -865,13 +877,6 @@ def _sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
                      AND meeting_wake_requests.acknowledged_at<?""",
                 (row["thread_id"], row["role"], now_iso, row["oldest_unread"]),
             )
-            if cursor.rowcount:
-                escalation_ids.append(_queue_escalation(
-                    conn, row["thread_id"], "system",
-                    f"stale attendee: {row['role']} left meeting messages unread "
-                    f"past the {row['wait_timeout_seconds']}-second SLA",
-                    "auto",
-                ))
     for escalation_id in escalation_ids:
         dispatch_escalation(escalation_id, db_path=db_path)
     return escalation_ids

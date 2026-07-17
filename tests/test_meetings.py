@@ -198,6 +198,39 @@ def test_a_required_attendee_that_never_arrives_keeps_it_waiting_and_escalates(d
     assert thread_id in [w["thread_id"] for w in meetings.wake_requests("beta")]
 
 
+def test_a_stale_attendee_is_woken_not_paged(desk):
+    """Contrast with the no-show above: an attendee who never ARRIVED is a human
+    problem and escalates; an attendee who checked in and is sitting on unread
+    messages mid-turn is how headless agents work between wakes, and gets a WAKE.
+
+    The sweep used to queue the page in the same breath as the wake request, and
+    the machine won the race every time it was measured: the first day these
+    escalations reached a phone, one ordinary working meeting produced four
+    pages, one of them seventeen seconds before the agent read the messages
+    unprompted. The human rung is still reachable — through the wake ladder, on
+    the merits, after hook/resume/spawn have actually failed — never
+    preemptively from here. Same surgery branch 2 of the sweep already had, for
+    the same reason: paging a person for a slow agent trains them to ignore the
+    page that matters.
+    """
+    thread_id = _start("stale reader", ["alpha", "beta"],
+                       wait_timeout_seconds=30)
+    meetings.send_update(thread_id, role="alpha", kind="evidence",
+                         body="for beta, who is mid-turn elsewhere")
+    with _db() as conn:
+        conn.execute("UPDATE mailbox_messages SET created_at=? WHERE thread_id=?",
+                     (_past(600), thread_id))
+
+    meetings._sweep_timeouts()
+
+    # The machine remedy is armed...
+    assert thread_id in [w["thread_id"] for w in meetings.wake_requests("beta")]
+    # ...and nobody's phone rang for it.
+    reasons = [e["reason"] for e in meetings.list_escalations(thread_id)]
+    assert not any("stale attendee" in r for r in reasons), (
+        "a checked-in attendee mid-turn is not an incident", reasons)
+
+
 # --- 3. mandatory one-to-one replies, and their SLA -------------------------
 
 def test_a_one_to_one_message_creates_a_tracked_response_obligation(desk):

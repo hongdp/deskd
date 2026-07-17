@@ -105,7 +105,13 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     created_by            TEXT NOT NULL,
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
-    result_note           TEXT
+    result_note           TEXT,
+    -- What a 'blocked' task is waiting ON. No column recorded this, so `blocked`
+    -- was a graveyard: anything could be marked blocked and die there, because
+    -- nothing could say what it waited for, whether that had happened, or who to
+    -- ask. Enforced in Python (task_update), not by a CHECK, because legacy rows
+    -- predate the column and an honest backfill cannot invent their dependency.
+    blocked_on            TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_assignee
@@ -334,7 +340,8 @@ _AGENT_TASKS_DDL = """
         CHECK (priority IN ('urgent','normal','low')),
     source_kind TEXT NOT NULL DEFAULT 'self', source_ref TEXT, due_at TEXT,
     created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-    result_note TEXT
+    result_note TEXT,
+    blocked_on TEXT
 """
 
 _AGENT_INBOX_DDL = """
@@ -371,6 +378,26 @@ def _migrate(conn) -> None:
     # to CONFIG.role_names() precisely so that works). Its list_meetings then
     # raised `no such column: closed_at` on any pre-existing DB, and nothing
     # noticed, because the meetings-only shape is the one nothing exercises.
+    # agent_tasks IS this layer's table (ORCH_SCHEMA above creates it, nothing
+    # below can read it), so blocked_on belongs here and a meetings-only host
+    # never executes this line.
+    #
+    # The backfill is deliberately NOTHING. A pre-existing 'blocked' row records
+    # no dependency and this migration has no evidence of one, so every available
+    # value is a lie: a placeholder ('unknown', '') would make an illegal state
+    # look legal to every later reader, and flipping the row to 'pending' would
+    # overwrite an agent's own judgement with a guess. NULL is the only true
+    # value — it says exactly what happened, which is that nobody recorded it.
+    # It does not rot: _blocked_unspecified() reports these rows so a human
+    # decides, which is what rule "genuinely cannot move -> escalate" asks for,
+    # and the first task_update to touch one has to name the dependency or leave.
+    #
+    # MUST precede the _rebuild calls below: they copy with `SELECT *` into the
+    # new DDL, so the live table has to have this column already or the copy
+    # fails on a column-count mismatch.
+    if "blocked_on" not in {r["name"] for r in
+                            conn.execute("PRAGMA table_info(agent_tasks)")}:
+        conn.execute("ALTER TABLE agent_tasks ADD COLUMN blocked_on TEXT")
     # Legacy DBs (including one adopted from a host that predates deskd) may
     # still enumerate roles/sources/kinds in CHECK constraints. Drop them so the
     # host's own vocabulary works; Python validates instead.
@@ -572,6 +599,35 @@ def _presence_row(row: dict, now: dt.datetime) -> dict:
     }
 
 
+def _role_presence(conn, role: str, now: dt.datetime) -> dict:
+    """Derived presence for ONE role, session row or not.
+
+    The single place a role with no session row at all is turned into presence.
+    Every caller that asks "is this role executing right now?" must get the same
+    answer, and there were three hand-rolled copies of this `base` dict before
+    the wake path needed to ask it too.
+    """
+    sess = conn.execute(
+        "SELECT * FROM agent_sessions WHERE role=?", (role,)).fetchone()
+    base = {"role": role, "session_id": None, "harness": None,
+            "state": None, "activity": None, "started_at": None,
+            "last_heartbeat_at": None, "ended_at": None}
+    return _presence_row(dict(sess) if sess else base, now)
+
+
+def _is_busy(conn, role: str, now: dt.datetime) -> bool:
+    """True if a turn is running that a wake would INTERRUPT.
+
+    Deliberately the same predicate the board uses to decide whether a session's
+    work breakdown may be shown as current (LIVE_LIVENESS): "executing right now"
+    is one fact, and the surface that renders it and the path that decides whether
+    interrupting it is allowed must never disagree about it. Everything else —
+    parked (`idle`), crashed (`dead`), ended (`offline`), never started (`never`)
+    — has no turn in flight, so there is nothing there to interrupt.
+    """
+    return _role_presence(conn, role, now)["liveness"] in LIVE_LIVENESS
+
+
 def _presence_list(conn, now: dt.datetime) -> list[dict]:
     """Presence for all enabled roles using an EXISTING connection (so callers
     already inside a write transaction don't open a second, dead-locking one)."""
@@ -579,12 +635,7 @@ def _presence_list(conn, now: dt.datetime) -> list[dict]:
         "SELECT * FROM agent_registry WHERE enabled=1 ORDER BY role").fetchall()
     out = []
     for r in reg:
-        sess = conn.execute(
-            "SELECT * FROM agent_sessions WHERE role=?", (r["role"],)).fetchone()
-        base = {"role": r["role"], "session_id": None, "harness": None,
-                "state": None, "activity": None, "started_at": None,
-                "last_heartbeat_at": None, "ended_at": None}
-        row = _presence_row(dict(sess) if sess else base, now)
+        row = _role_presence(conn, r["role"], now)
         row["display_name"] = r["display_name"]
         row["capabilities"] = _load_json(r["capabilities"])
         row["authority"] = _load_json(r["authority"])
@@ -680,12 +731,51 @@ def tasks(*, assignee_role: str | None = None, status: str | None = None,
     return rows
 
 
+def _apply_blocked_on(updates: dict, current) -> None:
+    """Hold the resulting row to: blocked IFF it names what it is blocked ON.
+
+    'blocked' was the one status with no live obligation attached to it. Nothing
+    recorded the dependency, so nothing could ever tell whether it had been met —
+    a task marked blocked left the wake path (waking cannot help someone who is
+    waiting on you) and entered a state no path could return it from. The live
+    desk has one, blocked since 07:02, and the engine cannot say what it waits
+    for. Naming the dependency is what makes 'blocked' a claim rather than a
+    place to put things.
+
+    The invariant is on the RESULTING row, not on the call: a caller may name the
+    dependency now or already have named it, and one that leaves blocked need not
+    mention the column at all — a stale `blocked_on` on an actionable task would
+    say it waits on something while its status says it does not.
+    """
+    new_status = updates.get("status", current["status"])
+    if new_status == "blocked":
+        dep = _clean(updates.get("blocked_on", current["blocked_on"]),
+                     "blocked_on", required=False)
+        if not dep:
+            raise ValueError(
+                "status='blocked' requires blocked_on: name the dependency you "
+                "are waiting on. If nothing names it, it is not blocked — do it, "
+                "transfer it, or escalate it.")
+        updates["blocked_on"] = dep
+    elif "blocked_on" in updates:
+        raise ValueError(
+            f"blocked_on is only meaningful for status='blocked' (this task "
+            f"would be {new_status!r})")
+    elif current["blocked_on"] is not None:
+        updates["blocked_on"] = None      # leaving blocked: the wait is over
+
+
 def task_update(task_id: int, *, actor: str | None = None,
                 db_path: Path | str | None = None, **fields) -> bool:
     """Update mutable task fields. Only status/priority/due_at/detail/title/
-    result_note/assignee_role are settable; unknown or None fields are ignored."""
+    result_note/assignee_role/blocked_on are settable; unknown or None fields are
+    ignored.
+
+    ``status='blocked'`` REQUIRES a ``blocked_on``, and leaving blocked clears it
+    — see _apply_blocked_on.
+    """
     allowed = {"status", "priority", "due_at", "detail", "title",
-               "result_note", "assignee_role"}
+               "result_note", "assignee_role", "blocked_on"}
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if not updates:
         return False
@@ -699,6 +789,11 @@ def task_update(task_id: int, *, actor: str | None = None,
     with connect(db_path, write=True) as conn:
         if "assignee_role" in updates:
             updates["assignee_role"] = _agent_role(conn, updates["assignee_role"])
+        current = conn.execute(
+            "SELECT status, blocked_on FROM agent_tasks WHERE id=?", (task_id,)).fetchone()
+        if current is None:
+            return False
+        _apply_blocked_on(updates, current)
         sets = ", ".join(f"{k}=?" for k in updates) + ", updated_at=?"
         params = list(updates.values()) + [now, task_id]
         cur = conn.execute(f"UPDATE agent_tasks SET {sets} WHERE id=?", params)
@@ -876,7 +971,8 @@ def delivery_ledger(thread_id: str | None = None,
 
 # --- wake orchestrator ------------------------------------------------------
 
-WAKE_REASONS = {"meeting_wake", "stuck_delivery", "urgent_task", "inbox"}
+WAKE_REASONS = {"meeting_wake", "stuck_delivery", "urgent_task", "owed_reply",
+                "inbox", "idle_task"}
 
 
 def _ladder():
@@ -914,6 +1010,32 @@ def _human_level(ladder) -> int:
     return max(0, len(ladder) - 2)
 
 
+def _reason_ceiling(reason_kind: str, ladder) -> int:
+    """The highest rung this reason may ever occupy. -1 = it may not wake at all.
+
+    HARD RULE: a task wake must NEVER page a person. The ladder climbs because a
+    message MUST land, and it ends at a human because that is the last thing that
+    can make it land. A queue has no such property — nobody is owed it and nothing
+    breaks if it waits for morning — so for MACHINE_ONLY_REASONS the ladder is
+    fenced at the last rung that stays on the machine.
+
+    This is a CEILING, applied to the start rung and to every escalation, not an
+    argument that the demand resolves too fast to climb. It does resolve fast (the
+    moment the agent boots), and that is exactly the sort of reasoning that stays
+    true until some unrelated change makes it false — at which point the failure
+    is a person's phone at 3am. So it cannot climb there even if it sits forever.
+
+    Scoped by PURPOSE, not by channel name: the rung declares whether it leaves
+    the machine (WakeRung.leaves_machine), so a host that renames its rungs,
+    reorders them, or pages a person from rung 1 is still fenced correctly. A
+    ladder whose every rung leaves the machine yields -1 and the demand is never
+    raised at all: failing to wake an idle agent for its own to-do list is a
+    disappointment, waking a person for it is a breach.
+    """
+    if reason_kind not in MACHINE_ONLY_REASONS:
+        return len(ladder) - 1
+    return _human_level(ladder) - 1
+
 
 def sync_meeting_close_tasks(conn) -> int:
     """Project every live work meeting into its attendees' task lists.
@@ -924,12 +1046,14 @@ def sync_meeting_close_tasks(conn) -> int:
     thing that ever noticed was the idle deadline retiring it an hour later.
     This is the durable, poll-free version of remembering.
 
-    Soft on purpose. priority='normal' surfaces the item and wakes nobody — the
-    module's headline rule is that only urgent wakes, and a conversation that is
-    still going does not need an interrupt telling you to end it. It turns urgent
-    exactly when the thread goes idle: nobody is talking, nobody closed it, and a
-    reminder in a list an agent is not currently reading has already failed. Then
-    it is demand like any other and climbs the ladder.
+    Soft on purpose. priority='normal' never INTERRUPTS: a conversation that is
+    still going does not need an attendee cut off mid-turn to be told to end it.
+    An attendee that is idle gets woken for it like any other queued work
+    (idle_task — there is no turn to interrupt, and two parked agents holding a
+    meeting open is precisely the case nothing else was noticing). It turns
+    urgent, and interrupts, exactly when the thread goes idle: nobody is talking,
+    nobody closed it, and a reminder in a list an agent is not currently reading
+    has already failed. Then it is demand like any other and climbs the ladder.
 
     DMs are excluded. A one-to-one with the supervisor is theirs to end
     (meetings._propose_end refuses the agent), so a close task there would be one
@@ -1000,13 +1124,116 @@ def sync_meeting_close_tasks(conn) -> int:
             touched += 1
     return touched
 
+#: The exact agent_tasks rows that raise an `urgent_task` demand. ONE string,
+#: used both by the query that raises that demand and by the query that excludes
+#: those rows from idle_task's actionable set. The two must partition the queue —
+#: every open task raises exactly one kind of demand or is a reported fact — and
+#: a second spelling of "already being woken for this" is how they would stop.
+#: Note it is not "priority != urgent": an urgent task that has gone in_progress
+#: raises NO urgent_task demand (that clause is `status='pending'`), so excluding
+#: it by priority alone would drop it out of every wake path — the exact hole
+#: this whole change exists to close, re-opened at its most expensive task.
+_URGENT_TASK_WHERE = "priority='urgent' AND status='pending'"
+
+#: Wake reasons that may never climb to a rung that leaves the machine.
+#:
+#: The ladder exists because a MESSAGE MUST LAND: it keeps climbing until someone
+#: — ultimately a person — reacts. A to-do list has no such property. Nothing is
+#: owed to anyone, nothing breaks if it waits until morning, and there is no
+#: answer a human woken at 3am could give that the queue needed. So `idle_task`
+#: is fenced to the machine rungs BY CONSTRUCTION rather than by the argument
+#: that it always resolves quickly (see _reason_ceiling).
+MACHINE_ONLY_REASONS = frozenset({"idle_task"})
+
+
+def _queued_tasks(conn, role: str | None = None) -> tuple[list[dict], list[dict]]:
+    """(actionable, stalled) — open work whose assignee nothing else is waking.
+
+    ACTIONABLE is what a wake could still move: assigned, open, not already
+    carried by an urgent_task demand, not blocked (it waits on a named
+    dependency; waking its assignee cannot make that dependency happen), and not
+    stalled.
+
+    STALLED is DERIVED, never stored, from the ledger that already exists: the
+    number of idle_task wakes this role has had since the task last moved. Time-
+    dependent state is computed at read time here (see _delivery_state,
+    _presence_row) precisely so it cannot go stale, and a `stalled_at` column
+    would be a second, staler copy of a fact the wake_attempts rows already hold.
+
+    A stalled task LEAVES the actionable set, and that is the whole loop breaker:
+    we woke the agent for its queue, it looked, it did not move this — so this
+    stops being a reason to wake anyone and becomes a fact someone must decide
+    about (board()'s health.stalled_tasks). No cooldown, no timer, no new state:
+    the demand stops because the reason for it stopped being true. A cooldown
+    would have been a patch over the missing rule, which is the mistake this
+    module keeps making.
+
+    The count is role-scoped, not task-scoped, on purpose: wake_sources() shows a
+    woken agent its WHOLE queue, so every idle_task wake is an occasion on which
+    this task was in front of it and did not move.
+    """
+    where = ["t.status IN ('pending','in_progress')", f"NOT ({_URGENT_TASK_WHERE})"]
+    params: list = []
+    if role is not None:
+        where.append("t.assignee_role=?")
+        params.append(role)
+    rows = conn.execute(
+        f"""SELECT t.*, (SELECT COUNT(*) FROM wake_attempts w
+                         WHERE w.role=t.assignee_role AND w.reason_kind='idle_task'
+                           AND w.attempted_at > t.updated_at) AS idle_wakes_since_move
+            FROM agent_tasks t WHERE {" AND ".join(where)} ORDER BY t.id""",
+        params).fetchall()
+    threshold = CONFIG.idle_task_stall_wakes
+    actionable, stalled = [], []
+    for r in rows:
+        (stalled if r["idle_wakes_since_move"] >= threshold
+         else actionable).append(dict(r))
+    return actionable, stalled
+
+
+def _idle_task_demand(conn, role: str, now: dt.datetime) -> dict | None:
+    """THE idle_task predicate — the demand, or None. Nothing else defines it.
+
+    "Soft deadlines never wake" was written against INTERRUPTION: deadlines shape
+    attention, they don't manufacture interrupts. That is still absolute, and it
+    is what `_is_busy` gates. But it was over-broad, because an IDLE agent has no
+    turn to interrupt: waking it for its own queue is not an interrupt, it is
+    scheduling. Without this, an idle agent with a to-do list sleeps forever and
+    the list is write-only — which makes "agents must never manage their own
+    waking" false, and that is the framework's whole thesis.
+
+    Note what is NOT in here: due_at. A queue entry is a queue entry; the deadline
+    changes ordering and nothing else, or it would be a wake trigger by the back
+    door.
+
+    Both callers go through this function — collect_wake_demand to raise it, and
+    _demand_resolved to decide it is over — so the two cannot drift. That is not
+    tidiness: generation and resolution disagreeing is this module's most-repeated
+    bug (see the stuck_delivery branch's comment, and the five it lists).
+    """
+    if _is_busy(conn, role, now):
+        return None
+    actionable, _ = _queued_tasks(conn, role)
+    if not actionable:
+        return None
+    titles = ", ".join(t["title"] for t in actionable[:3])
+    more = f" (+{len(actionable) - 3} more)" if len(actionable) > 3 else ""
+    return {"role": role, "reason_kind": "idle_task",
+            "source_ref": f"idle_task:{role}",
+            "label": f"{len(actionable)} open task(s): {titles}{more}",
+            "since_at": min(t["created_at"] for t in actionable)}
+
+
 def collect_wake_demand(conn) -> list[dict]:
     """Unify the DB-derived wake demands.
 
     Note: task ``due_at`` is deliberately NOT a source — soft deadlines never
-    wake; only priority='urgent' pending tasks do.
+    wake. An open task wakes its assignee only while that assignee is IDLE
+    (``idle_task``, which interrupts nothing); ``priority='urgent'`` is the only
+    task state that wakes regardless.
     """
-    now_iso = _iso()
+    now = _now()
+    now_iso = _iso(now)
     demands = []
     for r in conn.execute(
             """SELECT w.role, w.thread_id, m.agenda, w.created_at
@@ -1033,11 +1260,19 @@ def collect_wake_demand(conn) -> list[dict]:
                             "source_ref": f'{r["thread_id"]}:{r["message_id"]}',
                             "label": f'msg#{r["message_id"]}', "since_at": r["queued_at"]})
     for r in conn.execute(
-            "SELECT id, assignee_role, title, created_at FROM agent_tasks "
-            "WHERE priority='urgent' AND status='pending'"):
+            f"SELECT id, assignee_role, title, created_at FROM agent_tasks "
+            f"WHERE {_URGENT_TASK_WHERE}"):
         demands.append({"role": r["assignee_role"], "reason_kind": "urgent_task",
                         "source_ref": str(r["id"]), "label": r["title"],
                         "since_at": r["created_at"]})
+    # An idle agent with queued work. One demand per ROLE, not per task: it asks
+    # for the agent to be booted, and a booted agent sees its whole queue
+    # (wake_sources), so a demand per task would be N ladders racing to cause the
+    # one wake they all want.
+    for role in sorted(_known_roles(conn)):
+        d = _idle_task_demand(conn, role, now)
+        if d is not None:
+            demands.append(d)
     # An owed meeting reply past its SLA. Distinct from stuck_delivery, which
     # means "never read it": this one means "read it and has not answered", and
     # only a wake fixes that. meetings used to page a human for this directly,
@@ -1064,7 +1299,6 @@ def collect_wake_demand(conn) -> list[dict]:
             "SELECT target_role, priority, enqueued_at FROM agent_inbox "
             "WHERE acked_at IS NULL AND delivered_at IS NULL"):
         inbox_by_role.setdefault(r["target_role"], []).append(r)
-    now = _now()
     for role, items in inbox_by_role.items():
         oldest = min(i["enqueued_at"] for i in items)
         has_urgent = any(i["priority"] == "urgent" for i in items)
@@ -1102,6 +1336,26 @@ def _demand_resolved(conn, role: str, reason_kind: str, source_ref: str,
             r["status"] == "pending" and r["priority"] == "urgent"
             and r["assignee_role"] == role)
         return (resolved, "acked")
+    if reason_kind == "idle_task":
+        # Resolution is generation, negated — not a mirror of it. Every other
+        # branch here re-states its collect_wake_demand predicate by hand and
+        # comments about which clause was forgotten last time; the count of those
+        # comments is the argument for not doing it a sixth time. This branch
+        # asks the collector itself, so "resolved" means exactly "the collector
+        # would no longer raise this", for every clause it has and any it grows:
+        # role, idleness, actionability, urgency and stall, forever, by
+        # construction.
+        now = dt.datetime.fromisoformat(now_iso)
+        if _idle_task_demand(conn, role, now) is not None:
+            return (False, "")
+        # It stopped being raised for one of two reasons, and they are not the
+        # same event. Busy = the agent booted, which is ALL this demand ever
+        # asked for: that is a landed wake, and its latency is real. Still idle =
+        # the queue emptied under it, or every task in it stalled — the wake
+        # never landed and we have stopped trying, which must not be filed as a
+        # success or the stall breaker would hide inside the wake stats it is
+        # supposed to be visible against.
+        return (True, "acked" if _is_busy(conn, role, now) else "timeout")
     if reason_kind == "owed_reply":
         # Mirrors collect_wake_demand's predicate clause for clause. The commit
         # before this one exists because generation and resolution disagreed in
@@ -1214,6 +1468,8 @@ def _wake_reasons_text(ds: list[dict]) -> str:
     if by.get("urgent_task"):
         ts = ", ".join(sorted({str(d["label"]) for d in by["urgent_task"]}))
         parts.append(f'{len(by["urgent_task"])} urgent task(s) ({ts})')
+    if by.get("idle_task"):
+        parts.append("; ".join(str(d["label"]) for d in by["idle_task"]))
     if by.get("inbox"):
         parts.append(f'{len(by["inbox"])} inbox batch(es) queued')
     return "; ".join(parts) or "pending work"
@@ -1301,9 +1557,15 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
                     "SELECT * FROM wake_attempts WHERE outcome='pending'").fetchall()
                 if (a["role"], a["reason_kind"], a["source_ref"]) not in resolved_keys}
         for d in demands:
+            # HARD RULE 1 lives here, before anything else can happen to the
+            # demand: a reason fenced to the machine on a ladder with no machine
+            # rung has nowhere legal to go, so it does not wake at all.
+            ceiling = _reason_ceiling(d["reason_kind"], ladder)
+            if ceiling < 0:
+                continue
             cur = pend.get((d["role"], d["reason_kind"], d["source_ref"]))
             if cur is None:
-                lvl = _start_level(pres.get(d["role"]), ladder)
+                lvl = min(_start_level(pres.get(d["role"]), ladder), ceiling)
                 if record:
                     _insert_attempt(conn, d, lvl, now_iso, ladder)
                     _log_event(conn, "orchestrator", "wake_attempt", d["source_ref"],
@@ -1315,19 +1577,31 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
                 sla = ladder[lvl].sla_seconds
                 age = (now - dt.datetime.fromisoformat(cur["attempted_at"])).total_seconds()
                 if sla is not None and age > sla:
-                    nl = min(lvl + 1, len(ladder) - 1)
+                    nl = min(lvl + 1, len(ladder) - 1, ceiling)
                     # Escalation is APPEND-ONLY: supersede the old row, insert a
                     # new one. The wake history of a demand is never rewritten.
+                    #
+                    # At a ceiling, nl == lvl and this re-attempts the same rung
+                    # rather than climbing. That is deliberate and it is not a
+                    # loop: an attempt row is not proof a session ran (the driver
+                    # skips on a held role lock, and launches fail), so the rung
+                    # is retried at-least-once like every other wake — and each
+                    # retry is itself an idle_task attempt, which walks the task
+                    # towards STALLED and retires the demand. The thing that stops
+                    # it is the rule, not a cooldown.
+                    escalated = nl > lvl
                     if record:
                         conn.execute(
                             "UPDATE wake_attempts SET outcome='superseded', resolved_at=? "
                             "WHERE id=?",
                             (now_iso, cur["id"]))
                         _insert_attempt(conn, d, nl, now_iso, ladder)
-                        _log_event(conn, "orchestrator", "wake_escalate", d["source_ref"],
+                        _log_event(conn, "orchestrator",
+                                   "wake_escalate" if escalated else "wake_retry",
+                                   d["source_ref"],
                                    {"role": d["role"], "reason": d["reason_kind"],
                                     "from": lvl, "to": nl, "channel": ladder[nl].channel})
-                    changed.append({**d, "level": nl, "escalated": True})
+                    changed.append({**d, "level": nl, "escalated": escalated})
         # 3) build the per-role actionable plan (L0 hook needs no driver action)
         changed_roles = {c["role"] for c in changed}
         actions = []
@@ -1369,9 +1643,17 @@ def wake_attempts_recent(limit: int = 20,
 def wake_sources(role: str, db_path: Path | str | None = None) -> dict:
     """One-shot answer to 'what can currently wake/remind me, and can I change
     it?' — the role's own registered hooks (self-managed via `hook add/cancel`),
-    pending meeting wakes, queued inbox notifications, urgent tasks, and any
-    in-flight wake attempts."""
-    now_iso = _iso()
+    pending meeting wakes, queued inbox notifications, urgent tasks, its open
+    queue, and any in-flight wake attempts.
+
+    The role's OWN QUEUE belongs in this answer and was missing from it, which is
+    how an agent could ask this question, be told about hooks and meetings and
+    urgent work, and hear nothing about the five open tasks that were the actual
+    reason it kept being woken — or, worse, hear nothing about the ones that were
+    never going to wake it at all.
+    """
+    now = _now()
+    now_iso = _iso(now)
     with connect(db_path, write=True) as conn:
         role = _agent_role(conn, role)
         sync_delivery(conn)
@@ -1390,9 +1672,9 @@ def wake_sources(role: str, db_path: Path | str | None = None) -> dict:
             "SELECT id, source_kind, priority, title, delivered_at, enqueued_at "
             "FROM agent_inbox WHERE target_role=? AND acked_at IS NULL", (role,)).fetchall()]
         urgent_tasks = [dict(r) for r in conn.execute(
-            "SELECT id, title, due_at FROM agent_tasks "
-            "WHERE assignee_role=? AND priority='urgent' AND status='pending'",
-            (role,)).fetchall()]
+            f"SELECT id, title, due_at FROM agent_tasks "
+            f"WHERE assignee_role=? AND {_URGENT_TASK_WHERE}", (role,)).fetchall()]
+        actionable, stalled = _queued_tasks(conn, role)
         attempts = [dict(r) for r in conn.execute(
             "SELECT reason_kind, source_ref, channel, level, attempted_at "
             "FROM wake_attempts WHERE role=? AND outcome='pending' ORDER BY id DESC",
@@ -1403,12 +1685,25 @@ def wake_sources(role: str, db_path: Path | str | None = None) -> dict:
         "meeting_wakes": meeting_wakes,      # a meeting needs you (wake-ack/check-in)
         "inbox_queued": [i for i in inbox if not i["delivered_at"]],
         "inbox_delivered_unacked": [i for i in inbox if i["delivered_at"]],
-        "urgent_tasks": urgent_tasks,
+        "urgent_tasks": urgent_tasks,        # wake you whatever you are doing
+        # Your open queue. These wake you whenever you are idle — which is why
+        # nothing here may be left to rot: move it, block it on a NAMED
+        # dependency, transfer it, or escalate it. 'pending forever' is not a
+        # resting state.
+        "actionable_tasks": actionable,
+        # Woken for these idle_task_stall_wakes times since they last moved, and
+        # they did not move. They have STOPPED waking you and are now somebody's
+        # decision (board health.stalled_tasks). Touching one makes it actionable
+        # again — the count is measured from the task's last update.
+        "stalled_tasks": stalled,
         "pending_wake_attempts": attempts,
         "manage": (f"{PROJECT_NAME} hook add --for {role} "
                    f"(--at|--every|--cron|--probe) / "
                    f"{PROJECT_NAME} hook cancel <id>; "
-                   f"{PROJECT_NAME} inbox ack --for {role}"),
+                   f"{PROJECT_NAME} inbox ack --for {role}; "
+                   f"{PROJECT_NAME} task update <id> "
+                   f"--status (in_progress|blocked --blocked-on <dep>|done) "
+                   f"--for <role> (transfer)"),
     }
 
 
@@ -2001,6 +2296,15 @@ def board(db_path: Path | str | None = None) -> dict:
             (human_lvl,)).fetchone()[0]
         wake_activity = [dict(x) for x in conn.execute(
             "SELECT * FROM wake_attempts ORDER BY id DESC LIMIT 12").fetchall()]
+        # The two ways an open task can stop being anybody's wake. Neither is a
+        # failure of the engine and neither is fixable by waking anyone, which is
+        # exactly why they have to be REPORTED: a task that no path will ever
+        # raise again, and that nothing says out loud, is the write-only to-do
+        # list this change exists to abolish. Someone has to decide about these.
+        stalled_tasks = len(_queued_tasks(conn)[1])
+        blocked_unspecified = conn.execute(
+            "SELECT COUNT(*) FROM agent_tasks WHERE status='blocked' "
+            "AND (blocked_on IS NULL OR TRIM(blocked_on)='')").fetchone()[0]
         inbox_rows = [dict(r) for r in conn.execute(
             "SELECT * FROM agent_inbox WHERE acked_at IS NULL").fetchall()]
         hook_rows = [dict(r) for r in conn.execute(
@@ -2035,6 +2339,8 @@ def board(db_path: Path | str | None = None) -> dict:
             **health,
             "total_overdue": sum(1 for t in open_tasks if t["overdue"]),
             "total_open_tasks": len(open_tasks),
+            "stalled_tasks": stalled_tasks,
+            "blocked_unspecified": blocked_unspecified,
             "pending_wakes": sum(v["pending"] for v in wake_pending.values()),
             "wakes_at_human_level": human_level_wakes,
             "inbox_queued": sum(1 for r in inbox_rows if not r["delivered_at"]),
@@ -2072,11 +2378,7 @@ def agent_detail(role: str, db_path: Path | str | None = None) -> dict:
         role = _agent_role(conn, role)
         sync_delivery(conn)
         reg = conn.execute("SELECT * FROM agent_registry WHERE role=?", (role,)).fetchone()
-        sess = conn.execute("SELECT * FROM agent_sessions WHERE role=?", (role,)).fetchone()
-        base = {"role": role, "session_id": None, "harness": None, "state": None,
-                "activity": None, "started_at": None, "last_heartbeat_at": None,
-                "ended_at": None}
-        pres = _presence_row(dict(sess) if sess else base, now)
+        pres = _role_presence(conn, role, now)
         live = pres["liveness"] in LIVE_LIVENESS
 
         td = conn.execute(

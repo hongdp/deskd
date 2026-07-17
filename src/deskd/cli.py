@@ -142,6 +142,8 @@ def build_parser() -> argparse.ArgumentParser:
     tk_u.add_argument("--detail")
     tk_u.add_argument("--title")
     tk_u.add_argument("--note", help="result note")
+    tk_u.add_argument("--blocked-on",
+                      help="what this task waits ON; required by --status blocked")
     _add_role(tk_u, "--for", dest="assignee", required=False, help="reassign")
     tk_u.add_argument("--by", help="actor")
     for _tc in ("done", "cancel"):
@@ -402,7 +404,7 @@ def _cmd_task(args) -> None:
         ok = orch.task_update(args.id, status=args.status, priority=args.priority,
                               due_at=args.due, detail=args.detail, title=args.title,
                               result_note=args.note, assignee_role=args.assignee,
-                              actor=args.by)
+                              blocked_on=args.blocked_on, actor=args.by)
         out = {"updated": ok, "id": args.id}
     else:  # done | cancel
         status = "done" if args.task_cmd == "done" else "cancelled"

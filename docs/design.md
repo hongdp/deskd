@@ -27,13 +27,40 @@ and an escalation path. Honest pull with verification beats fake push.
 
 ## Waking
 
-**Four demand sources** feed one queue: meeting wakes, stuck deliveries, urgent
-tasks, and inbox notifications (plus the hooks an agent registers itself).
+**Six demand sources** feed one queue: meeting wakes, stuck deliveries, urgent
+tasks, owed replies, inbox notifications, and an idle agent's own open queue
+(plus the hooks an agent registers itself).
 
 **One rule with teeth:** a task's `due_at` is a *soft* deadline. It sorts to the
-top and is surfaced everywhere, but it **never wakes anyone** — only
-`priority=urgent` does. Deadlines shape attention; they don't manufacture
-interrupts.
+top and is surfaced everywhere, but it **never wakes anyone**. Deadlines shape
+attention; they don't manufacture interrupts.
+
+That rule was written against **interruption**, and it was over-broad: it also
+stopped anything waking an *idle* agent, which interrupts nothing. An idle agent
+with a to-do list slept forever and the list was write-only — so "agents never
+manage their own waking" was false. What waking a task earns is now:
+
+| task state | agent state | |
+|---|---|---|
+| `priority=urgent` | any | **wake** — interrupting is the point |
+| open | idle | **wake** — nothing is being interrupted; this is scheduling |
+| open | busy | **never** — that is the interrupt the rule forbids |
+
+A **task wake can never reach a human rung.** The ladder climbs to a person
+because a message *must land*; a to-do list has no such property, so `idle_task`
+is fenced to rungs that declare `leaves_machine=False`. Homework does not page
+anyone at 3am.
+
+**A task is in a live state or it is not open.** Doing it → `in_progress`.
+Waiting → `blocked`, which **must name its dependency** (`blocked_on`); nothing
+else counts as blocked. Someone else's → transfer it. Genuinely stuck → escalate,
+and the supervisor decides whether it still matters. `pending` forever is not a
+resting state: the list is a work queue, not a graveyard.
+
+**Stall breaks the loop with a rule, not a cooldown.** A task woken for
+`idle_task_stall_wakes` idle wakes without moving is *stalled* — derived at read
+time from the wake ledger, never stored — and **leaves the actionable set**. It
+stops causing wakes and becomes a reported fact for someone to decide about.
 
 **The ladder** (in-session hook → resume → spawn → human → supervisor badge) is
 append-only: escalating supersedes the old attempt and inserts a new one, so a

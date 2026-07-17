@@ -156,6 +156,16 @@ class EngineConfig:
     #: Non-urgent inbox items coalesce for this long before they wake anyone.
     inbox_batch_seconds: int = 180
 
+    #: How many `idle_task` wakes a task may sit through, without moving, before
+    #: it is STALLED: it stops raising wakes and becomes a reported fact instead.
+    #: This is what makes the queue-wake loop terminate structurally rather than
+    #: by a cooldown. It is the host's number because it prices the host's wake:
+    #: an attempt row is not proof a session ran (the driver may skip on a held
+    #: role lock, or the launch may fail), so this must stay above 1 or one lost
+    #: launch would retire a task nobody ever saw. Default 3 — the same shape of
+    #: judgement, and the same number, as `max_error_streak`.
+    idle_task_stall_wakes: int = 3
+
     #: Presence liveness thresholds (seconds since last heartbeat).
     online_max_seconds: int = 120
     suspect_max_seconds: int = 600

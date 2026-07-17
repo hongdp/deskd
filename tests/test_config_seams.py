@@ -251,6 +251,94 @@ def test_supervisor_role_change_reaches_already_imported_modules(desk, tmp_path)
         orchestration.inbox_enqueue("overlord", "alert", "x")
 
 
+def test_idle_task_is_fenced_below_a_hosts_own_human_rung(desk, tmp_path):
+    """HARD RULE: a task wake never pages a person — on ANY host's ladder.
+
+    The fence has to be scoped by purpose, not by name or by position, for the
+    same reason `_human_level` is: this host pages from rung 1, so a fence that
+    assumed the default ladder's shape (stop at 'spawn', or at len-2) would let
+    homework straight through to a pager. `leaves_machine` is the only thing that
+    knows.
+    """
+    ladder = (
+        WakeRung("nudge", 60),
+        WakeRung("page_oncall", 120, leaves_machine=True),     # index 1
+        WakeRung("wall_of_shame", None, leaves_machine=True),
+    )
+    cfg_mod.configure(roles=(RoleSpec("r1"),), db_path=tmp_path / "fence.db",
+                      wake_ladder=ladder)
+
+    assert orchestration._reason_ceiling("idle_task", ladder) == 0
+    assert orchestration._reason_ceiling("urgent_task", ladder) == 2, (
+        "an urgent task still climbs the whole ladder — a human is its point")
+
+    orchestration.task_add("homework", assignee_role="r1")
+    orchestration.plan_wakes()
+    for _ in range(5):
+        with orchestration.connect(write=True) as c:
+            c.execute("UPDATE wake_attempts SET attempted_at=? WHERE outcome='pending'",
+                      (iso(-10_000),))
+            c.execute("UPDATE agent_tasks SET updated_at=?", (iso(0),))  # never stalls
+        orchestration.plan_wakes()
+
+    assert {a["channel"] for a in orchestration.wake_attempts_recent(50)} == {"nudge"}
+    assert orchestration.board()["health"]["wakes_at_human_level"] == 0
+
+
+def test_a_ladder_that_only_pages_people_never_wakes_for_homework(desk, tmp_path):
+    """The degenerate host, and the direction the answer must fall.
+
+    Every rung here pulls a person in, so there is no rung an idle_task wake may
+    legally occupy. Failing to wake an idle agent for its own to-do list is a
+    disappointment; waking a person for it is a breach — so the demand is not
+    raised at all, and the task stays a reported fact instead.
+    """
+    ladder = (WakeRung("page", 60, leaves_machine=True),
+              WakeRung("wall", None, leaves_machine=True))
+    cfg_mod.configure(roles=(RoleSpec("r1"),), db_path=tmp_path / "allhuman.db",
+                      wake_ladder=ladder)
+
+    assert orchestration._reason_ceiling("idle_task", ladder) == -1
+
+    orchestration.task_add("homework", assignee_role="r1")
+    plan = orchestration.plan_wakes()
+
+    assert plan["changed"] == []
+    assert orchestration.wake_attempts_recent(10) == []
+    # An urgent task is a different promise and still gets its human.
+    orchestration.task_add("halt the line", assignee_role="r1", priority="urgent")
+    assert [c["reason_kind"] for c in orchestration.plan_wakes()["changed"]] \
+        == ["urgent_task"]
+
+
+def test_host_owns_the_stall_threshold(desk, tmp_path):
+    """N prices the host's wake: what a session costs to boot, and how bursty its
+    turns are, are not the engine's to know.
+
+    The floor matters more than the number. An attempt row is not proof a session
+    ran — the driver skips on a held role lock and launches fail — so at N=1 a
+    single lost launch retires a task the agent never saw. Any host setting this
+    is choosing how many lost launches a task survives.
+    """
+    cfg_mod.configure(roles=(RoleSpec("r1"),), db_path=tmp_path / "stall.db",
+                      idle_task_stall_wakes=1)
+
+    orchestration.task_add("homework", assignee_role="r1")
+    with orchestration.connect(write=True) as c:    # a wake only counts if it
+        c.execute("UPDATE agent_tasks SET updated_at=?", (iso(-3600),))  # came after
+    orchestration.plan_wakes()                      # one wake, task untouched
+
+    assert orchestration.plan_wakes()["changed"] == []
+    assert orchestration.board()["health"]["stalled_tasks"] == 1, (
+        "the host said one wake is all a task gets")
+
+
+def test_the_default_stall_threshold_tolerates_a_lost_launch(desk):
+    """The default is a safety property, not a taste: it must be >1, or one
+    skipped driver launch is enough to retire a task nobody ever saw."""
+    assert CONFIG.idle_task_stall_wakes > 1
+
+
 # --- timezone ---------------------------------------------------------------
 
 def test_non_utc_timezone_resolves(desk):
