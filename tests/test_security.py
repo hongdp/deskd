@@ -379,9 +379,14 @@ def test_required_fields_must_be_signed(signer):
 
 
 def test_claim_refuses_a_nonce_the_ledger_does_not_back(desk, signer):
-    """Invariant (4): the ledger row is the receipt. This is the check that
-    stops an agent writing a supervisor-attributed row directly into the DB —
-    without a matching, correctly-bound ledger row, the row is forged.
+    """Invariant (4): the ledger row is the receipt. A supervisor-attributed
+    action with no matching, correctly-bound ledger row is refused.
+
+    This binds the ASSERTION path, not the DB itself: an attacker who can write
+    the coordination DB directly inserts both the action row and its backing
+    nonce row, and claim() accepts it — it checks the row exists, not that it was
+    signed. That same-user exposure is conceded in docs/security.md and defended
+    by OS isolation, not this check.
     """
     raw, sig = signer.assertion(action="join", meeting_id="t1", nonce="j" * 24)
     verified = auth.verify_bytes(raw, sig, actions={"join"})

@@ -4,11 +4,19 @@ Every other module in deskd trusts a role string. This module is the only place
 that decides whether a caller is *actually* the supervisor, so it is the one
 file where paranoia beats convenience.
 
-The threat model is specific: agents run as unprivileged sessions on this host,
-with write access to the workspace and to the coordination DB. An agent must
-never be able to manufacture a supervisor action — not by forging a payload,
-not by pointing verification at a key it wrote itself, and not by replaying a
-supervisor action it observed. That yields four invariants:
+The threat model has a boundary worth stating exactly, because this file is where
+someone will look to understand it. These invariants stop an agent from
+manufacturing a supervisor action *through the supported interface* — the signed
+assertion path and the meeting API. They do NOT, and cannot, stop code that
+writes the coordination DB directly: an agent that runs `INSERT INTO
+supervisor_nonces` forges a row that :func:`claim` will accept, because claim
+checks that the row *exists*, not that it was ever signed. That is the same
+same-host, same-user exposure `docs/security.md` concedes in full — the DB write
+capability is the hole, and the defence against it is OS-level isolation (run the
+verifier and DB under an account agents cannot write), not this module. What
+follows secures the network/assertion boundary, which is a different and real
+boundary: an agent must not forge a payload, point verification at a key it
+wrote, or replay an assertion it observed. That yields four invariants:
 
 1. **The private key is never on this host.** The supervisor signs on a trusted
    device; deskd only ever holds the Ed25519 *public* key, at a path that is

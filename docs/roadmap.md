@@ -24,40 +24,26 @@ Two consequences run through this whole document:
 
 ---
 
-## P0 — Wrong now, and cheap now
+## Done in 0.1.0 — the defects that shaped these rules
 
-### Close the seam tests that don't exist
+These shipped fixed; they are kept here as the record of *why* the rules below
+exist, because each was a real bug that a green suite hid.
 
-Two defects survived review because **a suite covers the seam that exists and
-cannot notice the one that is missing**:
-
-- `agent_tasks.source_kind` validated against a module constant while
-  `agent_inbox.source_kind` validated against config — same column name, same
-  type, both CHECK-free, so a column-level diff showed nothing. There was an
-  `inbox_sources` seam test and no task equivalent.
-- `_demand_resolved`'s role predicate: a mutation restoring the *original* bug
-  fails a test, but a mutation dropping the role predicate from the replacement
-  query passes. The fix's own comment states the invariant ("this predicate must
-  stay identical to `_delivery_state()`'s wake test") and nothing enforces it.
-
-Rule going forward: **every config seam gets a host-extends-it test, and every
-invariant stated in a comment gets a test or stops being stated.**
-
-### Decide the closed enum sets, and stop the docs contradicting the code
-
-`mailbox_threads.kind IN ('live','review')` and `review_artifacts.stage IN
-('report','review','final')` are CHECK-constrained with no host seam, while
-`orchestration.py` states the principle that "a CHECK would freeze one host's
-vocabulary into every host's database file" and `mailbox.py` claims compliance by
-scoping the claim to "roles or sources" — which is exactly how these slipped
-through. Either open the seam or declare them engine-owned shapes, but a reader
-must not be able to conclude the opposite of what the code does.
-
-### `BROADCAST = "all"`
-
-`"both"` is a two-role fossil pinned as an on-disk contract, and `_role()`
-actively normalises the correct generic word `"all"` **into** it. Keep `"both"` as
-a read alias, migrate the rows. Cheap now, permanent after publication.
+- **The seam tests that didn't exist.** `agent_tasks.source_kind` validated
+  against a module constant while `agent_inbox.source_kind` validated against
+  config — same column, both CHECK-free, so a column diff showed nothing.
+  `_demand_resolved`'s role predicate had the same shape: a mutation restoring
+  the *original* bug failed a test, but dropping the role predicate from the
+  *replacement* query passed. **Fixed:** `task_sources` is now a config field,
+  every config seam has a host-extends-it test, and the standing rule is —
+  **every invariant stated in a comment gets a test or stops being stated.**
+- **Closed enum sets vs. the docs.** `mailbox_threads.kind` and
+  `review_artifacts.stage` were CHECK-constrained with no host seam while the
+  code claimed no CHECK froze a host's vocabulary. **Resolved:** reconciled so a
+  reader cannot conclude the opposite of what the code does.
+- **`BROADCAST`.** `"both"` was a two-role fossil, and `_role()` normalised the
+  generic `"all"` *into* it. **Fixed:** `BROADCAST = "all"`, `"both"` kept as a
+  read alias.
 
 ---
 

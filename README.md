@@ -51,6 +51,8 @@ pip install -e ".[web]"      # engine + web console
 
 ## Quickstart
 
+Describe your desk in a module that defines `configure_deskd()`:
+
 ```python
 # myapp/desk.py
 from deskd.config import RoleSpec, PromptBuilder, configure
@@ -59,18 +61,27 @@ class MyPrompts(PromptBuilder):
     def bootstrap(self, role: str) -> str:
         return f"Load the myapp skill, declare role={role}, follow its playbook."
 
-configure(
-    roles=(
-        RoleSpec("researcher", "Researcher", ("research", "review")),
-        RoleSpec("operator",   "Operator",   ("execution",), {"can_execute": True}),
-    ),
-    timezone="America/New_York",
-    probe_allowlist=("myapp.watchers",),   # empty = no probes may run
-    prompt_builder=MyPrompts(),
-)
+def configure_deskd():                        # deskd calls this at startup
+    configure(
+        roles=(
+            RoleSpec("researcher", "Researcher", ("research", "review")),
+            RoleSpec("operator",   "Operator",   ("execution",), {"can_execute": True}),
+        ),
+        timezone="America/New_York",
+        inbox_sources=("alert", "signal", "system", "meeting", "supervisor"),
+        probe_allowlist=("myapp.watchers",),   # empty = no probes may run
+        prompt_builder=MyPrompts(),
+    )
 ```
 
+Point deskd at it with **`DESKD_CONFIG_MODULE`**. Every deskd process — the CLI,
+`deskd serve`, the cron driver — imports that module and calls `configure_deskd()`
+before it touches the engine, so your roles are registered everywhere. Without it
+a deskd process starts empty (no roles) and every role-scoped command is rejected.
+
 ```bash
+export DESKD_CONFIG_MODULE=myapp.desk         # (myapp must be importable — on PYTHONPATH)
+
 deskd serve                                   # supervisor console on 127.0.0.1:8000
 deskd status set --role operator --activity "watching the queue"
 deskd inbox enqueue --for operator --source alert --title "threshold crossed" --priority urgent
@@ -80,7 +91,8 @@ deskd wake sources --role operator            # what can wake me, and how to cha
 Wake the desk from cron (the driver is the **only** thing that spawns sessions):
 
 ```cron
-* * * * * DESKD_WAKE_EXECUTE=1 /path/to/deskd/scripts/cron/wake_orchestrator.sh
+# cron has its own environment — set both vars on the line (or in the crontab header)
+* * * * * DESKD_CONFIG_MODULE=myapp.desk DESKD_WAKE_EXECUTE=1 /path/to/deskd/scripts/cron/wake_orchestrator.sh
 ```
 
 It is **dry-run by default** — schedule it, watch the log, then set
@@ -90,7 +102,7 @@ It is **dry-run by default** — schedule it, watch the log, then set
 
 ```bash
 # a calendar wake (weekday 06:15, in your configured tz)
-deskd hook add --for operator --title "pre-open prep" --cron "15 6 * * 1-5"
+deskd hook add --for operator --title "daily digest" --cron "15 6 * * *"
 
 # your own watcher algorithm: return a dict -> it wakes you
 deskd hook add --for operator --title "queue depth watch" \

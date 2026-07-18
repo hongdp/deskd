@@ -29,6 +29,16 @@ records its auth mode and a single-use nonce.
   root-owned and not group/world-writable, and is **not** environment-overridable —
   otherwise an agent could point verification at a key it wrote. Nonces are
   single-use; expiry, tampering, wrong action/content, and replay all fail closed.
+- **hybrid** — accepts either a simple code or a signed assertion, for migrating
+  from one to the other.
+- **open** — **no credential at all: every caller that can reach the socket is
+  authorized as the supervisor.** The boundary is disabled. This exists for a
+  single trusted operator on a private host who has decided the access code adds
+  nothing (on a same-user host it does not stop the host's own agents, which can
+  read `.env`) — it is a deliberate surrender, never a default. `auth_mode()`
+  defaults to `simple`; `open` happens only when `DESKD_SUPERVISOR_AUTH_MODE=open`
+  is set explicitly, and the server prints a banner and shows a red console
+  warning every time it runs this way. Do not enable it on a shared network.
 
 Keep the private key off the agent host. No signing utility or key generator
 belongs in this repo.

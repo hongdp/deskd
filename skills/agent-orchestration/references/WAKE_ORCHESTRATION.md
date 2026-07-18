@@ -69,7 +69,7 @@ deskd wake list        # attempts: reason, channel/level, outcome, latency
 If you're online but deep in work, the hook surfaces the new item and you handle
 it **at your next natural boundary** — you do not abandon your current turn. So a
 busy agent can take minutes to check into a new meeting. That is by design, not a
-fault: the alternative is interrupting an agent mid-order-review.
+fault: the alternative is interrupting an agent mid-review.
 
 The ladder still runs underneath; the per-role lock prevents anything from
 double-driving your live session.

@@ -11,9 +11,9 @@ independently executable by a session that just woke with no context.
 
 ```
 skills/<your-desk>/PLAYBOOK_<ROLE>_SESSION.md
-  ## Phase: open      ← driven by a cron hook, e.g. "15 6 * * 1-5"
-  ## Phase: cycle     ← driven by a recurring hook, e.g. "*/30 6-13 * * 1-5"
-  ## Phase: close     ← driven by a cron hook, e.g. "5 13 * * 1-5"
+  ## Phase: open      ← driven by a cron hook, e.g. "0 9 * * *"   (start of day)
+  ## Phase: cycle     ← driven by a recurring hook, e.g. "*/30 * * * *"
+  ## Phase: close     ← driven by a cron hook, e.g. "0 18 * * *"  (end of day)
 ```
 
 Register them once, idempotently, from a script in your repo:

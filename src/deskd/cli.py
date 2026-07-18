@@ -32,7 +32,7 @@ import json
 import sys
 from typing import NoReturn
 
-from .config import CONFIG, PROJECT_NAME, __version__, env
+from .config import CONFIG, PROJECT_NAME, __version__, env, load_host_config
 
 # --- engine-level enumerations ----------------------------------------------
 # These are domain-agnostic engine vocabulary, not roles, so they are safe to
@@ -591,6 +591,10 @@ _DISPATCH = {
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Load the host's roles/config BEFORE the parser is built: choices like
+    # --source and --probe are read from CONFIG at parse time, so a host's
+    # vocabulary must be in place first. No-op when DESKD_CONFIG_MODULE is unset.
+    load_host_config()
     args = build_parser().parse_args(argv)
     try:
         _DISPATCH[args.cmd](args)

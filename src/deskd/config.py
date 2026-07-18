@@ -206,3 +206,37 @@ def configure(**kwargs) -> EngineConfig:
             raise ValueError(f"unknown config field: {k}")
         setattr(CONFIG, k, v)
     return CONFIG
+
+
+def load_host_config() -> str | None:
+    """Import the host's config module named by ``DESKD_CONFIG_MODULE``, if set.
+
+    A deskd process — the CLI, ``deskd serve``, the cron driver — starts with an
+    EMPTY config: no roles, no probe allowlist, deny-all. The host supplies those
+    by calling :func:`configure`, but that call has to actually RUN inside every
+    process that talks to the engine, and a separate ``deskd`` process never
+    imports the host's application by itself. Without this hook the host's roles
+    are registered nowhere the CLI can see, and every role-scoped command is
+    rejected — which is exactly the gap the published Quickstart fell into.
+
+    Set ``DESKD_CONFIG_MODULE=myapp.desk`` and this imports that module; importing
+    it is expected to call ``configure()`` (at module top level, or via a
+    ``configure_deskd()`` function this then calls if present). Idempotent and
+    import-order-independent: engine modules read CONFIG at call time, so this
+    only has to run before the first engine CALL, which every entry point below
+    arranges by invoking it first thing.
+
+    Returns the module name loaded, or None if the var is unset. Raises if the
+    var names a module that cannot be imported — a misconfigured host should fail
+    loudly at startup, not silently run with no roles.
+    """
+    import importlib
+
+    name = env("CONFIG_MODULE")
+    if not name:
+        return None
+    module = importlib.import_module(name)
+    hook = getattr(module, "configure_deskd", None)
+    if callable(hook):
+        hook()
+    return name

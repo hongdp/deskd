@@ -383,6 +383,44 @@ def test_empty_probe_allowlist_denies_everything(desk):
     assert orchestration._probe_path_ok("deskd.orchestration:board") is False
 
 
+# --- DESKD_CONFIG_MODULE: the host config actually loads in a fresh process --
+
+def test_config_module_env_loads_host_roles(desk, tmp_path, monkeypatch):
+    """A separate deskd process (CLI, serve, driver) never imports the host app
+    on its own — so without this hook the host's configure() runs nowhere the
+    process can see, its roles register nowhere, and every role-scoped command is
+    rejected. That was the published Quickstart's actual bug. load_host_config()
+    imports DESKD_CONFIG_MODULE and calls its configure_deskd()."""
+    mod = tmp_path / "hostcfg_probe.py"
+    mod.write_text(
+        "from deskd.config import RoleSpec, configure\n"
+        "def configure_deskd():\n"
+        "    configure(roles=(RoleSpec('widget','W'), RoleSpec('sprocket','S')),\n"
+        "              inbox_sources=('pagerduty','system','meeting','supervisor'))\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("DESKD_CONFIG_MODULE", "hostcfg_probe")
+
+    loaded = cfg_mod.load_host_config()
+
+    assert loaded == "hostcfg_probe"
+    assert set(CONFIG.role_names()) == {"widget", "sprocket"}
+    assert "pagerduty" in CONFIG.inbox_sources     # host vocabulary, not the engine's
+
+
+def test_config_module_unset_is_a_noop(desk, monkeypatch):
+    """Unset var: the engine stays as configured, no import attempted."""
+    monkeypatch.delenv("DESKD_CONFIG_MODULE", raising=False)
+    assert cfg_mod.load_host_config() is None
+
+
+def test_config_module_missing_fails_loud(desk, monkeypatch):
+    """A named-but-unimportable module must raise, not silently run with no
+    roles — a misconfigured host should fail at startup, not at first command."""
+    monkeypatch.setenv("DESKD_CONFIG_MODULE", "no_such_deskd_host_module")
+    with pytest.raises(ModuleNotFoundError):
+        cfg_mod.load_host_config()
+
+
 # --- the supervisor is not a role -------------------------------------------
 
 def test_supervisor_is_not_an_agent_role(desk, conn):

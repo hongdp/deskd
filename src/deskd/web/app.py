@@ -82,6 +82,12 @@ def _install_config(config: EngineConfig | None) -> EngineConfig:
 
 def create_app(config: EngineConfig | None = None) -> FastAPI:
     """Build the console app. `config` defaults to the process-wide CONFIG."""
+    # `deskd serve` runs uvicorn with factory=True, so this factory is what a
+    # reloaded WORKER process calls — a fresh interpreter where main()'s
+    # load_host_config() never ran and CONFIG is empty. Load it here too (no-op
+    # if DESKD_CONFIG_MODULE is unset, or if an explicit config is passed in).
+    if config is None:
+        config_mod.load_host_config()
     cfg = _install_config(config)
 
     # Resolve the mode once, at construction: an invalid DESKD_SUPERVISOR_AUTH_MODE

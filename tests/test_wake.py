@@ -745,7 +745,7 @@ def _idle_attempts() -> list[dict]:
 def test_an_idle_agent_is_woken_for_its_open_queue(desk):
     """The hole this whole change exists to close.
 
-    Observed live: the analyst had five open tasks, three of them orchestration
+    Observed live: alpha had five open tasks, three of them orchestration
     bugs it had found itself, written down, and never returned to. Nothing would
     ever have reminded it — priority=normal with no due_at is invisible to every
     path — so it sat parked with a to-do list it could not be reminded of. Three
