@@ -37,9 +37,18 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Sequence
 
 from . import auth, mailbox
+from . import channels as _channels
+# Channel machinery lives in `deskd.channels` (engine infrastructure, not a
+# meetings concern — the wake ladder's terminal rung dispatches through it
+# too). Re-exported because hosts historically registered channels via this
+# module; both spellings stay valid.
+from .channels import (  # noqa: F401  (re-exports)
+    OUTBOX_CHANNEL, CallableChannel, EscalationChannel,
+    register_channel, registered_channels, unregister_channel,
+)
 from .config import CONFIG, PROJECT_NAME
 
 MEETING_TYPES = {"live", "review", "ad-hoc"}
@@ -92,9 +101,7 @@ DEFAULT_REVIEW_MAX_MESSAGES = 40
 #: Upper bound on `wait_for_updates` blocking. Agents must not busy-wait.
 MAX_WAIT_SECONDS = 5
 
-#: The terminal escalation channel: "delivery" is the ledger row itself, which
-#: the console renders. Always available, so an escalation is never lost.
-OUTBOX_CHANNEL = "outbox"
+# (channel names/classes are imported at the top from `deskd.channels`)
 
 #: The mailbox's "every participant" recipient token. Re-exported from the
 #: module that owns it rather than re-spelled: it is part of the on-disk
@@ -619,88 +626,6 @@ def _stamp_notifications(conn, role: str) -> None:
 
 # --- escalation channels ----------------------------------------------------
 
-class EscalationChannel:
-    """A destination an escalation can be delivered to.
-
-    The engine ships with no network code and no channel implementations: it
-    knows nothing about anyone's Discord, SMTP, or pager. A host registers what
-    it has (see `register_channel` / `CallableChannel`); `outbox` is always
-    available as the terminal fallback, so an escalation is never silently
-    dropped just because nothing is configured.
-    """
-
-    #: Unique channel name, as stored in meeting_escalations.channel.
-    name: str = ""
-
-    def available(self) -> bool:
-        """Is this channel currently usable? `auto` dispatch picks every
-        channel that says yes. An unconfigured channel should say no rather
-        than fail at send time."""
-        return True
-
-    def send(self, subject: str, text: str) -> None:
-        """Deliver, or raise. Raising marks this channel failed for this
-        escalation; other channels still get their turn."""
-        raise NotImplementedError
-
-
-class CallableChannel(EscalationChannel):
-    """Adapter so a host can register a channel with a plain function.
-
-        deskd.meetings.register_channel(CallableChannel(
-            "discord", send=lambda subject, text: post(text),
-            available=lambda: bool(webhook_url),
-        ))
-    """
-
-    def __init__(self, name: str, send: Callable[[str, str], None],
-                 available: Callable[[], bool] | None = None) -> None:
-        self.name = _clean(name, "channel name")
-        if self.name in {"auto", OUTBOX_CHANNEL}:
-            raise ValueError(f"{self.name!r} is a reserved channel name")
-        self._send = send
-        self._available = available
-
-    def available(self) -> bool:
-        return True if self._available is None else bool(self._available())
-
-    def send(self, subject: str, text: str) -> None:
-        self._send(subject, text)
-
-
-_CHANNELS: dict[str, EscalationChannel] = {}
-
-
-def register_channel(channel: EscalationChannel) -> None:
-    """Register (or replace) an escalation channel. Call at host startup."""
-    name = _clean(channel.name, "channel name")
-    if name in {"auto", OUTBOX_CHANNEL}:
-        raise ValueError(f"{name!r} is a reserved channel name")
-    _CHANNELS[name] = channel
-
-
-def unregister_channel(name: str) -> None:
-    _CHANNELS.pop(name, None)
-
-
-def registered_channels() -> tuple[str, ...]:
-    return tuple(sorted(_CHANNELS))
-
-
-def _channel_available(channel: EscalationChannel) -> bool:
-    # A broken availability probe must not take down the dispatcher; treat it
-    # as unavailable and let the outbox fallback catch the escalation.
-    try:
-        return bool(channel.available())
-    except Exception:
-        return False
-
-
-def _auto_channels() -> list[str]:
-    names = [n for n, c in _CHANNELS.items() if _channel_available(c)]
-    return sorted(names) or [OUTBOX_CHANNEL]
-
-
 def _queue_escalation(conn, thread_id: str, requested_by: str, reason: str,
                       channel: str = "auto") -> int:
     cursor = conn.execute(
@@ -728,32 +653,19 @@ def dispatch_escalation(escalation_id: int, *,
         ).fetchone()
         if not row:
             raise ValueError(f"unknown escalation: {escalation_id}")
-    channels = _auto_channels() if row["channel"] == "auto" else [row["channel"]]
     subject = f"{PROJECT_NAME} meeting: {row['agenda']}"
     text = (f"{PROJECT_NAME} meeting escalation [{row['thread_id']}]\n"
             f"Agenda: {row['agenda']}\nReason: {row['reason']}")
-    results = []
-    for name in channels:
-        try:
-            if name == OUTBOX_CHANNEL:
-                # The ledger row IS the delivery; the console surfaces it.
-                results.append({"channel": name, "status": "queued"})
-                continue
-            channel = _CHANNELS.get(name)
-            if channel is None:
-                raise RuntimeError(f"no such escalation channel: {name}")
-            channel.send(subject, text)
-            results.append({"channel": name, "status": "sent"})
-        except Exception as exc:
-            results.append({"channel": name, "status": "failed", "error": str(exc)})
-    sent = any(r["status"] == "sent" for r in results)
-    queued = any(r["status"] == "queued" for r in results)
-    status = "sent" if sent else ("queued" if queued else "failed")
+    # The ledger row (meeting_escalations) is ours and already written; the
+    # channel layer only mirrors it out. An outbox result means the row IS the
+    # delivery, surfaced by the console.
+    results = _channels.deliver(subject, text, row["channel"])
+    status = _channels.summarize(results)
     with connect(db_path, write=True) as conn:
         conn.execute(
             "UPDATE meeting_escalations SET status=?,details=?,sent_at=? WHERE id=?",
             (status, json.dumps(results, ensure_ascii=False),
-             _iso() if sent else None, escalation_id),
+             _iso() if status == "sent" else None, escalation_id),
         )
     return {"id": escalation_id, "status": status, "results": results}
 
@@ -1785,7 +1697,7 @@ def escalate_meeting(thread_id: str, *, role: str, reason: str,
                      db_path: Path | str | None = None) -> dict:
     """Hand the meeting to a human. `channel` is `auto` (every available
     registered channel), `outbox`, or a channel the host registered."""
-    valid = {"auto", OUTBOX_CHANNEL} | set(_CHANNELS)
+    valid = {"auto", OUTBOX_CHANNEL} | set(registered_channels())
     if channel not in valid:
         raise ValueError(
             f"invalid escalation channel: {channel} (known: {', '.join(sorted(valid))})")

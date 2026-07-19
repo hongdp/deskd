@@ -165,25 +165,18 @@ for a in p.get("actions", []):
       ) &
       ;;
     human)
-      # Human wake channel — NOT session-launching, so it must NOT be gated by
-      # the spawn lock (a role can reach L3 while its session is online but
-      # heads-down); the escalation must still fire.
-      # The role is passed as argv, never interpolated into the program text.
-      tid=$(printf '%s' "$PLAN" | "$PY" -c '
-import sys, json
-role = sys.argv[1]
-p = json.load(sys.stdin)
-refs = [x["source_ref"] for a in p.get("actions", []) if a["role"] == role
-        for x in a.get("reasons", []) if x["reason_kind"] == "meeting_wake"]
-print(refs[0] if refs else "")' "$role")
-      echo "[$(ts)] L3 human escalation role=$role thread=${tid:-none}" >>"$LOG"
-      [ -n "$tid" ] && deskd meeting escalate "$tid" \
-        --role "$role" --reason "wake orchestrator L3: unattended past SLA" \
-        --channel auto >>"$LOG" 2>&1 || true
+      # Human rung: the ENGINE owns it now. Arrival at a leaves_machine rung
+      # writes a durable wake_escalations row inside the planning tick and
+      # dispatches it through the registered channels after commit — for EVERY
+      # reason kind, not just meeting wakes (this branch used to escalate
+      # meetings only, so any other demand reaching this rung pulled in
+      # nobody). Nothing left for the driver to execute.
+      echo "[$(ts)] L$level human rung role=$role (engine dispatched; see wake_escalations)" >>"$LOG"
       ;;
     *)
-      # supervisor_badge (L4): terminal — nothing to execute; the board shows it red.
-      echo "[$(ts)] L4 supervisor_badge role=$role (persistent red on console)" >>"$LOG"
+      # supervisor_badge (terminal): the arrival wrote its wake_escalations
+      # row too; the board shows it red until someone acts. Nothing to execute.
+      echo "[$(ts)] L$level $channel role=$role (persistent red on console)" >>"$LOG"
       ;;
   esac
 done
