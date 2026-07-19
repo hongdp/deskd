@@ -142,6 +142,49 @@ def test_any_role_can_call_a_meeting_and_be_seen_by_the_others(desk, caller):
             f"{caller}'s message did not project to {role}")
 
 
+def test_a_normal_call_wakes_the_invited_without_paging_anyone(desk):
+    """The invitation IS a wake demand. These wakes were urgent-only, which
+    left a normal call with no path to its invitees except the attendance
+    -timeout sweep — and on a quiet desk (see the sweep-on-tick test) that
+    meant a routine weekly review took 17 minutes to convene. Machine rungs
+    only: no escalation is queued for a normal call — urgency changes who
+    ELSE hears about it, not whether the machine tries."""
+    status = meetings.call_meeting(agenda="ordinary weekly", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    assert thread_id in [w["thread_id"] for w in meetings.wake_requests("beta")]
+    # The caller is present already; waking it would be noise.
+    assert thread_id not in [w["thread_id"] for w in meetings.wake_requests("alpha")]
+    assert meetings.list_escalations(thread_id) == [], (
+        "a normal call must not page anyone")
+
+
+def test_the_planning_tick_advances_the_attendance_clock(desk):
+    """The sweep runs on meetings READ paths, so its clocks advance only while
+    someone happens to be looking — and the incident that motivated this was
+    exactly nobody looking: a 300s attendance timeout that fired after 13.5
+    minutes because the first read of the meeting WAS the timeout check. The
+    orchestrator's planning tick now runs the sweep, so the clock ticks once a
+    minute whether or not anyone reads. A dry tick must not move it."""
+    from deskd import orchestration
+
+    status = meetings.call_meeting(agenda="quiet sunday", called_by="alpha",
+                                   attendees=["alpha", "beta"],
+                                   wait_timeout_seconds=30)
+    thread_id = status["meeting"]["thread_id"]
+    with _db() as conn:
+        conn.execute("UPDATE meetings SET created_at=? WHERE thread_id=?",
+                     (_past(600), thread_id))
+
+    orchestration.plan_wakes(record=False)   # dry: the clock must not move
+    assert not any("attendance timeout" in e["reason"]
+                   for e in meetings.list_escalations(thread_id))
+
+    orchestration.plan_wakes(record=True)    # a real tick, no meetings read
+    assert any("attendance timeout" in e["reason"] and "beta" in e["reason"]
+               for e in meetings.list_escalations(thread_id))
+
+
 @pytest.mark.parametrize("caller", ROLE_NAMES)
 def test_urgent_call_by_any_role_wakes_every_other_attendee(desk, caller):
     """"No wakes" was the third role's other silent symptom: the meeting existed
@@ -220,6 +263,14 @@ def test_a_stale_attendee_is_woken_not_paged(desk):
     with _db() as conn:
         conn.execute("UPDATE mailbox_messages SET created_at=? WHERE thread_id=?",
                      (_past(600), thread_id))
+        # The scenario is "message arrived AFTER beta's last ack and went
+        # unread past the SLA". Calling now arms (and check-in acks) a wake
+        # request, so beta's ack timestamp is fresh — backdate it behind the
+        # message, or the re-arm guard correctly reads the old message as
+        # already-silenced by the newer ack.
+        conn.execute(
+            "UPDATE meeting_wake_requests SET acknowledged_at=? WHERE thread_id=?",
+            (_past(1200), thread_id))
 
     meetings._sweep_timeouts()
 

@@ -1623,6 +1623,15 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
     now_iso = _iso(now)
     ladder = _ladder()
     resolved, changed, esc_ids = [], [], []
+    # Advance the meeting SLA clocks BEFORE planning, so a wake request the
+    # sweep arms is collected as demand in this same tick. The sweep otherwise
+    # runs only on meetings read paths — clocks that advance only while
+    # someone happens to be looking, which on a quiet desk is never. Outside
+    # the planning txn (it owns its own transaction and dispatches), and
+    # record-gated for the same reason probes are: a rollback cannot undo a
+    # channel send.
+    if record:
+        meetings.sweep_timeouts(db_path)
     with _planning_txn(db_path, record=record) as conn:
         sync_delivery(conn)
         sync_meeting_close_tasks(conn)

@@ -795,6 +795,18 @@ def _sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
     return escalation_ids
 
 
+def sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
+    """Advance the meeting SLA clocks (attendance timeout, stale-attendee
+    re-arm) and dispatch what they queue.
+
+    Public because the orchestrator's planning tick calls it: the sweep runs
+    on every meetings READ path, which advances the clocks only while someone
+    happens to be looking. On a quiet desk nobody looks — a 300s attendance
+    timeout once fired after 13.5 minutes because the first read of the
+    meeting WAS the timeout check. The tick makes the clocks tick."""
+    return _sweep_timeouts(db_path)
+
+
 # --- calling a meeting ------------------------------------------------------
 
 def _call_meeting(*, agenda: str, called_by: str, attendees: list[str],
@@ -896,13 +908,24 @@ def _call_meeting(*, agenda: str, called_by: str, attendees: list[str],
                      auth_nonce if role == supervisor and role == called_by else None),
                 )
             _event(conn, thread["id"], "called", called_by, agenda, auth_nonce)
+            # The INVITATION is itself a wake demand, whatever the priority:
+            # machine rungs only (hook -> resume -> spawn), nobody paged. These
+            # used to be urgent-only, which left a normal call with NO path to
+            # its invitees except the attendance-timeout sweep — and that sweep
+            # only ran when some session happened to read the meeting, so on a
+            # quiet desk a routine weekly review took 17 minutes to convene
+            # (2026-07-19: called 22:00:39, sweep finally ran 22:14:17, trader
+            # checked in 22:17:33). The caller is present already; waking it
+            # would be noise. The supervisor is a human and is never woken.
+            for role in sorted((roles & agent_roles) - {called_by}):
+                conn.execute(
+                    """INSERT OR IGNORE INTO meeting_wake_requests
+                       (thread_id,role,status,created_at) VALUES (?,?,'pending',?)""",
+                    (thread["id"], role, now),
+                )
             if priority == "urgent":
-                for role in sorted((roles & agent_roles) - {called_by}):
-                    conn.execute(
-                        """INSERT OR IGNORE INTO meeting_wake_requests
-                           (thread_id,role,status,created_at) VALUES (?,?,'pending',?)""",
-                        (thread["id"], role, now),
-                    )
+                # Urgency changes who ELSE hears about it, not whether the
+                # machine tries: the human escalation rides on top of the wake.
                 escalation_id = _queue_escalation(
                     conn, thread["id"], called_by,
                     "urgent meeting requires off-hours wake", "auto",
