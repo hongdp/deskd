@@ -87,6 +87,11 @@ MODEL=${DESKD_WAKE_MODEL:-claude-opus-4-8}
 TIMEOUT=${DESKD_WAKE_TIMEOUT:-1800}
 # Domain tools belong to the host: extend this via DESKD_WAKE_ALLOWED_TOOLS
 # (e.g. append your MCP server's tools). The engine grants nothing by itself.
+# This is only the DEFAULT: a role whose registry authority declares
+# `allowed_tools` gets exactly that list — the plan carries the declaration and
+# this driver is the enforcement point (deskd declares, the harness enforces).
+# NB --allowedTools is only a boundary while `Bash` is excluded from the grant;
+# a role with a shell can reach anything the process can.
 ALLOWED=${DESKD_WAKE_ALLOWED_TOOLS:-Bash,Read,Write,Edit,Glob,Grep,Skill,ToolSearch,TodoWrite,WebSearch,WebFetch}
 
 # Single-instance: don't let two driver ticks overlap.
@@ -99,19 +104,28 @@ TICK_ARGS=""; [ "$EXECUTE" != "1" ] && TICK_ARGS="--dry"
 PLAN=$(deskd wake tick $TICK_ARGS 2>>"$LOG") \
   || { echo "[$(ts)] wake tick failed" >>"$LOG"; exit 0; }
 
-# One TSV row per action: role \t channel \t level \t session_id \t prompt.
-# session_id is emitted as "-" when absent so consecutive tabs never collapse
-# under IFS=$'\t' (tab is IFS-whitespace) and shift the prompt field.
+# One TSV row per action: role \t channel \t level \t session_id \t tools \t
+# prompt. session_id/tools are emitted as "-" when absent so consecutive tabs
+# never collapse under IFS=$'\t' (tab is IFS-whitespace) and shift the prompt
+# field; the prompt stays LAST because it is freeform. `tools` is the role's
+# declared authority.allowed_tools, comma-joined — the declaration this driver
+# enforces below.
 printf '%s' "$PLAN" | "$PY" -c '
 import sys, json
 p = json.load(sys.stdin)
 for a in p.get("actions", []):
+    at = (a.get("authority") or {}).get("allowed_tools")
+    tools = ",".join(at) if isinstance(at, list) and at else "-"
     print("\t".join([a["role"], a["channel"], str(a["level"]),
-                     a.get("session_id") or "-",
+                     a.get("session_id") or "-", tools,
                      a["prompt"].replace("\t", " ").replace("\n", " ")]))
-' | while IFS=$'\t' read -r role channel level session prompt; do
+' | while IFS=$'\t' read -r role channel level session tools prompt; do
   [ -z "${role:-}" ] && continue
   [ "$session" = "-" ] && session=""
+  # Per-role enforcement of the declared grant; the global default only covers
+  # roles that declare nothing.
+  ROLE_ALLOWED=$ALLOWED
+  [ "$tools" != "-" ] && ROLE_ALLOWED=$tools
 
   if [ "$EXECUTE" != "1" ]; then
     echo "[$(ts)] DRY-RUN $channel L$level role=$role :: $prompt" >>"$LOG"
@@ -138,14 +152,14 @@ for a in p.get("actions", []):
         if [ "$channel" = "resume" ] && [ -n "$session" ]; then
           echo "[$(ts)] resume role=$role session=$session" >>"$LOG"
           DESKD_ROLE="$role" timeout "$TIMEOUT" "$AGENT" -p "$prompt" \
-            --resume "$session" --allowedTools "$ALLOWED" >>"$LOG" 2>&1 || true
+            --resume "$session" --allowedTools "$ROLE_ALLOWED" >>"$LOG" 2>&1 || true
         else
           SID=$(uuidgen 2>/dev/null || "$PY" -c 'import uuid; print(uuid.uuid4())')
           deskd status set --role "$role" --state booting \
             --session-id "$SID" --harness "wake-$role" >/dev/null 2>&1 || true
           echo "[$(ts)] spawn role=$role session=$SID" >>"$LOG"
           DESKD_ROLE="$role" DESKD_SESSION_ID="$SID" timeout "$TIMEOUT" "$AGENT" -p "$prompt" \
-            --model "$MODEL" --session-id "$SID" --allowedTools "$ALLOWED" >>"$LOG" 2>&1 || true
+            --model "$MODEL" --session-id "$SID" --allowedTools "$ROLE_ALLOWED" >>"$LOG" 2>&1 || true
           deskd status end --role "$role" >/dev/null 2>&1 || true
         fi
       ) &
@@ -185,11 +199,15 @@ import sys, json
 try: p = json.load(sys.stdin)
 except Exception: sys.exit(0)
 for r in p.get("rollovers", []):
-    print("\t".join([r["role"], r.get("session_id") or "-",
+    at = (r.get("authority") or {}).get("allowed_tools")
+    tools = ",".join(at) if isinstance(at, list) and at else "-"
+    print("\t".join([r["role"], r.get("session_id") or "-", tools,
                      r["prompt"].replace("\t", " ").replace("\n", " ")]))
-' | while IFS=$'\t' read -r role session prompt; do
+' | while IFS=$'\t' read -r role session tools prompt; do
     [ -z "${role:-}" ] && continue
     [ "$session" = "-" ] && session=""
+    ROLE_ALLOWED=$ALLOWED
+    [ "$tools" != "-" ] && ROLE_ALLOWED=$tools
     if [ -z "$session" ]; then
       echo "[$(ts)] rollover role=$role has no resumable session; ending it" >>"$LOG"
       deskd status end --role "$role" >/dev/null 2>&1 || true
@@ -201,7 +219,7 @@ for r in p.get("rollovers", []):
       flock -n 8 || { echo "[$(ts)] rollover role=$role: session lock busy (mid-turn); retry next tick" >>"$LOG"; exit 0; }
       echo "[$(ts)] rollover-drain role=$role session=$session" >>"$LOG"
       DESKD_ROLE="$role" timeout "$TIMEOUT" "$AGENT" -p "$prompt" \
-        --resume "$session" --allowedTools "$ALLOWED" >>"$LOG" 2>&1 || true
+        --resume "$session" --allowedTools "$ROLE_ALLOWED" >>"$LOG" 2>&1 || true
       deskd status end --role "$role" >/dev/null 2>&1 || true
     ) &
   done
