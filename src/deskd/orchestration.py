@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS agent_registry (
     created_at            TEXT NOT NULL
 );
 
+-- agent_sessions.session_day: the local-tz day the session belongs to.
+-- agent_sessions.phase: active | draining | closed.
 CREATE TABLE IF NOT EXISTS agent_sessions (
     role                  TEXT PRIMARY KEY,
     session_id            TEXT,
@@ -83,13 +85,20 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     started_at            TEXT NOT NULL,
     last_heartbeat_at     TEXT NOT NULL,
     ended_at              TEXT,
-    session_day           TEXT,   -- local-tz day the session belongs to
-    phase                 TEXT     -- active | draining | closed
+    session_day           TEXT,
+    phase                 TEXT
 );
 
 -- No CHECK on source_kind: a host defines its own task provenance kinds
 -- (CONFIG.task_sources) and its own supervisor role name, so the enumeration is
 -- validated in Python instead (see _task_sources).
+-- agent_tasks.blocked_on: what a 'blocked' task is waiting ON. No column
+-- recorded this, so `blocked` was a graveyard: anything could be marked blocked
+-- and die there, because nothing could say what it waited for, whether that had
+-- happened, or who to ask. Enforced in Python (task_update), not by a CHECK,
+-- because legacy rows predate the column and an honest backfill cannot invent
+-- their dependency. (Comments live OUTSIDE the CREATE body: older SQLite
+-- rewrites DDL textually on ALTER, and inline comments corrupt the rewrite.)
 CREATE TABLE IF NOT EXISTS agent_tasks (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     title                 TEXT NOT NULL,
@@ -106,11 +115,6 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
     result_note           TEXT,
-    -- What a 'blocked' task is waiting ON. No column recorded this, so `blocked`
-    -- was a graveyard: anything could be marked blocked and die there, because
-    -- nothing could say what it waited for, whether that had happened, or who to
-    -- ask. Enforced in Python (task_update), not by a CHECK, because legacy rows
-    -- predate the column and an honest backfill cannot invent their dependency.
     blocked_on            TEXT
 );
 
@@ -154,13 +158,14 @@ CREATE TABLE IF NOT EXISTS message_delivery (
 -- executes the returned plan. Every escalation is a new row (the old one marked
 -- 'superseded'), so the full wake history of a demand is auditable. This layer
 -- only wakes agents — it never acts as an agent.
+-- wake_attempts.reason_kind: meeting_wake / stuck_delivery / urgent_task /
+-- inbox / owed_reply. wake_attempts.channel: a CONFIG.wake_ladder rung channel.
 CREATE TABLE IF NOT EXISTS wake_attempts (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     role                  TEXT NOT NULL,
-    reason_kind           TEXT NOT NULL,   -- meeting_wake / stuck_delivery /
-                                          -- urgent_task / inbox / owed_reply
+    reason_kind           TEXT NOT NULL,
     source_ref            TEXT NOT NULL,
-    channel               TEXT NOT NULL,   -- a CONFIG.wake_ladder rung channel
+    channel               TEXT NOT NULL,
     level                 INTEGER NOT NULL,
     attempted_at          TEXT NOT NULL,
     outcome               TEXT NOT NULL DEFAULT 'pending'
@@ -210,15 +215,17 @@ ON agent_inbox(target_role, acked_at, delivered_at);
 -- evaluated per tick ('probe', a dotted callable inside CONFIG.probe_allowlist).
 -- Firing enqueues an agent_inbox item, which rides the normal delivery/wake
 -- ladder. Agents must use this instead of ANY self-managed waiting/polling.
+-- wake_hooks.kind: at | interval | probe | cron (validated in Python).
+-- wake_hooks.spec: JSON — {at} | {every,until?} | {cron,tz} | {callable,every,until?}.
 CREATE TABLE IF NOT EXISTS wake_hooks (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_role            TEXT NOT NULL,
-    kind                  TEXT NOT NULL,   -- at | interval | probe | cron (validated in Python)
+    kind                  TEXT NOT NULL,
     title                 TEXT NOT NULL,
     body                  TEXT,
     priority              TEXT NOT NULL DEFAULT 'normal'
                           CHECK (priority IN ('urgent','normal','low')),
-    spec                  TEXT NOT NULL,   -- JSON: {at} | {every,until?} | {cron,tz} | {callable,every,until?}
+    spec                  TEXT NOT NULL,
     status                TEXT NOT NULL DEFAULT 'active'
                           CHECK (status IN ('active','done','cancelled','error')),
     next_fire_at          TEXT,

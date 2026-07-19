@@ -103,6 +103,14 @@ OUTBOX_CHANNEL = "outbox"
 BROADCAST = mailbox.BROADCAST
 
 MEETING_SCHEMA = """
+-- meetings.closed_at: when the meeting actually closed. NOT a synonym for
+-- updated_at, even though the two coincide on every row today: closing merely
+-- happens to be the last thing that touches most meetings. That is a
+-- coincidence, not an invariant — anything writing a closed meeting afterwards
+-- turns updated_at into a lie about when it ended, silently, and a console
+-- sorting history by "end time" would quietly reorder itself. Written in
+-- exactly one place (_close_meeting), which is also the only place that can
+-- close a meeting.
 CREATE TABLE IF NOT EXISTS meetings (
     thread_id             TEXT PRIMARY KEY REFERENCES mailbox_threads(id) ON DELETE CASCADE,
     meeting_type          TEXT NOT NULL,
@@ -115,13 +123,6 @@ CREATE TABLE IF NOT EXISTS meetings (
     wait_timeout_seconds  INTEGER NOT NULL DEFAULT 300 CHECK (wait_timeout_seconds >= 30),
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
-    -- When the meeting actually closed. NOT a synonym for updated_at, even
-    -- though the two coincide on every row today: closing merely happens to be
-    -- the last thing that touches most meetings. That is a coincidence, not an
-    -- invariant — anything writing a closed meeting afterwards turns updated_at
-    -- into a lie about when it ended, silently, and a console sorting history by
-    -- "end time" would quietly reorder itself. Written in exactly one place
-    -- (_close_meeting), which is also the only place that can close a meeting.
     closed_at             TEXT,
     auto_escalated_at     TEXT,
     waiting_escalated_at  TEXT
