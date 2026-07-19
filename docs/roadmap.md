@@ -88,16 +88,19 @@ Same guarantee, new dimension.
 
 ## P2 — Make the decoupling claims true
 
-**Status: two of four shipped (unreleased).** The terminal rung and the
-ledger/channel split are done: `deskd.channels` owns pluggable egress
+**Status: shipped in 0.1.3, except ingress adapters.** The terminal rung and
+the ledger/channel split are done: `deskd.channels` owns pluggable egress
 (meetings re-exports for back-compat), arrival at any `leaves_machine` rung
 writes a durable `wake_escalations` row for EVERY reason kind and mirrors it
 out post-commit, and the board states which channels are wired
 (`health.channels`, `health.human_rung_unwired`,
-`health.undelivered_escalations`). Still open: the supervisor-boundary
-extraction (partly overtaken — mode/code live in `auth` now; the action verbs
-still live in meetings, which tangles with P4) and the non-Python ingress
-adapters.
+`health.undelivered_escalations`). The supervisor-boundary extraction moved to
+P4 (decision 2026-07-19, see there): what this section originally described
+was partly overtaken — mode selection and the access code now live in `auth`
+with the web app asking, not deciding — and the remaining piece, the action
+verbs, lives inside meetings, so extracting it before meetings leave the core
+would do the same surgery twice. Still open here: the non-Python ingress
+adapters below.
 
 ### The terminal rung must not be defined as a UI
 
@@ -105,18 +108,6 @@ The ladder's last rung is "a red badge on the supervisor console". If the consol
 is swappable, the ladder's terminal rung — the thing that guarantees a wake never
 silently dies — goes with it. Redefine it as an abstract durable human-visible
 sink with an interface; the console becomes one implementation.
-
-### Extract the supervisor boundary out of the web adapter
-
-`auth.py` owns verification and the nonce ledger, but mode selection, the action
-allowlist and the nonce recording call site live in `web/app.py`. If the UI is
-swappable, every new UI re-implements the boundary — and gets it wrong. This is
-not hypothetical: a host's UI once held a live credential in its page source, and
-another re-implemented the mode gate with its own fallback code minting, so the
-code the server printed was not the code the verifier checked.
-
-Extract a `supervisor` module that owns the boundary; the web app becomes a thin
-HTTP shell over it.
 
 ### The ledger is not the transport
 
@@ -267,6 +258,25 @@ point the application cannot route around:
 
 `integrity` belongs next to `auth`: it is the same class of invariant as "the
 supervisor is not an agent", not an application concern.
+
+### The supervisor boundary comes out with the application
+
+(Moved here from P2, 2026-07-19.) `auth.py` owns verification, the nonce
+ledger, and — since the console rework — mode selection and the access code,
+with the web app asking rather than deciding. What still lives in the wrong
+place is the **action-verb allowlist and its apply functions**: they sit
+inside meetings, so today "what may a supervisor do" is answered by an
+application. If the UI is swappable, every new UI re-implements whatever the
+boundary doesn't own — and gets it wrong; this is not hypothetical: a host's
+UI once held a live credential in its page source, and another re-implemented
+the mode gate with its own fallback code minting, so the code the server
+printed was not the code the verifier checked.
+
+The reason this rides with P4 rather than standing alone: the verbs are
+meeting verbs. Extract a `supervisor` module that owns the boundary — verbs,
+claim-checking, nonce recording — as part of pulling meetings out of the
+core, so applications *register* their supervisor verbs with the boundary
+instead of embedding it. The web app stays a thin HTTP shell either way.
 
 Meetings then remain as the reference application — still the most important one.
 The difference is that the third collaboration shape inherits the guarantees
