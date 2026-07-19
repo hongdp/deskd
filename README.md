@@ -46,7 +46,8 @@ watcher, on a message, or on an escalation ladder when a wake doesn't land.
 ## Install
 
 ```bash
-pip install -e ".[web]"      # engine + web console
+pip install "deskd[web]"     # from PyPI: engine + web console
+pip install -e ".[web]"      # or from a checkout, for development
 ```
 
 ## Quickstart
