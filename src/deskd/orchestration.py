@@ -239,6 +239,34 @@ CREATE TABLE IF NOT EXISTS wake_hooks (
 
 CREATE INDEX IF NOT EXISTS idx_wake_hooks_due
 ON wake_hooks(status, next_fire_at);
+
+-- Capability-addressed demands that NO enabled role can take. The wake ladder's
+-- guarantee applied to the authority axis: a demand nobody is allowed to handle
+-- must not vanish — it is recorded here, counted red on the board
+-- (health.unroutable_demands), and re-routed by plan_wakes the moment a
+-- qualifying role exists. Columns mirror agent_inbox because routing moves the
+-- row there verbatim.
+CREATE TABLE IF NOT EXISTS unroutable_demands (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    require_capability    TEXT NOT NULL,
+    source_kind           TEXT NOT NULL,
+    ref                   TEXT,
+    priority              TEXT NOT NULL DEFAULT 'normal'
+                          CHECK (priority IN ('urgent','normal','low')),
+    title                 TEXT NOT NULL,
+    body                  TEXT,
+    dedup_key             TEXT,
+    enqueued_at           TEXT NOT NULL,
+    expires_at            TEXT,
+    routed_at             TEXT,
+    routed_to             TEXT
+);
+
+-- Same dedup contract as the inbox, on the capability instead of the role: a
+-- re-firing unroutable alert must not pile up while nobody can take it.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unroutable_dedup
+ON unroutable_demands(require_capability, dedup_key)
+WHERE dedup_key IS NOT NULL AND routed_at IS NULL;
 """
 
 
@@ -1535,6 +1563,11 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
         # are visible to this tick's demand collection. Evaluated only in record
         # mode: a dry preview must not run probes or advance timers.
         hooks_fired = _eval_wake_hooks(conn, now) if record else []
+        # Re-route capability-addressed demands BEFORE collecting: an urgent
+        # demand routed this tick wakes its new owner this tick. Not gated on
+        # `record` — the dry preview must make the same decisions; _planning_txn
+        # rolls its writes back.
+        routed = _route_unroutable(conn)
         pres = {p["role"]: p for p in _presence_list(conn, now)}
         demands = collect_wake_demand(conn)
         # 1) close pending attempts whose demand is resolved or has disappeared
@@ -1628,16 +1661,27 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
             inbox_items = [dict(r) for r in conn.execute(
                 "SELECT * FROM agent_inbox WHERE target_role=? "
                 "AND acked_at IS NULL AND delivered_at IS NULL", (role,)).fetchall()]
+            # The role's registry declaration rides in the action. The engine
+            # never interprets it — it DECLARES, and the driver (the harness
+            # side of the seam) enforces, e.g. mapping authority.allowed_tools
+            # to the tool grant of the session it launches. Without this, every
+            # role is woken with the driver's one global grant and the
+            # declaration is decorative.
+            reg = conn.execute(
+                "SELECT capabilities, authority FROM agent_registry WHERE role=?",
+                (role,)).fetchone()
             actions.append({
                 "role": role, "level": top["level"], "channel": channel,
                 "session_id": (pres.get(role) or {}).get("session_id"),
+                "capabilities": _load_json(reg["capabilities"]) if reg else [],
+                "authority": _load_json(reg["authority"]) if reg else {},
                 "reasons": [{"reason_kind": d["reason_kind"], "source_ref": d["source_ref"],
                              "label": d.get("label")} for d in role_demands],
                 "prompt": _wake_prompt(role, role_demands, inbox_items),
             })
     return {"generated_at": now_iso, "actions": actions,
             "resolved": resolved, "changed": changed,
-            "hooks_fired": hooks_fired}
+            "hooks_fired": hooks_fired, "routed": routed}
 
 
 def wake_attempts_recent(limit: int = 20,
@@ -1756,8 +1800,15 @@ def rollover_plan(db_path: Path | str | None = None, *, record: bool = True) -> 
                     (r["role"],))
                 _log_event(conn, "orchestrator", "session_rollover", r["role"],
                            {"from_day": r["session_day"], "to_day": today})
+            # Same seam as plan_wakes actions: a rollover resumes a session, so
+            # the driver needs the role's declared grant here too.
+            reg = conn.execute(
+                "SELECT capabilities, authority FROM agent_registry WHERE role=?",
+                (r["role"],)).fetchone()
             out.append({"role": r["role"], "session_id": r["session_id"],
                         "from_day": r["session_day"], "to_day": today,
+                        "capabilities": _load_json(reg["capabilities"]) if reg else [],
+                        "authority": _load_json(reg["authority"]) if reg else {},
                         "prompt": _rollover_prompt(r["role"], r["session_day"], today)})
     return {"today": today, "rollovers": out}
 
@@ -1807,6 +1858,116 @@ def inbox_enqueue(target_role: str, source_kind: str, title: str, *,
         return _inbox_insert(conn, target_role, source_kind, title, body=body,
                              ref=ref, priority=priority, dedup_key=dedup_key,
                              expires_at=expires_at)
+
+
+# --- capability-addressed ingress -------------------------------------------
+
+def _roles_with_capability(conn, capability: str) -> list[str]:
+    """Enabled roles whose REGISTRY row declares `capability`. The registry is
+    the source of truth, not CONFIG.roles: runtime changes (enabled=0, a
+    capability granted to a live row) must be honoured, and _seed_registry
+    never clobbers a live row with config."""
+    out = []
+    for r in conn.execute(
+            "SELECT role, capabilities FROM agent_registry WHERE enabled=1"):
+        caps = _load_json(r["capabilities"])
+        if isinstance(caps, list) and capability in caps:
+            out.append(r["role"])
+    return sorted(out)
+
+
+def _route_role(conn, capability: str) -> str | None:
+    """Pick the recipient among qualifying roles: fewest un-acked inbox items,
+    then name. Deterministic and presence-INdependent on purpose: who happens
+    to be online this second is the wake ladder's axis, and it takes over once
+    the item is queued — routing by liveness here would just race it."""
+    roles = _roles_with_capability(conn, capability)
+    if not roles:
+        return None
+
+    def _load(role: str) -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM agent_inbox WHERE target_role=? "
+            "AND acked_at IS NULL", (role,)).fetchone()[0]
+
+    return min(roles, key=lambda r: (_load(r), r))
+
+
+def inbox_route(require_capability: str, source_kind: str, title: str, *,
+                body: str | None = None, ref: str | None = None,
+                priority: str = "normal", dedup_key: str | None = None,
+                expires_at: str | None = None,
+                db_path: Path | str | None = None) -> dict:
+    """Capability-addressed ingress: enqueue to SOME enabled role that declares
+    `require_capability` — the caller names the authority the work needs, not
+    who does it. Returns {"routed_to": role, "id": inbox_id}.
+
+    If no enabled role declares the capability the demand is UNROUTABLE — the
+    ladder's overdue state on the authority axis. It is recorded durably (never
+    dropped), counted red on the board, and plan_wakes re-routes it into a real
+    inbox the moment a qualifying role exists. Returns {"unroutable": True,
+    "id": row_id} in that case; {"deduped": True, ...} on a dedup no-op of
+    either kind."""
+    require_capability = _clean(require_capability, "require_capability")
+    with connect(db_path, write=True) as conn:
+        role = _route_role(conn, require_capability)
+        if role is not None:
+            iid = _inbox_insert(conn, role, source_kind, title, body=body,
+                                ref=ref, priority=priority, dedup_key=dedup_key,
+                                expires_at=expires_at)
+            if iid is None:
+                return {"deduped": True, "routed_to": role}
+            return {"routed_to": role, "id": iid}
+        # Validate exactly what _inbox_insert would have: the unroutable path
+        # must not be a hole through which an invalid row enters the system.
+        title = _clean(title, "title")
+        if source_kind not in CONFIG.inbox_sources:
+            raise ValueError(f"invalid source_kind: {source_kind}")
+        if priority not in TASK_PRIORITIES:
+            raise ValueError(f"invalid priority: {priority}")
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO unroutable_demands
+                   (require_capability, source_kind, ref, priority, title, body,
+                    dedup_key, enqueued_at, expires_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (require_capability, source_kind, ref, priority, title,
+             _clean(body, "body", required=False), dedup_key, _iso(), expires_at))
+        if not cur.rowcount:
+            return {"deduped": True, "unroutable": True}
+        _log_event(conn, source_kind, "unroutable_demand", ref,
+                   {"require_capability": require_capability, "title": title})
+        return {"unroutable": True, "id": cur.lastrowid}
+
+
+def _route_unroutable(conn) -> list[dict]:
+    """The closing half of inbox_route's guarantee, run every planning tick:
+    any recorded unroutable demand whose capability an enabled role NOW
+    declares moves into that role's inbox and rides the normal delivery/wake
+    ladder. Append-only history: the row is stamped routed_at/routed_to, never
+    deleted."""
+    out = []
+    for r in conn.execute(
+            "SELECT * FROM unroutable_demands WHERE routed_at IS NULL").fetchall():
+        role = _route_role(conn, r["require_capability"])
+        if role is None:
+            continue
+        try:
+            iid = _inbox_insert(conn, role, r["source_kind"], r["title"],
+                                body=r["body"], ref=r["ref"],
+                                priority=r["priority"], dedup_key=r["dedup_key"],
+                                expires_at=r["expires_at"])
+        except ValueError:
+            # The host's inbox_sources shrank under a stored row. Leave it
+            # visible on the board rather than kill every future tick over it.
+            continue
+        conn.execute(
+            "UPDATE unroutable_demands SET routed_at=?, routed_to=? WHERE id=?",
+            (_iso(), role, r["id"]))
+        _log_event(conn, "orchestrator", "demand_routed", r["ref"],
+                   {"require_capability": r["require_capability"], "role": role,
+                    "inbox_id": iid, "title": r["title"]})
+        out.append({"id": r["id"], "routed_to": role, "inbox_id": iid})
+    return out
 
 
 _INBOX_RANK = {"urgent": 0, "normal": 1, "low": 2}
@@ -2318,6 +2479,12 @@ def board(db_path: Path | str | None = None) -> dict:
             "SELECT id, owner_role, kind, title, priority, next_fire_at, "
             "fire_count, last_error FROM wake_hooks WHERE status='active' ORDER BY id"
         ).fetchall()]
+        # Overdue on the authority axis: demands no enabled role is allowed to
+        # take. Anything above zero is a call to action (grant the capability
+        # or enable a role) — plan_wakes clears it the tick after.
+        unroutable = conn.execute(
+            "SELECT COUNT(*) FROM unroutable_demands WHERE routed_at IS NULL"
+        ).fetchone()[0]
     all_tasks.sort(key=lambda t: _task_sort_key(t, now_iso))
     open_tasks = [t for t in all_tasks if t["status"] in TASK_OPEN_STATUSES]
 
@@ -2352,6 +2519,7 @@ def board(db_path: Path | str | None = None) -> dict:
             "wakes_at_human_level": human_level_wakes,
             "inbox_queued": sum(1 for r in inbox_rows if not r["delivered_at"]),
             "inbox_total": len(inbox_rows),
+            "unroutable_demands": unroutable,
         },
         "wake_activity": wake_activity,
         "recent_events": recent_events(20, db_path),

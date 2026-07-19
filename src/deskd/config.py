@@ -57,7 +57,21 @@ def driver_lock_path() -> Path:
 @dataclass(frozen=True)
 class RoleSpec:
     """One agent role. `authority` is an opaque dict the engine stores and
-    surfaces but never interprets — the host decides what it means."""
+    surfaces but never interprets — the host decides what it means.
+
+    Two declarations the engine SURFACES without ever acting on them itself:
+
+    - `capabilities`: what the role may do. Capability-addressed ingress
+      (`orchestration.inbox_route`) targets these, and "no enabled role
+      declares it" is an unroutable demand — recorded, shown red on the board,
+      re-routed automatically once a qualifying role exists.
+    - `authority["allowed_tools"]` (list of harness tool names): the tool
+      grant a session woken for this role should run under. Wake and rollover
+      plans carry it; the reference driver maps it to `--allowedTools`, falling
+      back to its global default when absent. The engine declares, the harness
+      enforces — and note that a grant containing a shell (`Bash`) makes every
+      other restriction in the list advisory.
+    """
     name: str
     display_name: str = ""
     capabilities: tuple[str, ...] = ()

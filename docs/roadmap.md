@@ -49,6 +49,16 @@ exist, because each was a real bug that a green suite hid.
 
 ## P1 — Authority as a first-class dimension
 
+**Status: shipped (unreleased).** Wake and rollover plans carry each role's
+registry declaration, and the reference driver maps `authority["allowed_tools"]`
+to the session's `--allowedTools` — the global default now covers only roles
+that declare nothing. `inbox_route()` (`deskd inbox route`) is the
+capability-addressed ingress; a demand no enabled role may take lands in
+`unroutable_demands`, reads red on the board (`health.unroutable_demands`), and
+is re-routed by the first planning tick in which a qualifying role exists.
+Still true: a grant containing `Bash` is advisory (the reason this item is not
+isolation — see P3), and routing enters at ingress rather than per-rung.
+
 **Why this first:** heterogeneous authority is *why* multi-agent systems exist. If
 every agent could do everything you would run one agent; different permissions are
 what create the need for a provable handoff — which is deskd's core guarantee

@@ -165,6 +165,18 @@ def build_parser() -> argparse.ArgumentParser:
     ib_e.add_argument("--ref")
     ib_e.add_argument("--priority", choices=PRIORITIES, default="normal")
     ib_e.add_argument("--dedup-key")
+    # Capability-addressed enqueue: name the authority the work needs, not who
+    # does it. Routes to an enabled role declaring the capability; records an
+    # unroutable demand (board: health.unroutable_demands) when none does.
+    ib_r = ib.add_parser("route")
+    ib_r.add_argument("--capability", required=True,
+                      help="route to any enabled role declaring this capability")
+    ib_r.add_argument("--source", required=True, choices=tuple(CONFIG.inbox_sources))
+    ib_r.add_argument("--title", required=True)
+    ib_r.add_argument("--body")
+    ib_r.add_argument("--ref")
+    ib_r.add_argument("--priority", choices=PRIORITIES, default="normal")
+    ib_r.add_argument("--dedup-key")
     ib_l = ib.add_parser("list")
     _add_role(ib_l, "--for", dest="target", required=False)
     ib_l.add_argument("--undelivered", action="store_true",
@@ -420,6 +432,10 @@ def _cmd_inbox(args) -> None:
                                  body=args.body, ref=args.ref,
                                  priority=args.priority, dedup_key=args.dedup_key)
         out = {"enqueued": iid} if iid else {"deduped": True}
+    elif args.inbox_cmd == "route":
+        out = orch.inbox_route(args.capability, args.source, args.title,
+                               body=args.body, ref=args.ref,
+                               priority=args.priority, dedup_key=args.dedup_key)
     elif args.inbox_cmd == "list":
         out = orch.inbox_pending(args.target, include_delivered=not args.undelivered)
     else:  # ack — only ever acks items already DELIVERED; see inbox_ack().
