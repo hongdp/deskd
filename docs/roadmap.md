@@ -88,6 +88,17 @@ Same guarantee, new dimension.
 
 ## P2 — Make the decoupling claims true
 
+**Status: two of four shipped (unreleased).** The terminal rung and the
+ledger/channel split are done: `deskd.channels` owns pluggable egress
+(meetings re-exports for back-compat), arrival at any `leaves_machine` rung
+writes a durable `wake_escalations` row for EVERY reason kind and mirrors it
+out post-commit, and the board states which channels are wired
+(`health.channels`, `health.human_rung_unwired`,
+`health.undelivered_escalations`). Still open: the supervisor-boundary
+extraction (partly overtaken — mode/code live in `auth` now; the action verbs
+still live in meetings, which tangles with P4) and the non-Python ingress
+adapters.
+
 ### The terminal rung must not be defined as a UI
 
 The ladder's last rung is "a red badge on the supervisor console". If the console

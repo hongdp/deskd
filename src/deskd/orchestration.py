@@ -35,7 +35,7 @@ import re
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import mailbox, meetings
+from . import channels, mailbox, meetings
 from .config import CONFIG, PROJECT_NAME
 
 SESSION_STATES = {
@@ -239,6 +239,29 @@ CREATE TABLE IF NOT EXISTS wake_hooks (
 
 CREATE INDEX IF NOT EXISTS idx_wake_hooks_due
 ON wake_hooks(status, next_fire_at);
+
+-- The wake ladder's HUMAN-RUNG ledger: one row per arrival of a demand at a
+-- rung that leaves the machine. This is the durable half of the terminal
+-- sink — the row exists whether or not any channel is registered, the console
+-- renders it, and the channel layer (deskd.channels) only MIRRORS it out.
+-- Previously only meeting_wake demands escalating past the machine reached a
+-- person (via the driver's meeting-specific branch); every other reason kind
+-- arrived at the human rung and reached nobody. wake_escalations.status:
+-- queued (outbox only) | sent | failed.
+CREATE TABLE IF NOT EXISTS wake_escalations (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    role                  TEXT NOT NULL,
+    reason_kind           TEXT NOT NULL,
+    source_ref            TEXT NOT NULL,
+    level                 INTEGER NOT NULL,
+    channel               TEXT NOT NULL DEFAULT 'auto',
+    reason                TEXT,
+    status                TEXT NOT NULL DEFAULT 'queued'
+                          CHECK (status IN ('queued','sent','failed')),
+    details               TEXT,
+    created_at            TEXT NOT NULL,
+    sent_at               TEXT
+);
 
 -- Capability-addressed demands that NO enabled role can take. The wake ladder's
 -- guarantee applied to the authority axis: a demand nobody is allowed to handle
@@ -1489,6 +1512,50 @@ def _insert_attempt(conn, d: dict, level: int, now_iso: str, ladder) -> int:
     return cur.lastrowid
 
 
+def _queue_wake_escalation(conn, d: dict, level: int, now_iso: str) -> int:
+    """Durable half of the human rung, written on ARRIVAL at a leaves_machine
+    rung — once per climb, inside the planning transaction. The row exists
+    whether or not any channel is registered; dispatch mirrors it out after
+    commit (_dispatch_wake_escalation), exactly the meetings pattern: a slow
+    channel must never hold the planning write lock."""
+    cur = conn.execute(
+        """INSERT INTO wake_escalations
+               (role, reason_kind, source_ref, level, channel, reason, created_at)
+           VALUES (?,?,?,?, 'auto', ?, ?)""",
+        (d["role"], d["reason_kind"], d["source_ref"], level,
+         d.get("label"), now_iso))
+    _log_event(conn, "orchestrator", "wake_escalation_queued", d["source_ref"],
+               {"role": d["role"], "reason": d["reason_kind"], "level": level})
+    return cur.lastrowid
+
+
+def _dispatch_wake_escalation(escalation_id: int,
+                              db_path: Path | str | None) -> dict:
+    """Mirror a queued wake escalation out through the channel layer. Called
+    after the planning transaction committed. The ledger row is already the
+    delivery of last resort; channels only improve on it."""
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM wake_escalations WHERE id=?",
+                           (escalation_id,)).fetchone()
+    if row is None:
+        return {"id": escalation_id, "status": "missing"}
+    subject = f"{PROJECT_NAME} wake escalation: {row['role']}"
+    text = (f"{PROJECT_NAME} wake escalation\n"
+            f"Role: {row['role']}\n"
+            f"Reason: {row['reason_kind']} ({row['reason'] or row['source_ref']})\n"
+            f"The wake ladder climbed past the machine — check the board.")
+    results = channels.deliver(subject, text, row["channel"])
+    status = channels.summarize(results)
+    with connect(db_path, write=True) as conn:
+        conn.execute(
+            "UPDATE wake_escalations SET status=?, details=?, sent_at=? WHERE id=?",
+            (status, json.dumps(results, ensure_ascii=False),
+             _iso() if status == "sent" else None, escalation_id))
+    return {"id": escalation_id, "role": row["role"],
+            "reason_kind": row["reason_kind"], "status": status,
+            "results": results}
+
+
 def _wake_reasons_text(ds: list[dict]) -> str:
     """Summarize a role's demands into one human-readable clause."""
     by: dict = {}
@@ -1555,7 +1622,7 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
     now = _now()
     now_iso = _iso(now)
     ladder = _ladder()
-    resolved, changed = [], []
+    resolved, changed, esc_ids = [], [], []
     with _planning_txn(db_path, record=record) as conn:
         sync_delivery(conn)
         sync_meeting_close_tasks(conn)
@@ -1611,6 +1678,10 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
                     _log_event(conn, "orchestrator", "wake_attempt", d["source_ref"],
                                {"role": d["role"], "reason": d["reason_kind"],
                                 "level": lvl, "channel": ladder[lvl].channel})
+                # Only a host-defined ladder can START a demand on a human rung,
+                # but arrival is arrival: the sink must fire here too.
+                if ladder[lvl].leaves_machine:
+                    esc_ids.append(_queue_wake_escalation(conn, d, lvl, now_iso))
                 changed.append({**d, "level": lvl, "escalated": False})
             else:
                 lvl = min(cur["level"], len(ladder) - 1)
@@ -1641,6 +1712,13 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
                                    d["source_ref"],
                                    {"role": d["role"], "reason": d["reason_kind"],
                                     "from": lvl, "to": nl, "channel": ladder[nl].channel})
+                    # ARRIVAL at a rung that pulls a person in — the terminal
+                    # sink's durable row, once per rung climbed, for EVERY
+                    # reason kind. The driver's old meeting-only escalation
+                    # branch reached nobody for any other reason; this is the
+                    # engine-owned replacement (dispatch happens post-commit).
+                    if escalated and ladder[nl].leaves_machine:
+                        esc_ids.append(_queue_wake_escalation(conn, d, nl, now_iso))
                     changed.append({**d, "level": nl, "escalated": escalated})
         # 3) build the per-role actionable plan (L0 hook needs no driver action)
         changed_roles = {c["role"] for c in changed}
@@ -1679,9 +1757,15 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
                              "label": d.get("label")} for d in role_demands],
                 "prompt": _wake_prompt(role, role_demands, inbox_items),
             })
+    # Mirror queued human-rung escalations out AFTER the planning transaction
+    # committed (their rows are durable regardless of what channels do). A dry
+    # run rolled its queue rows back and must not reach any network.
+    escalations = ([_dispatch_wake_escalation(e, db_path) for e in esc_ids]
+                   if record else [])
     return {"generated_at": now_iso, "actions": actions,
             "resolved": resolved, "changed": changed,
-            "hooks_fired": hooks_fired, "routed": routed}
+            "hooks_fired": hooks_fired, "routed": routed,
+            "escalations": escalations}
 
 
 def wake_attempts_recent(limit: int = 20,
@@ -2485,6 +2569,18 @@ def board(db_path: Path | str | None = None) -> dict:
         unroutable = conn.execute(
             "SELECT COUNT(*) FROM unroutable_demands WHERE routed_at IS NULL"
         ).fetchone()[0]
+        # Human-rung escalations whose only delivery is the outbox row itself
+        # (status='queued'): each is a "pull a human in" that pulled in nobody
+        # unless somebody reads this board.
+        undelivered_esc = conn.execute(
+            "SELECT COUNT(*) FROM wake_escalations WHERE status='queued'"
+        ).fetchone()[0]
+    # Which rungs are actually WIRED. The ladder promises a human rung; whether
+    # that promise means anything depends on the host having registered a
+    # channel that is available right now. unwired = the promise is currently
+    # an outbox row only — a state the host must see, not discover.
+    ladder_needs_human = any(r.leaves_machine for r in _ladder())
+    channel_rows = channels.channel_status()
     all_tasks.sort(key=lambda t: _task_sort_key(t, now_iso))
     open_tasks = [t for t in all_tasks if t["status"] in TASK_OPEN_STATUSES]
 
@@ -2520,6 +2616,10 @@ def board(db_path: Path | str | None = None) -> dict:
             "inbox_queued": sum(1 for r in inbox_rows if not r["delivered_at"]),
             "inbox_total": len(inbox_rows),
             "unroutable_demands": unroutable,
+            "channels": channel_rows,
+            "human_rung_unwired": (ladder_needs_human
+                                   and not channels.human_reachable()),
+            "undelivered_escalations": undelivered_esc,
         },
         "wake_activity": wake_activity,
         "recent_events": recent_events(20, db_path),
