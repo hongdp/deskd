@@ -269,3 +269,46 @@ def test_the_transport_refuses_stacked_requests_and_says_which_one(desk):
     # A request that does not demand a reply was never bounded by this.
     mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
                          kind="note", body="no answer needed on this one")
+
+
+# --- discussion dissent scope ------------------------------------------------
+
+def test_a_dissent_withdraws_only_the_dissenters_own_agreement(desk, tmp_path):
+    """A speaker's dissent is theirs; the counterparts' standing agreements are
+    not the engine's to strike. Clearing the whole board on every dissent
+    forced ALL sides back into discussion each round, doubling every round
+    (found 2026-07-19). The alternation rule keeps the narrow clear safe: the
+    other parties necessarily speak — and can re-agree or dissent — after
+    seeing the new dispute, so no phase can finalize on an unseen argument."""
+    from conftest import ROLES
+    role_names = tuple(r.name for r in ROLES)
+    thread = mailbox.open_thread("weekly numbers", kind="review")
+    thread_id = thread["id"]
+    for stage in ("report", "review"):
+        for r in role_names:
+            artifact = tmp_path / f"{stage}-{r}.md"
+            artifact.write_text(f"{r} {stage}")
+            mailbox.submit_review_artifact(thread_id, role=r, stage=stage,
+                                           path=artifact)
+
+    mailbox.review_discuss(thread_id, role="alpha",
+                           body="numbers check out", agree=True)
+    mailbox.review_discuss(thread_id, role="beta",
+                           body="row 4 is wrong", agree=False)
+    with mailbox.connect() as conn:
+        standing = {r["role"] for r in conn.execute(
+            "SELECT role FROM thread_agreements WHERE thread_id=?",
+            (thread_id,))}
+    assert standing == {"alpha"}, (
+        "beta's dissent must strike beta's agreement alone")
+
+    mailbox.review_discuss(thread_id, role="gamma",
+                           body="row 4 re-checked, it is fine", agree=True)
+    mailbox.review_discuss(thread_id, role="beta",
+                           body="withdrawn — agreed", agree=True)
+    with mailbox.connect() as conn:
+        row = dict(conn.execute(
+            "SELECT phase,stop_reason FROM mailbox_threads WHERE id=?",
+            (thread_id,)).fetchone())
+    assert row["phase"] == "ready_to_finalize"
+    assert row["stop_reason"] == "mutual agreement"

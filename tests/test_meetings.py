@@ -1345,3 +1345,76 @@ def test_migrating_a_db_without_closed_at_adds_it_and_backfills_only_closed_rows
         pass
     assert _row(closed) == {"state": "closed", "closed_at": legacy_end}
     assert _row(live)["closed_at"] is None
+
+
+# --- the human answering a page; the handshake's last word -------------------
+
+def test_supervisor_join_resumes_an_escalated_meeting(desk):
+    """An escalation is a page FOR the human, so the human arriving must BE
+    the resolution. This join used to bounce with "cannot join while meeting
+    is escalated", turning the answer to a page into a manual-resume two-step
+    (found 2026-07-21, a supervisor's ruling refused at the door)."""
+    thread_id = _start("page the human", ["alpha", "beta"])
+    meetings.escalate_meeting(thread_id, role="alpha",
+                              reason="need a ruling", channel="outbox")
+    assert _state(thread_id) == "escalated"
+
+    meetings.apply_simple_supervisor_action(
+        {"action": "join", "meeting_id": thread_id})
+
+    assert _state(thread_id) == "active"
+    assert _thread_row(thread_id)["status"] == "open"
+    assert _events(thread_id, "resumed"), "the arrival is recorded as the resume"
+    sent = meetings.apply_simple_supervisor_action(
+        {"action": "send", "meeting_id": thread_id, "body": "ruling: proceed"})
+    assert sent["message_id"]
+
+
+def test_supervisor_join_still_respects_an_explicit_pause(desk):
+    """Pausing is a decision; joining must not silently undo it. Only the
+    deliberate `resume` action may — the escalated case above differs exactly
+    because escalation ASKS for the human."""
+    thread_id = _start("parked on purpose", ["alpha", "beta"])
+    meetings.pause_meeting(thread_id, role="alpha", reason="hold until data lands")
+    with pytest.raises(ValueError, match="cannot join while meeting is paused"):
+        meetings.apply_simple_supervisor_action(
+            {"action": "join", "meeting_id": thread_id})
+
+
+def test_a_stopped_attendee_may_still_read_a_closed_meeting(desk):
+    """The protocol's last required act — a final mark-read after close — used
+    to be the one call guaranteed to raise, because closing stops every
+    attendee. Reading is side-effect-free; only speaking needs a live seat."""
+    thread_id = _start("read after close", ["alpha", "beta"])
+    meetings.send_update(thread_id, role="alpha", kind="evidence",
+                         body="for the record")
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+    assert meetings.confirm_end(thread_id, role="beta")["closed"] is True
+
+    out = meetings.meeting_updates(thread_id, role="beta", mark_read=True)
+    assert out["meeting"]["state"] == "closed"
+    assert "for the record" in [m["body"] for m in out["messages"]]
+    # And the receipt actually landed: a second read owes nothing.
+    again = meetings.meeting_updates(thread_id, role="beta", mark_read=True)
+    assert again["messages"] == []
+
+
+def test_termination_pending_accepts_a_final_reply_and_refuses_new_topics(desk):
+    """The handshake's substance is the final response to what was already
+    said; refusing it broke the evidence chain at its last link (a recorded
+    acceptance could only live in a private journal). A NEW topic stays
+    refused — reopening discussion is what reject_end is for."""
+    thread_id = _start("last word", ["alpha", "beta"])
+    first = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                                 body="correction: the window is six days")
+    meetings.propose_end(thread_id, role="alpha", resolution="wrap")
+    assert _state(thread_id) == "termination_pending"
+
+    with pytest.raises(ValueError, match="does not accept updates"):
+        meetings.send_update(thread_id, role="beta", kind="evidence",
+                             body="brand new topic")
+    accepted = meetings.send_update(thread_id, role="beta", kind="evidence",
+                                    body="accepted: six days it is",
+                                    reply_to=first["message_id"])
+    assert accepted["message_id"]
+    assert meetings.confirm_end(thread_id, role="beta")["closed"] is True
