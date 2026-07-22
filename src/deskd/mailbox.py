@@ -371,10 +371,10 @@ def open_thread(subject: str, *, kind: str = "live", idle_minutes: int = 45,
     unset, the engine has no opinion and any participant may do either.
 
     Sizing note for reviews: unanimity costs at least one discussion turn per
-    participant, and a single dissent clears the board. Set ``max_discussion``
-    comfortably above the participant count or the budget will retire the
-    discussion before consensus can form — which is safe (it advances to
-    finalize) but wastes the round.
+    participant, and a dissent costs the dissenter's re-agreement turn on top.
+    Set ``max_discussion`` comfortably above the participant count or the
+    budget will retire the discussion before consensus can form — which is
+    safe (it advances to finalize) but wastes the round.
     """
     subject = " ".join(subject.split())
     if not subject:
@@ -774,8 +774,20 @@ def _participants(conn: sqlite3.Connection, thread_id: str) -> tuple[str, ...]:
     return tuple(sorted(_known_roles(conn)))
 
 
-def _clear_agreements(conn: sqlite3.Connection, thread_id: str) -> None:
-    conn.execute("DELETE FROM thread_agreements WHERE thread_id=?", (thread_id,))
+def _clear_agreements(conn: sqlite3.Connection, thread_id: str,
+                      role: str | None = None) -> None:
+    """Drop recorded agreements — all of them (a phase transition resets
+    consensus), or one role's (that role just voiced a NEW disagreement).
+    A speaker's dissent withdraws only their own standing agreement: the
+    counterpart's agreement is theirs to withdraw, and the alternation rule
+    guarantees they speak — and can do so — after seeing the new dispute,
+    so a stale agreement can never finalize a phase unseen."""
+    if role is None:
+        conn.execute("DELETE FROM thread_agreements WHERE thread_id=?",
+                     (thread_id,))
+    else:
+        conn.execute("DELETE FROM thread_agreements WHERE thread_id=? AND role=?",
+                     (thread_id, role))
 
 
 def _submitted_roles(conn: sqlite3.Connection, thread_id: str, stage: str) -> set[str]:
@@ -875,10 +887,13 @@ def review_discuss(thread_id: str, *, role: str, body: str, agree: bool = False,
     """Speak once in the bounded discussion phase, optionally agreeing.
 
     Two rules keep this from becoming a loop. Speakers must alternate — nobody
-    may talk twice in a row — and any dissent clears every standing agreement,
-    so consensus must be re-established on the current state of the argument
-    rather than accumulated across it. The phase ends on unanimity or when the
-    discussion budget runs out, whichever comes first.
+    may talk twice in a row — and a dissent withdraws the dissenter's OWN
+    standing agreement, so their consensus must be re-earned on the current
+    state of the argument. The counterparts' agreements stand: alternation
+    guarantees each of them speaks after seeing the new dispute, where they may
+    re-agree or dissent in turn, so nothing finalizes on an unseen argument.
+    The phase ends on unanimity or when the discussion budget runs out,
+    whichever comes first.
     """
     with connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -908,7 +923,10 @@ def review_discuss(thread_id: str, *, role: str, body: str, agree: bool = False,
                 (thread_id, role, _iso(_now())),
             )
         else:
-            _clear_agreements(conn, thread_id)
+            # Only the dissenter's own agreement falls. Clearing the whole
+            # table here forced BOTH sides back into discussion on every
+            # dispute, doubling every round (parlay task #39, 2026-07-19).
+            _clear_agreements(conn, thread_id, role)
 
         participants = set(_participants(conn, thread_id))
         agreed = set(_agreed_roles(conn, thread_id))

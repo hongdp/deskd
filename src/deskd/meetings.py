@@ -561,7 +561,8 @@ def _meeting(conn, thread_id: str):
     return row
 
 
-def _attendee(conn, thread_id: str, role: str, *, checked_in: bool = False):
+def _attendee(conn, thread_id: str, role: str, *, checked_in: bool = False,
+              allow_stopped: bool = False):
     row = conn.execute(
         "SELECT * FROM meeting_attendees WHERE thread_id=? AND role=?",
         (thread_id, role),
@@ -570,7 +571,7 @@ def _attendee(conn, thread_id: str, role: str, *, checked_in: bool = False):
         raise ValueError(f"{role} is not invited to meeting {thread_id}")
     if checked_in and not row["checked_in_at"]:
         raise ValueError(f"{role} has not checked in")
-    if checked_in and row["stopped_at"]:
+    if checked_in and row["stopped_at"] and not allow_stopped:
         raise ValueError(f"{role} has left the meeting")
     return row
 
@@ -1072,9 +1073,32 @@ def _supervisor_join(conn, thread_id: str, auth_nonce: str) -> None:
     """The supervisor may drop into a meeting it was never invited to."""
     supervisor = CONFIG.supervisor_role
     meeting = _meeting(conn, thread_id)
-    if meeting["state"] in {"closed", "paused", "escalated"}:
+    if meeting["state"] in {"closed", "paused"}:
         raise ValueError(f"cannot join while meeting is {meeting['state']}")
     _supervisor_claim(conn, auth_nonce, {"join"}, thread_id=thread_id)
+    if meeting["state"] == "escalated":
+        # An escalation is a page FOR the human; the human arriving IS the
+        # resolution. Gating the join on a manual resume turned answering a
+        # page into a two-step the console had to explain away (found
+        # 2026-07-21: the supervisor's reply bounced with "cannot join").
+        # Explicit `paused` stays a hard gate above: pausing is a supervisor
+        # choice, and joining must not silently undo it.
+        now_dt = _now()
+        next_state = ("consensus" if meeting["messages_remaining"] <=
+                      meeting["consensus_threshold"] else "active")
+        conn.execute(
+            "UPDATE meetings SET state=?,updated_at=? WHERE thread_id=?",
+            (next_state, _iso(now_dt), thread_id),
+        )
+        thread = mailbox._refresh_thread(conn, thread_id)
+        conn.execute(
+            """UPDATE mailbox_threads SET status='open',stop_reason=NULL,
+               stopped_by=NULL,updated_at=?,expires_at=? WHERE id=?""",
+            (_iso(now_dt), mailbox._deadline(now_dt, thread["idle_minutes"]),
+             thread_id),
+        )
+        _event(conn, thread_id, "resumed", supervisor,
+               "supervisor arrival resumed an escalated meeting", auth_nonce)
     previous_mode = _mode(conn, thread_id)
     now = _iso()
     attendee = conn.execute(
@@ -1207,7 +1231,13 @@ def _meeting_updates(thread_id: str, *, role: str, mark_read: bool = False,
             raise ValueError(f"invalid meeting role: {role}")
         if role == CONFIG.supervisor_role:
             _supervisor_claim(conn, auth_nonce, {"read"}, thread_id=thread_id)
-        attendee = _attendee(conn, thread_id, role, checked_in=True)
+        # allow_stopped: reading is side-effect-free, and the protocol REQUIRES
+        # a final `updates --mark-read` after a meeting closes — which stops
+        # every attendee, so the mandatory last read used to be the one call
+        # guaranteed to raise (parlay task #46, 2026-07-20). A stopped attendee
+        # may always read what it was part of; only speaking needs a live seat.
+        attendee = _attendee(conn, thread_id, role, checked_in=True,
+                             allow_stopped=True)
         visible_sql, visible_params = _visible_message_sql(conn, "mm")
         messages = conn.execute(
             f"""SELECT mm.* FROM mailbox_messages mm
@@ -1303,7 +1333,15 @@ def _send_update(conn, thread_id: str, role: str, body: str, kind: str,
     if not preamble:
         if len(active_roles) < 2:
             raise ValueError("meeting needs at least two active attendees before discussion")
-        if meeting["state"] not in {"active", "consensus"}:
+        # termination_pending accepts REPLIES: the final response to an existing
+        # message is the substance of the two-sided termination handshake, and
+        # refusing it broke the evidence chain at its last link (a trader's
+        # acceptance of a correction could only live in its private journal —
+        # parlay task #46, 2026-07-20). New topics stay refused: reopening
+        # discussion is what reject_end is for.
+        terminal_reply = (meeting["state"] == "termination_pending"
+                          and reply_to is not None)
+        if meeting["state"] not in {"active", "consensus"} and not terminal_reply:
             raise ValueError(f"meeting does not accept updates while {meeting['state']}")
         if meeting["state"] == "consensus" and kind not in {"position", "decision"}:
             raise ValueError(
