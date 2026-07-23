@@ -15,10 +15,20 @@ as `deskd`. See README.md and docs/design.md for the architecture.
 
 ## Layout
 
-- `src/deskd/` — `orchestration.py` (presence/wake ladder), `mailbox.py`
-  (inbox + delivery ledger), `meetings.py`, `auth.py`, `cli.py` (`deskd`
-  entry point), `config.py` (holds `__version__`), `web/` (console; its
-  `static/*.html` ships in the wheel — keep it under the package)
+- `src/deskd/orchestration/` — the engine core as a layered subpackage:
+  `store.py` (schema/connect/registry/events — the only sibling that talks to
+  the layers below) → `presence.py` / `tasks.py` / `delivery.py` / `inbox.py`
+  (+ capability routing) / `hooks.py` → `wake.py` (demand collection, the
+  ladder, `plan_wakes`) → `board.py` (console aggregates). **Import from the
+  facade (`deskd.orchestration`)** — `__init__.py` re-exports every name, and
+  the submodule layout is internal layering, not API. The engine clock is
+  `orchestration.store._now`; submodules call it through the module attribute
+  so tests can patch that single point.
+- `src/deskd/` — `mailbox.py` (threads + receipts), `meetings.py` (bounded
+  meetings; its split is P4's job, not a file-size cleanup), `channels.py`
+  (pluggable human-facing egress; ledger rows never move here), `auth.py`,
+  `cli.py` (`deskd` entry point), `config.py` (holds `__version__`), `web/`
+  (console; its `static/*.html` ships in the wheel — keep it under the package)
 - `tests/` — pytest (configured via pyproject); `docs/` — design/security/roadmap
 - `scripts/session_hook.py`, `skills/agent-orchestration` — the Claude Code
   integration surface (PostToolUse hook + skill)

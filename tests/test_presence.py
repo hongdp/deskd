@@ -40,7 +40,7 @@ SPLIT = dt.datetime(2026, 1, 15, 3, 0, 0, tzinfo=dt.timezone.utc)
 
 
 class Clock:
-    """A hand-cranked replacement for `orch._now`.
+    """A hand-cranked replacement for the engine clock (orch.store._now).
 
     Every timestamp the engine writes and every age it derives flows through
     `_now()`, so patching this one function moves the engine's whole notion of
@@ -49,7 +49,7 @@ class Clock:
 
     def __init__(self, monkeypatch, start: dt.datetime):
         self.t = start
-        monkeypatch.setattr(orch, "_now", lambda: self.t)
+        monkeypatch.setattr(orch.store, "_now", lambda: self.t)
 
     def advance(self, seconds: float) -> None:
         self.t = self.t + dt.timedelta(seconds=seconds)

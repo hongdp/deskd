@@ -61,7 +61,7 @@ class _Clock:
 def clock(desk, monkeypatch):
     """Freeze the engine's clock at a Tuesday noon in the configured zone."""
     holder = _Clock(dt.datetime(2026, 7, 14, 16, 0, tzinfo=dt.timezone.utc))
-    monkeypatch.setattr(orchestration, "_now", lambda: holder.now)
+    monkeypatch.setattr(orchestration.store, "_now", lambda: holder.now)
     return holder
 
 
