@@ -579,6 +579,32 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
                     if escalated and ladder[nl].leaves_machine:
                         esc_ids.append(_queue_wake_escalation(conn, d, nl, now_iso))
                     changed.append({**d, "level": nl, "escalated": escalated})
+                elif sla is None and age > CONFIG.terminal_retry_seconds:
+                    # The TERMINAL rung is a badge, not a parking brake. Left
+                    # alone, a demand that reached it never moves again — and
+                    # on 2026-07-23 that turned a transient DNS outage into a
+                    # permanent one: every spawn died at the API, Discord was
+                    # down too, two inbox demands terminal'd, and when the
+                    # network came back nothing retried (the inbox demand key
+                    # aggregates per role, so all later notifications rode the
+                    # parked attempt). Recycle: after terminal_retry_seconds,
+                    # supersede and climb again from the machine rungs. The
+                    # escalation ledger keeps the badge red; the machine keeps
+                    # trying. No new escalation is queued by the recycle itself
+                    # — one fires only if the ladder genuinely climbs back up.
+                    nl = min(_start_level(pres.get(d["role"]), ladder), ceiling)
+                    if record:
+                        conn.execute(
+                            "UPDATE wake_attempts SET outcome='superseded', resolved_at=? "
+                            "WHERE id=?",
+                            (now_iso, cur["id"]))
+                        _insert_attempt(conn, d, nl, now_iso, ladder)
+                        _log_event(conn, "orchestrator", "wake_recycle",
+                                   d["source_ref"],
+                                   {"role": d["role"], "reason": d["reason_kind"],
+                                    "from": lvl, "to": nl,
+                                    "channel": ladder[nl].channel})
+                    changed.append({**d, "level": nl, "escalated": False})
         # 3) build the per-role actionable plan (L0 hook needs no driver action)
         changed_roles = {c["role"] for c in changed}
         actions = []
@@ -621,10 +647,46 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
     # run rolled its queue rows back and must not reach any network.
     escalations = ([_dispatch_wake_escalation(e, db_path) for e in esc_ids]
                    if record else [])
+    retried = _retry_wake_escalations(db_path) if record else []
     return {"generated_at": now_iso, "actions": actions,
             "resolved": resolved, "changed": changed,
             "hooks_fired": hooks_fired, "routed": routed,
-            "escalations": escalations}
+            "escalations": escalations, "escalations_retried": retried}
+
+
+def _retry_wake_escalations(db_path: Path | str | None) -> list[dict]:
+    """Re-mirror human-rung escalations that never reached a person, once per
+    planning tick while they are fresh (24h).
+
+    Two states qualify, and both were exposed on 2026-07-23 when the network
+    outage that broke the machine rungs ALSO broke the Discord channel:
+
+    - ``failed``: every channel raised at send time. Failure was a terminal
+      state, so the page that mattered most — the one explaining why nothing
+      else works — was dropped exactly when the transport was down. Retried
+      every tick until something takes it.
+    - ``queued``: only the durable outbox took it (no channel was available).
+      Retried only once a registered channel reports available again — a host
+      that wires no channels keeps outbox-as-delivery semantics untouched.
+
+    The 24h bound keeps a permanently broken channel from paging about
+    ancient history: past it, the board's undelivered_escalations gauge is
+    the record.
+    """
+    cutoff = _iso(store._now() - dt.timedelta(hours=24))
+    reachable = channels.human_reachable()
+    with connect(db_path) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, status FROM wake_escalations "
+            "WHERE created_at > ? AND (status='failed' "
+            "      OR (status='queued' AND ?))",
+            (cutoff, 1 if reachable else 0)).fetchall()]
+    out = []
+    for r in rows:
+        res = _dispatch_wake_escalation(r["id"], db_path)
+        if res.get("status") != r["status"]:
+            out.append(res)
+    return out
 
 
 def wake_attempts_recent(limit: int = 20,

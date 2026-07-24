@@ -617,11 +617,18 @@ def test_reassigning_an_urgent_task_retires_the_old_assignees_attempt(desk):
 
 # --- 10. the terminal rung ---------------------------------------------------
 
-def test_terminal_rung_never_times_out(desk):
-    """The last rung has nowhere to climb, so it must not move: no escalation
-    past the end of the ladder, and — the actual bug — no auto-resolve either.
-    A timed-out badge would silently clear the one signal that says a human
-    never came."""
+def test_terminal_rung_recycles_and_the_record_survives(desk):
+    """The last rung has nowhere to CLIMB — but it must not become a parking
+    brake either. The 2026-07-23 outage proved the old "never moves" contract
+    wrong: with every spawn dead and the channel down, two demands terminal'd,
+    and when the network recovered nothing ever retried. The contract now:
+    after CONFIG.terminal_retry_seconds the ladder recycles the demand back to
+    the machine rungs and climbs again. What this test originally guarded
+    still holds, relocated: the "a human never came" signal must not be
+    silently cleared — it lives in the wake_escalations ledger (undelivered
+    rows stay, the board counts them), never in a parked attempt. And within
+    the retry window the badge genuinely does not move (no rung 5, no
+    auto-resolve, no churn)."""
     orch.task_add("urgent", assignee_role="alpha", priority="urgent")
     orch.plan_wakes()
     while _open_attempts()[0]["level"] < len(CONFIG.wake_ladder) - 1:
@@ -630,11 +637,12 @@ def test_terminal_rung_never_times_out(desk):
     terminal = _open_attempts()[0]
     assert CONFIG.wake_ladder[terminal["level"]].sla_seconds is None
     history = len(_attempts())
+    ledger = len(_rows("SELECT * FROM wake_escalations"))
+    assert ledger > 0, "climbing past the machine must have left a record"
 
-    _backdate(100 * YEAR)                          # a century past any SLA
+    # Within the retry window: exactly the old contract. Nothing moves.
+    _backdate(CONFIG.terminal_retry_seconds - 60)
     orch.plan_wakes()
-    orch.plan_wakes()
-
     still = _open_attempts()
     assert len(still) == 1
     assert still[0]["id"] == terminal["id"]        # not superseded, not replaced
@@ -642,6 +650,18 @@ def test_terminal_rung_never_times_out(desk):
     assert still[0]["outcome"] == "pending"        # stays red
     assert still[0]["resolved_at"] is None
     assert len(_attempts()) == history             # nothing appended
+
+    # Past it: the machine tries again — append-only, and the ledger record
+    # of the failed human hand-off is untouched.
+    _backdate(CONFIG.terminal_retry_seconds + 60)
+    orch.plan_wakes()
+    recycled = _open_attempts()
+    assert len(recycled) == 1
+    assert recycled[0]["id"] != terminal["id"]
+    assert recycled[0]["level"] < terminal["level"], "recycle climbs from below"
+    superseded = [a for a in _attempts() if a["id"] == terminal["id"]][0]
+    assert superseded["outcome"] == "superseded"   # history rewritten never
+    assert len(_rows("SELECT * FROM wake_escalations")) == ledger
 
 
 def test_terminal_rung_still_resolves_when_the_demand_dies(desk):
