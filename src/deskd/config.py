@@ -167,6 +167,16 @@ class EngineConfig:
     #: Escalation ladder.
     wake_ladder: tuple[WakeRung, ...] = DEFAULT_WAKE_LADDER
 
+    #: How long a demand may sit on a TERMINAL rung (sla_seconds=None) before
+    #: the ladder recycles it back to the machine rungs and climbs again.
+    #: The terminal rung is a badge, not a parking brake: on 2026-07-23 a DNS
+    #: outage killed every spawn AND the Discord channel, two demands
+    #: terminal'd at supervisor_badge, and when the network returned nothing
+    #: retried — the inbox demand key aggregates per role, so every later
+    #: notification rode the parked attempt into permanent silence. The badge
+    #: stays red in the escalation ledger; the MACHINE must keep trying.
+    terminal_retry_seconds: int = 1800
+
     #: Non-urgent inbox items coalesce for this long before they wake anyone.
     inbox_batch_seconds: int = 180
 
