@@ -312,3 +312,82 @@ def test_a_dissent_withdraws_only_the_dissenters_own_agreement(desk, tmp_path):
             (thread_id,)).fetchone())
     assert row["phase"] == "ready_to_finalize"
     assert row["stop_reason"] == "mutual agreement"
+
+
+# --- what a body keeps on the way to a reader --------------------------------
+
+def _stored_body(message_id: int) -> str:
+    # Read in its own short-lived connection AFTER the write: send_message holds
+    # a BEGIN IMMEDIATE, so a write connection kept open across it would deadlock.
+    with mailbox.connect() as conn:
+        return conn.execute("SELECT body FROM mailbox_messages WHERE id=?",
+                            (message_id,)).fetchone()[0]
+
+
+def test_a_body_keeps_its_line_structure(desk):
+    """A message is read by a human, so its formatting is part of its content.
+
+    The transport used to store `" ".join(body.split())` — the flattened form it
+    needs for duplicate detection. That silently defeated the desk's own writing
+    rules: a report built from paragraphs and a markdown table arrived as one
+    run-on line, and the longer and better-structured the report, the worse it
+    read.
+    """
+    report = (
+        "First line answers the question.\n"
+        "\n"
+        "| name | close | verdict |\n"
+        "|---|---|---|\n"
+        "| ACME | 12.50 | pass |\n"
+        "\n"
+        "What I need from you: nothing."
+    )
+    thread = mailbox.open_thread("a report a human reads")
+    sent = mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
+                                kind="note", body=report)
+
+    stored = _stored_body(sent["id"])
+    assert stored == report
+    assert stored.count("\n") == report.count("\n")
+    assert "|---|---|---|" in stored.splitlines()
+
+
+def test_surrounding_blank_space_is_still_trimmed(desk):
+    thread = mailbox.open_thread("trim the edges, keep the middle")
+    sent = mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
+                                kind="note", body="  \n line one\nline two \n\n ")
+
+    assert _stored_body(sent["id"]) == "line one\nline two"
+
+
+def test_an_empty_body_is_still_refused(desk):
+    thread = mailbox.open_thread("nothing to say")
+    with pytest.raises(ValueError, match="body is required"):
+        mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
+                             kind="note", body="   \n\t \n ")
+
+
+def test_rewrapping_a_message_does_not_defeat_dedup(desk):
+    """Dedup keys off the flattened form, so re-wrapping is still a repeat.
+
+    This is the half that pays for the half above: an agent that cannot tell
+    whether it already spoke must not be able to say the same thing twice by
+    re-flowing it.
+    """
+    thread = mailbox.open_thread("say it once")
+    mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
+                         kind="note", body="the thesis holds and the stop is 12.50")
+
+    with pytest.raises(ValueError, match="duplicate message suppressed"):
+        mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
+                             kind="note",
+                             body="the thesis holds\nand the stop is 12.50")
+
+
+def test_genuinely_different_wording_still_gets_through(desk):
+    thread = mailbox.open_thread("say something new")
+    mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
+                         kind="note", body="the thesis holds")
+    second = mailbox.send_message(thread["id"], sender="alpha", recipient="beta",
+                                  kind="note", body="the thesis no longer holds")
+    assert second["id"]
