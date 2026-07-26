@@ -37,6 +37,9 @@ points a host actually needs:
   through it, and the engine never reaches into the host to collect them.
 * `deskd.meetings` — bounded multi-agent meetings and the supervisor adapter.
 * `deskd.mailbox` — the durable thread/message transport and review workflow.
+* `deskd.channels` — the pluggable human-notification egress a host registers
+  at startup (`channels.register_channel`). The engine ships none; without one
+  the escalation path terminates in the durable outbox.
 * `deskd.auth` — the supervisor trust boundary (Ed25519 verification, the nonce
   ledger). Read this one before changing anything security-relevant.
 * `deskd.web` — the optional console (`pip install deskd[web]`).
@@ -73,6 +76,7 @@ __all__ = [
     "__version__",
     # engine modules (imported lazily; see __getattr__)
     "auth",
+    "channels",
     "mailbox",
     "meetings",
     "orchestration",
@@ -88,8 +92,15 @@ def __getattr__(name: str):
     `configure()` and `RoleSpec` should not pay for that. It also keeps
     `import deskd` working in an environment where an optional dependency of a
     submodule is missing.
+
+    `channels` is listed for a different reason: it is where a host registers
+    its pager at startup, and it must be reachable the same way as everything
+    else a host touches. `from deskd import channels` already worked (the
+    import system resolves a submodule by name), but `import deskd` followed
+    by `deskd.channels.register_channel(...)` did not — which is precisely the
+    spelling the meetings deprecation warning points people at.
     """
-    if name in ("auth", "mailbox", "meetings", "orchestration"):
+    if name in ("auth", "channels", "mailbox", "meetings", "orchestration"):
         import importlib
 
         module = importlib.import_module(f".{name}", __name__)

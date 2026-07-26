@@ -4,7 +4,9 @@ Three claims under test:
 
 1. **The ledger is not the transport.** `deskd.channels` owns pluggable
    egress only; the durable rows stay with their owners. Registration via
-   `deskd.meetings` must keep working — hosts wired channels through it.
+   `deskd.meetings` must keep working — hosts wired channels through it —
+   but it is deprecated, and the warning has to actually fire or nobody
+   migrates.
 2. **The terminal rung is not a UI.** Arrival at a `leaves_machine` rung
    writes a durable `wake_escalations` row for EVERY reason kind and mirrors
    it out through the registered channels — previously only meeting wakes
@@ -47,15 +49,92 @@ def _age_attempt(role: str, reason: str, ref: str, level: int) -> None:
 
 # --- the module split, and back-compat ---------------------------------------
 
-def test_meetings_reexports_the_channel_surface(desk):
+CHANNEL_SURFACE = ("OUTBOX_CHANNEL", "CallableChannel", "EscalationChannel",
+                   "register_channel", "registered_channels",
+                   "unregister_channel")
+
+
+@pytest.mark.parametrize("name", CHANNEL_SURFACE)
+def test_meetings_still_resolves_the_channel_surface(desk, name):
     """Hosts register channels via deskd.meetings today; the move to
     deskd.channels must not strand them. Same objects, not copies — two
     registries would mean a channel registered through one spelling is
     invisible to the other."""
     from deskd import meetings
-    assert meetings.CallableChannel is channels.CallableChannel
-    assert meetings.register_channel is channels.register_channel
-    assert meetings.OUTBOX_CHANNEL == channels.OUTBOX_CHANNEL
+    with pytest.warns(DeprecationWarning):
+        assert getattr(meetings, name) is getattr(channels, name)
+
+
+@pytest.mark.parametrize("name", CHANNEL_SURFACE)
+def test_meetings_channel_surface_warns_and_names_its_replacement(desk, name):
+    """A deprecation nobody can see is just a comment. The warning has to fire
+    on the `from`-import spelling hosts actually wrote, and it has to say
+    where the name went — an unactionable warning gets filtered, not fixed."""
+    from deskd import meetings
+    with pytest.warns(DeprecationWarning) as caught:
+        getattr(meetings, name)
+    message = str(caught[0].message)
+    assert f"deskd.channels.{name}" in message
+    assert "from deskd import channels" in message
+
+
+def test_from_import_spelling_still_works_and_warns(desk):
+    """The PEP 562 hook, exercised the way a host wrote it. `from X import Y`
+    on a package goes through importlib's fromlist handling before the
+    IMPORT_FROM opcode, and both read the attribute — so assert the warning
+    fired, not how many times."""
+    with pytest.warns(DeprecationWarning):
+        from deskd.meetings import CallableChannel, register_channel
+    assert CallableChannel is channels.CallableChannel
+    assert register_channel is channels.register_channel
+
+
+def test_the_new_spelling_is_silent(desk):
+    """The migration target must be clean, or the warning is telling people to
+    move from one noisy import to another."""
+    import warnings
+
+    from deskd import channels as fresh
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert fresh.register_channel is channels.register_channel
+        assert fresh.CallableChannel is channels.CallableChannel
+        assert fresh.OUTBOX_CHANNEL == channels.OUTBOX_CHANNEL
+
+
+def test_deskd_exposes_channels_as_an_attribute(desk):
+    """`deskd.channels.register_channel` is what the deprecation warning tells
+    hosts to write, so plain `import deskd` has to make it reachable — the
+    lazy submodule hook in deskd/__init__.py, not an accident of some other
+    module having imported it first."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import deskd
+
+    # A fresh interpreter, because `deskd.channels` resolves for free once
+    # anything in this process has imported the submodule — which the suite
+    # has. Only a cold start proves the hook is doing the work.
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(deskd.__file__).resolve().parents[1]),
+         env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import deskd; print(deskd.channels.registered_channels())"],
+        capture_output=True, text=True, env=env)
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "()"
+
+
+def test_meetings_does_not_swallow_unknown_attributes(desk):
+    """The hook must stay a narrow shim: anything else is still an
+    AttributeError, so a typo does not silently resolve to nothing."""
+    from deskd import meetings
+    with pytest.raises(AttributeError):
+        meetings.no_such_name
 
 
 def test_channel_status_reports_outbox_and_availability(desk):

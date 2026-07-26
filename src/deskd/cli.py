@@ -49,7 +49,7 @@ REVIEW_STAGES = ("report", "review", "finalize")
 
 # NOTE: escalation channels are deliberately NOT a choices list. The engine
 # ships no channels beyond `auto` and `outbox`; a host registers its own at
-# startup (meetings.register_channel), so the valid set is only known at
+# startup (channels.register_channel), so the valid set is only known at
 # runtime — exactly like roles. The engine rejects an unknown channel and names
 # the ones it knows.
 
