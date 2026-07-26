@@ -44,6 +44,8 @@ points a host actually needs:
 
 from __future__ import annotations
 
+from types import ModuleType
+
 from .config import (
     CONFIG,
     DEFAULT_WAKE_LADDER,
@@ -79,7 +81,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> ModuleType:
     """Expose the engine submodules as attributes, imported on first use.
 
     Lazy on purpose. Importing `deskd` must stay cheap and side-effect-free: the

@@ -9,8 +9,11 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, Literal, overload
 
 from .. import mailbox, meetings
 from ..config import CONFIG
@@ -289,7 +292,25 @@ def _session_day(value: dt.datetime | None = None) -> str:
     return (value or _now()).astimezone(CONFIG.tzinfo()).date().isoformat()
 
 
+@overload
+def _clean(value: str | None, label: str) -> str: ...
+@overload
+def _clean(value: str | None, label: str, *, required: Literal[True]) -> str: ...
+@overload
+def _clean(value: str | None, label: str, *,
+           required: Literal[False]) -> str | None: ...
+@overload
+def _clean(value: str | None, label: str, *, required: bool) -> str | None: ...
+
+
 def _clean(value: str | None, label: str, *, required: bool = True) -> str | None:
+    """Collapse whitespace; empty means absent.
+
+    The overloads above are not decoration: with ``required=True`` (the default,
+    and how nearly every caller invokes it) this cannot return None — it raises
+    instead. Callers assign the result straight back onto a ``str`` argument,
+    which is correct, and only the overloads let a checker see that.
+    """
     out = " ".join((value or "").split())
     if not out:
         if required:
@@ -320,7 +341,7 @@ def _normalize_due(value: str | None) -> str | None:
 
 # --- connection, seeding, migrations ----------------------------------------
 
-def _seed_registry(conn) -> None:
+def _seed_registry(conn: sqlite3.Connection) -> None:
     """Insert CONFIG.roles into agent_registry if absent.
 
     DO NOTHING on conflict is deliberate: the DB row is authoritative once it
@@ -339,7 +360,7 @@ def _seed_registry(conn) -> None:
         )
 
 
-def _has_enum_check(conn, table: str, column: str) -> bool:
+def _has_enum_check(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """True if `table`.`column` still carries a legacy `CHECK (col IN (...))`.
 
     Such constraints enumerate role/source literals and must not exist: a host
@@ -351,7 +372,8 @@ def _has_enum_check(conn, table: str, column: str) -> bool:
     return bool(re.search(rf"CHECK\s*\(\s*{column}\s+IN\s*\(", sql, re.IGNORECASE))
 
 
-def _rebuild(conn, table: str, columns_ddl: str, indexes_ddl: str = "") -> None:
+def _rebuild(conn: sqlite3.Connection, table: str, columns_ddl: str,
+             indexes_ddl: str = "") -> None:
     """Rebuild `table` with new DDL, copying every row (column order must match).
 
     SQLite cannot drop a CHECK constraint in place; the copy-and-rename dance is
@@ -399,7 +421,7 @@ _WAKE_HOOKS_DDL = """
 """
 
 
-def _migrate(conn) -> None:
+def _migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing DB up to the current schema. Idempotent."""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_sessions)")}
     if "session_day" not in cols:
@@ -455,7 +477,8 @@ def _migrate(conn) -> None:
 
 
 @contextmanager
-def connect(db_path: Path | str | None = None, *, write: bool = False):
+def connect(db_path: Path | str | None = None, *,
+            write: bool = False) -> Iterator[sqlite3.Connection]:
     """Open the shared DB with mailbox + meeting + orchestration schema."""
     with meetings.connect(db_path) as conn:
         conn.executescript(ORCH_SCHEMA)
@@ -469,13 +492,13 @@ def connect(db_path: Path | str | None = None, *, write: bool = False):
 
 # --- roles ------------------------------------------------------------------
 
-def _known_roles(conn) -> set[str]:
+def _known_roles(conn: sqlite3.Connection) -> set[str]:
     """The registry is the source of truth for which roles exist."""
     return {r["role"] for r in conn.execute(
         "SELECT role FROM agent_registry WHERE enabled=1")}
 
 
-def _role_params(conn) -> tuple[list[str], str]:
+def _role_params(conn: sqlite3.Connection) -> tuple[list[str], str]:
     """(sorted role list, SQL placeholder string) for binding roles into SQL.
 
     Role literals must NEVER be interpolated into SQL. Sorted for deterministic
@@ -485,7 +508,7 @@ def _role_params(conn) -> tuple[list[str], str]:
     return roles, ",".join("?" * len(roles))
 
 
-def _agent_role(conn, role: str) -> str:
+def _agent_role(conn: sqlite3.Connection, role: str) -> str:
     """Validate an agent-facing role argument.
 
     The supervisor is a human identity, not an agent: it has no session, no
@@ -514,7 +537,8 @@ def _task_sources() -> set[str]:
 
 # --- events -----------------------------------------------------------------
 
-def _log_event(conn, actor: str, kind: str, ref: str | None, payload) -> None:
+def _log_event(conn: sqlite3.Connection, actor: str, kind: str, ref: str | None,
+               payload: dict | None) -> None:
     conn.execute(
         "INSERT INTO orchestration_events (created_at, actor, kind, ref, payload) "
         "VALUES (?,?,?,?,?)",
@@ -536,7 +560,14 @@ def recent_events(limit: int = 20, db_path: Path | str | None = None) -> list[di
         out.append(d)
     return out
 
-def _load_json(value):
+def _load_json(value: str | None) -> Any:
+    """Decode a JSON text column, or hand the raw value back if it will not parse.
+
+    `Any` is the honest return here, not a shrug: the payloads are host-supplied
+    (task payloads, hook specs, role capabilities) and the engine deliberately
+    never interprets them. Callers that care narrow it themselves — see
+    `_roles_with_capability`, which guards with `isinstance(caps, list)`.
+    """
     try:
         return json.loads(value)
     except (ValueError, TypeError):

@@ -118,54 +118,55 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     # --- pages --------------------------------------------------------------
 
     @app.get("/", include_in_schema=False)
-    def home():
+    def home() -> FileResponse:
         return FileResponse(STATIC / "board.html")
 
     @app.get("/board", include_in_schema=False)
-    def board_page():
+    def board_page() -> FileResponse:
         return FileResponse(STATIC / "board.html")
 
     @app.get("/agent/{role}", include_in_schema=False)
-    def agent_page(role: str):
+    def agent_page(role: str) -> FileResponse:
         # The page reads the role off its own URL and calls /api/agent/{role};
         # an unknown role surfaces as that call's 404, not a missing page.
         return FileResponse(STATIC / "agent.html")
 
     @app.get("/meetings", include_in_schema=False)
-    def meetings_page():
+    def meetings_page() -> FileResponse:
         return FileResponse(STATIC / "meetings.html")
 
     @app.get("/wake", include_in_schema=False)
-    def wake_page():
+    def wake_page() -> FileResponse:
         return FileResponse(STATIC / "wake.html")
 
     @app.get("/escalations", include_in_schema=False)
-    def escalations_page():
+    def escalations_page() -> FileResponse:
         return FileResponse(STATIC / "escalations.html")
 
     @app.get("/tasks", include_in_schema=False)
-    def tasks_page():
+    def tasks_page() -> FileResponse:
         return FileResponse(STATIC / "tasks.html")
 
     # --- read-only projections ----------------------------------------------
 
     @app.get("/api/board")
-    def api_board():
+    def api_board() -> dict:
         return orchestration.board()
 
     @app.get("/api/agent/{role}")
-    def api_agent(role: str):
+    def api_agent(role: str) -> dict:
         try:
             return orchestration.agent_detail(role)
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/delivery")
-    def api_delivery(meeting: str | None = None):
+    def api_delivery(meeting: str | None = None) -> dict:
         return orchestration.delivery_ledger(meeting)
 
     @app.get("/api/meetings")
-    def api_meetings(include_closed: bool = False, day: str | None = None):
+    def api_meetings(include_closed: bool = False,
+                     day: str | None = None) -> list[dict]:
         # `day` narrows CLOSED meetings only — the engine refuses to let a
         # history filter hide a live meeting (see list_meetings).
         try:
@@ -174,13 +175,13 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/meeting-days")
-    def api_meeting_days():
+    def api_meeting_days() -> list[str]:
         """Local dates with at least one closed meeting — real choices for the
         console's day picker instead of a blank date box."""
         return meetings.meeting_days()
 
     @app.get("/api/agent/{role}/wake-sources")
-    def api_agent_wake_sources(role: str):
+    def api_agent_wake_sources(role: str) -> dict:
         """'What can currently wake this agent' — the engine's own answer."""
         try:
             return orchestration.wake_sources(role)
@@ -188,7 +189,7 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/wake")
-    def api_wake(limit: int = 200):
+    def api_wake(limit: int = 200) -> dict:
         """The escalation ladder in force (with per-rung wiring status) and the
         attempt ledger. Pending demands are the attempts with outcome='pending';
         grouping them per demand is presentation, so it stays in the client."""
@@ -198,7 +199,7 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
         }
 
     @app.get("/api/escalations")
-    def api_escalations(limit: int = 200):
+    def api_escalations(limit: int = 200) -> dict:
         """Every path by which this desk pulls a human in, and whether each one
         currently works: the wake_escalations human-rung ledger, meeting
         escalations, demands no enabled role may take, and channel health."""
@@ -214,7 +215,7 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
 
     @app.get("/api/tasks")
     def api_tasks(role: str | None = None, status: str | None = None,
-                  include_closed: bool = False):
+                  include_closed: bool = False) -> dict:
         """Cross-role task browser + the engine's actionable/stalled verdict.
         stalled_ids lets the client mark rows without re-deriving the split."""
         queue = orchestration.task_queue(role)
@@ -225,16 +226,17 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
         }
 
     @app.get("/api/hooks")
-    def api_hooks(role: str | None = None, include_closed: bool = True):
+    def api_hooks(role: str | None = None,
+                  include_closed: bool = True) -> list[dict]:
         return orchestration.hooks(owner_role=role, include_closed=include_closed)
 
     @app.get("/api/channels")
-    def api_channels():
+    def api_channels() -> dict:
         return {"channels": channels.channel_status(),
                 "human_reachable": channels.human_reachable()}
 
     @app.get("/api/meeting-meta")
-    def api_meeting_meta():
+    def api_meeting_meta() -> dict:
         """Everything the console must not hardcode: which roles exist, what the
         supervisor identity is called, which auth modes are live, and the name of
         the access-code header (it is derived from the project name)."""
@@ -267,7 +269,7 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     # Declared before /api/meetings/{meeting_id} for readability; Starlette
     # method-matches anyway, so the GET wildcard never shadows these POSTs.
     @app.post("/api/meetings/supervisor-apply")
-    def api_supervisor_apply(req: SupervisorAssertionRequest):
+    def api_supervisor_apply(req: SupervisorAssertionRequest) -> dict:
         """Signed mode: verify Ed25519 assertion + burn nonce, then apply."""
         if not auth.signed_auth_enabled():
             raise HTTPException(403, "signed supervisor authentication is disabled")
@@ -284,7 +286,7 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     def api_supervisor_action(
         req: SupervisorActionRequest,
         code: str = Header(default="", alias=config_mod.SUPERVISOR_CODE_HEADER),
-    ):
+    ) -> dict:
         """Simple mode: shared access code in a header."""
         if not auth.simple_auth_enabled():
             raise HTTPException(403, "simplified supervisor authentication is disabled")
@@ -298,7 +300,7 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/meetings/{meeting_id}")
-    def api_meeting(meeting_id: str):
+    def api_meeting(meeting_id: str) -> dict:
         try:
             return meetings.meeting_transcript(meeting_id)
         except ValueError as exc:

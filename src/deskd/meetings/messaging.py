@@ -6,6 +6,7 @@ budget/consensus flip, supervisor visibility).
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 from pathlib import Path
 from typing import Sequence
 
@@ -103,7 +104,7 @@ def wait_for_updates(thread_id: str, *, role: str, wait_seconds: int = 0,
 
 # --- speaking ---------------------------------------------------------------
 
-def _revive_idle_thread(conn, thread_id: str) -> bool:
+def _revive_idle_thread(conn: sqlite3.Connection, thread_id: str) -> bool:
     """A supervisor message IS the supervisor resuming. Idle-paused only.
 
     The idle deadline retires a thread lazily, on read, and touches only
@@ -144,7 +145,8 @@ def _revive_idle_thread(conn, thread_id: str) -> bool:
     return True
 
 
-def _send_update(conn, thread_id: str, role: str, body: str, kind: str,
+def _send_update(conn: sqlite3.Connection, thread_id: str, role: str, body: str,
+                 kind: str,
                  auth_nonce: str | None = None,
                  reply_to: int | None = None,
                  resolves: Sequence[int] | None = None) -> tuple[int, int | None]:

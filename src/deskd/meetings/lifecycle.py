@@ -5,6 +5,7 @@ attendance protocol.
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 from pathlib import Path
 
 from .. import mailbox
@@ -230,7 +231,8 @@ def discover(role: str, *, include_closed: bool = False,
 
 # --- check-in / join / leave ------------------------------------------------
 
-def _check_in(conn, thread_id: str, role: str, auth_nonce: str | None = None) -> None:
+def _check_in(conn: sqlite3.Connection, thread_id: str, role: str,
+              auth_nonce: str | None = None) -> None:
     supervisor = CONFIG.supervisor_role
     meeting = _meeting(conn, thread_id)
     if meeting["state"] in {"closed", "paused", "escalated"}:
@@ -287,7 +289,7 @@ def check_in(thread_id: str, *, role: str,
     return views.meeting_status(thread_id, db_path=db_path)
 
 
-def _leave(conn, thread_id: str, role: str, reason: str,
+def _leave(conn: sqlite3.Connection, thread_id: str, role: str, reason: str,
            auth_nonce: str | None = None) -> None:
     supervisor = CONFIG.supervisor_role
     meeting = _meeting(conn, thread_id)

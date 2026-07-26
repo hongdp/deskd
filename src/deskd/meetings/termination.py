@@ -5,6 +5,7 @@ meeting.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from ..channels import OUTBOX_CHANNEL, registered_channels
@@ -18,7 +19,8 @@ from .store import (_active_roles, _agent_role, _attendee, _clean, _event,
 
 # --- termination handshake --------------------------------------------------
 
-def _pending_termination(conn, thread_id: str):
+def _pending_termination(conn: sqlite3.Connection,
+                         thread_id: str) -> sqlite3.Row | None:
     return conn.execute(
         """SELECT * FROM meeting_terminations
            WHERE thread_id=? AND status='pending' ORDER BY id DESC LIMIT 1""",
@@ -26,14 +28,14 @@ def _pending_termination(conn, thread_id: str):
     ).fetchone()
 
 
-def _is_supervisor_one_to_one(conn, thread_id: str) -> bool:
+def _is_supervisor_one_to_one(conn: sqlite3.Connection, thread_id: str) -> bool:
     """Exactly one agent, alone with the supervisor: a DM, not a work meeting."""
     actives = _active_roles(conn, thread_id)
     return (CONFIG.supervisor_role in actives
             and len([r for r in actives if r != CONFIG.supervisor_role]) == 1)
 
 
-def _propose_end(conn, thread_id: str, role: str, resolution: str,
+def _propose_end(conn: sqlite3.Connection, thread_id: str, role: str, resolution: str,
                  auth_nonce: str | None = None) -> int:
     supervisor = CONFIG.supervisor_role
     meeting = _meeting(conn, thread_id)
@@ -123,7 +125,8 @@ def propose_end(thread_id: str, *, role: str, resolution: str,
             "meeting": views.meeting_status(thread_id, db_path=db_path)}
 
 
-def _close_meeting(conn, thread_id: str, resolution: str, actor: str,
+def _close_meeting(conn: sqlite3.Connection, thread_id: str, resolution: str,
+                   actor: str,
                    auth_nonce: str | None = None) -> None:
     now = store._iso()
     # The only place a meeting closes, so the only place closed_at is written.
@@ -152,7 +155,8 @@ def _close_meeting(conn, thread_id: str, resolution: str, actor: str,
     _event(conn, thread_id, "closed", actor, resolution, auth_nonce)
 
 
-def _missing_confirmations(conn, thread_id: str, proposal_id: int) -> list[str]:
+def _missing_confirmations(conn: sqlite3.Connection, thread_id: str,
+                           proposal_id: int) -> list[str]:
     """Active required attendees whose confirm the pending proposal still
     lacks — the denominator _finalize_if_unanimous is waiting on, by name."""
     return [r["role"] for r in conn.execute(
@@ -166,7 +170,8 @@ def _missing_confirmations(conn, thread_id: str, proposal_id: int) -> list[str]:
     )]
 
 
-def _finalize_if_unanimous(conn, thread_id: str, proposal, actor: str,
+def _finalize_if_unanimous(conn: sqlite3.Connection, thread_id: str,
+                           proposal: sqlite3.Row, actor: str,
                            auth_nonce: str | None = None) -> bool:
     """Close the meeting if every ACTIVE required attendee has confirmed the
     pending termination. Attendees who have left (stopped_at set) are excluded
@@ -197,7 +202,8 @@ def _finalize_if_unanimous(conn, thread_id: str, proposal, actor: str,
     return False
 
 
-def _vote_end(conn, thread_id: str, role: str, vote: str, reason: str | None,
+def _vote_end(conn: sqlite3.Connection, thread_id: str, role: str, vote: str,
+              reason: str | None,
               auth_nonce: str | None = None) -> bool:
     supervisor = CONFIG.supervisor_role
     _attendee(conn, thread_id, role, checked_in=True)
@@ -269,7 +275,8 @@ def confirm_end(thread_id: str, *, role: str,
             "meeting": views.meeting_status(thread_id, db_path=db_path)}
 
 
-def _waiting_on_after_confirm(conn, thread_id: str, closed: bool) -> list[str]:
+def _waiting_on_after_confirm(conn: sqlite3.Connection, thread_id: str,
+                              closed: bool) -> list[str]:
     """Who a recorded-but-not-closing confirm is still waiting for. A confirm
     that returns closed=False with no explanation reads as a silent failure —
     the supervisor's console vote on the M-001 handoff meeting was accepted,
