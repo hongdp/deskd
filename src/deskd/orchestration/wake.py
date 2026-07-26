@@ -143,10 +143,14 @@ def collect_wake_demand(conn) -> list[dict]:
     now = store._now()
     now_iso = _iso(now)
     demands = []
+    # `m.state!='closed'`: _close_meeting settles pending wake requests, but
+    # rows that predate that rule (or arrive through a future path it misses)
+    # must not wake anyone — a closed meeting cannot even be checked in to, so
+    # the demand would regenerate every tick with no legal way to satisfy it.
     for r in conn.execute(
             """SELECT w.role, w.thread_id, m.agenda, w.created_at
                FROM meeting_wake_requests w JOIN meetings m ON m.thread_id=w.thread_id
-               WHERE w.status='pending'"""):
+               WHERE w.status='pending' AND m.state!='closed'"""):
         demands.append({"role": r["role"], "reason_kind": "meeting_wake",
                         "source_ref": r["thread_id"], "label": r["agenda"],
                         "since_at": r["created_at"]})

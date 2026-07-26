@@ -791,6 +791,43 @@ def _sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
                      AND meeting_wake_requests.acknowledged_at<?""",
                 (row["thread_id"], row["role"], now_iso, row["oldest_unread"]),
             )
+        # 4. Parked termination votes. Branch 3 deliberately skips
+        #    `termination_pending`, and the propose-time wake fires exactly
+        #    once — so a voter that acknowledged its wake (or was woken for
+        #    something else entirely) and finished its turn without voting
+        #    would park the meeting for good. Re-arm after the meeting's own
+        #    wait timeout, with the same acknowledged-only guard as branch 3:
+        #    a request still pending is already being climbed by the ladder.
+        vote_in, vote_params = _in_clause("a.role", sorted(agent_roles))
+        parked = conn.execute(
+            f"""SELECT a.thread_id, a.role, t.created_at AS proposed_at,
+                       m.wait_timeout_seconds
+                FROM meetings m
+                JOIN meeting_terminations t ON t.thread_id=m.thread_id
+                     AND t.status='pending'
+                JOIN meeting_attendees a ON a.thread_id=m.thread_id
+                     AND a.required=1 AND a.checked_in_at IS NOT NULL
+                     AND a.stopped_at IS NULL
+                WHERE m.state='termination_pending'
+                  AND {vote_in}
+                  AND a.role NOT IN (SELECT role FROM meeting_termination_votes
+                                     WHERE proposal_id=t.id)""",
+            vote_params,
+        ).fetchall()
+        for row in parked:
+            timeout = dt.timedelta(seconds=row["wait_timeout_seconds"])
+            if _parse_time(row["proposed_at"]) + timeout > now:
+                continue
+            conn.execute(
+                """INSERT INTO meeting_wake_requests(thread_id,role,status,created_at)
+                   VALUES (?,?,'pending',?)
+                   ON CONFLICT(thread_id,role) DO UPDATE
+                   SET status='pending',created_at=excluded.created_at,
+                       acknowledged_at=NULL
+                   WHERE meeting_wake_requests.status='acknowledged'
+                     AND meeting_wake_requests.acknowledged_at<?""",
+                (row["thread_id"], row["role"], now_iso, _iso(now - timeout)),
+            )
     for escalation_id in escalation_ids:
         dispatch_escalation(escalation_id, db_path=db_path)
     return escalation_ids
@@ -1598,6 +1635,31 @@ def _propose_end(conn, thread_id: str, role: str, resolution: str,
         "UPDATE meetings SET state='termination_pending',updated_at=? WHERE thread_id=?",
         (now, thread_id),
     )
+    # A pending proposal is work owed by every other required attendee: their
+    # vote. Wake them for it the way an invitation wakes its invitees — an end
+    # is usually proposed precisely BECAUSE the counterpart finished its turn
+    # and went idle, so without a wake the missing vote never arrives and the
+    # meeting parks in termination_pending until someone happens to look
+    # (M-001 handoff meeting, 2026-07-25: counter-proposal at 21:06, the other
+    # agent already parked, still open three hours later).
+    agent_roles = _known_roles(conn)
+    voters = [r["role"] for r in conn.execute(
+        """SELECT role FROM meeting_attendees
+           WHERE thread_id=? AND required=1 AND checked_in_at IS NOT NULL
+             AND stopped_at IS NULL AND role!=?""",
+        (thread_id, role),
+    ) if r["role"] in agent_roles]
+    for voter in voters:
+        # Unconditional re-arm (unlike the stale sweep's guarded one): a fresh
+        # proposal is unambiguous new work even for a recently-acked attendee.
+        conn.execute(
+            """INSERT INTO meeting_wake_requests(thread_id,role,status,created_at)
+               VALUES (?,?,'pending',?)
+               ON CONFLICT(thread_id,role) DO UPDATE
+               SET status='pending',created_at=excluded.created_at,
+                   acknowledged_at=NULL""",
+            (thread_id, voter, now),
+        )
     _event(conn, thread_id, "termination_proposed", role,
            f"proposal #{proposal_id}: {resolution}", auth_nonce)
     return proposal_id
@@ -1629,7 +1691,30 @@ def _close_meeting(conn, thread_id: str, resolution: str, actor: str,
            updated_at=? WHERE id=?""",
         (resolution, actor, now, thread_id),
     )
+    # A closed meeting demands nothing. Settle every outstanding wake request,
+    # or a force_close that races a pending invitation/vote wake leaves rows
+    # the demand collector regenerates into wake attempts every tick, forever —
+    # for a meeting no one can even check in to.
+    conn.execute(
+        """UPDATE meeting_wake_requests SET status='acknowledged',acknowledged_at=?
+           WHERE thread_id=? AND status='pending'""",
+        (now, thread_id),
+    )
     _event(conn, thread_id, "closed", actor, resolution, auth_nonce)
+
+
+def _missing_confirmations(conn, thread_id: str, proposal_id: int) -> list[str]:
+    """Active required attendees whose confirm the pending proposal still
+    lacks — the denominator _finalize_if_unanimous is waiting on, by name."""
+    return [r["role"] for r in conn.execute(
+        """SELECT role FROM meeting_attendees
+           WHERE thread_id=? AND required=1 AND checked_in_at IS NOT NULL
+             AND stopped_at IS NULL
+             AND role NOT IN (SELECT role FROM meeting_termination_votes
+                              WHERE proposal_id=? AND vote='confirm')
+           ORDER BY role""",
+        (thread_id, proposal_id),
+    )]
 
 
 def _finalize_if_unanimous(conn, thread_id: str, proposal, actor: str,
@@ -1690,6 +1775,14 @@ def _vote_end(conn, thread_id: str, role: str, vote: str, reason: str | None,
         (proposal["id"], role, vote, reason,
          auth_nonce if role == supervisor else None, now),
     )
+    # The vote is exactly what the proposal-time wake demanded; settle it, or
+    # the wake ladder keeps climbing for an agent that already did the work
+    # (check-in acks don't fire here — the voter was checked in all along).
+    conn.execute(
+        """UPDATE meeting_wake_requests SET status='acknowledged',acknowledged_at=?
+           WHERE thread_id=? AND role=? AND status='pending'""",
+        (now, thread_id, role),
+    )
     _event(conn, thread_id, f"termination_{vote}", role,
            reason or f"proposal #{proposal['id']}", auth_nonce)
     if vote == "reject":
@@ -1721,7 +1814,21 @@ def confirm_end(thread_id: str, *, role: str,
     with connect(db_path, write=True) as conn:
         role = _agent_role(conn, role)
         closed = _vote_end(conn, thread_id, role, "confirm", None)
-    return {"closed": closed, "meeting": meeting_status(thread_id, db_path=db_path)}
+        waiting = _waiting_on_after_confirm(conn, thread_id, closed)
+    return {"closed": closed, "waiting_on": waiting,
+            "meeting": meeting_status(thread_id, db_path=db_path)}
+
+
+def _waiting_on_after_confirm(conn, thread_id: str, closed: bool) -> list[str]:
+    """Who a recorded-but-not-closing confirm is still waiting for. A confirm
+    that returns closed=False with no explanation reads as a silent failure —
+    the supervisor's console vote on the M-001 handoff meeting was accepted,
+    changed nothing (their confirm is outside the required-attendee
+    denominator), and showed nothing. Name the missing voters instead."""
+    if closed:
+        return []
+    pending = _pending_termination(conn, thread_id)
+    return _missing_confirmations(conn, thread_id, pending["id"]) if pending else []
 
 
 def reject_end(thread_id: str, *, role: str, reason: str,
@@ -2038,9 +2145,13 @@ def _apply_supervisor_payload(verified: auth.VerifiedAssertion, *,
             )}
         elif action in {"confirm_end", "reject_end"}:
             vote = "confirm" if action == "confirm_end" else "reject"
-            result = {"closed": _vote_end(
+            closed = _vote_end(
                 conn, thread_id, supervisor, vote, payload.get("reason"), nonce,
-            )}
+            )
+            result = {"closed": closed}
+            if vote == "confirm":
+                result["waiting_on"] = _waiting_on_after_confirm(
+                    conn, thread_id, closed)
         elif action == "resume":
             meeting = _meeting(conn, thread_id)
             now = _iso()
