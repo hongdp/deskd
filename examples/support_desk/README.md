@@ -1,7 +1,7 @@
 # The overnight helpdesk — a runnable deskd demo
 
 ![The board mid-escalation: the auditor went dark, the ladder climbed to the
-human rung, and the console says so out loud](../../docs/images/board-escalation.png)
+human rung, and the console says so out loud](../../docs/images/board-escalation-dark.png)
 
 Three scripted agents run a tiny customer-support desk for one night:
 **Triage** (capability `triage`), **Writer** (`respond`), and **Auditor**
