@@ -4,6 +4,8 @@ capability-addressed router and its unroutable-demand ledger.
 
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Sequence
 from pathlib import Path
 
 from ..config import CONFIG
@@ -12,7 +14,8 @@ from .store import (TASK_PRIORITIES, _agent_role, _clean, _iso,
 
 # --- unified agent inbox ----------------------------------------------------
 
-def _inbox_insert(conn, target_role: str, source_kind: str, title: str, *,
+def _inbox_insert(conn: sqlite3.Connection, target_role: str, source_kind: str,
+                  title: str, *,
                   body: str | None = None, ref: str | None = None,
                   priority: str = "normal", dedup_key: str | None = None,
                   expires_at: str | None = None) -> int | None:
@@ -59,7 +62,7 @@ def inbox_enqueue(target_role: str, source_kind: str, title: str, *,
 
 # --- capability-addressed ingress -------------------------------------------
 
-def _roles_with_capability(conn, capability: str) -> list[str]:
+def _roles_with_capability(conn: sqlite3.Connection, capability: str) -> list[str]:
     """Enabled roles whose REGISTRY row declares `capability`. The registry is
     the source of truth, not CONFIG.roles: runtime changes (enabled=0, a
     capability granted to a live row) must be honoured, and _seed_registry
@@ -73,7 +76,7 @@ def _roles_with_capability(conn, capability: str) -> list[str]:
     return sorted(out)
 
 
-def _route_role(conn, capability: str) -> str | None:
+def _route_role(conn: sqlite3.Connection, capability: str) -> str | None:
     """Pick the recipient among qualifying roles: fewest un-acked inbox items,
     then name. Deterministic and presence-INdependent on purpose: who happens
     to be online this second is the wake ladder's axis, and it takes over once
@@ -136,7 +139,7 @@ def inbox_route(require_capability: str, source_kind: str, title: str, *,
         return {"unroutable": True, "id": cur.lastrowid}
 
 
-def _route_unroutable(conn) -> list[dict]:
+def _route_unroutable(conn: sqlite3.Connection) -> list[dict]:
     """The closing half of inbox_route's guarantee, run every planning tick:
     any recorded unroutable demand whose capability an enabled role NOW
     declares moves into that role's inbox and rides the normal delivery/wake
@@ -184,7 +187,7 @@ def unroutable_list(include_routed: bool = False, limit: int = 100,
 _INBOX_RANK = {"urgent": 0, "normal": 1, "low": 2}
 
 
-def _inbox_sort_key(r: dict):
+def _inbox_sort_key(r: dict) -> tuple[int, str]:
     return (_INBOX_RANK.get(r["priority"], 1), r["enqueued_at"])
 
 
@@ -207,7 +210,8 @@ def inbox_pending(target_role: str | None = None, *, include_delivered: bool = T
     return rows
 
 
-def inbox_mark_delivered(ids, db_path: Path | str | None = None) -> int:
+def inbox_mark_delivered(ids: Sequence[int],
+                         db_path: Path | str | None = None) -> int:
     """Stamp items delivered. Called by the in-session hook when the session
     actually runs, never speculatively at plan time."""
     ids = [int(i) for i in ids]
@@ -223,7 +227,7 @@ def inbox_mark_delivered(ids, db_path: Path | str | None = None) -> int:
         return cur.rowcount
 
 
-def inbox_ack(target_role: str | None = None, ids=None,
+def inbox_ack(target_role: str | None = None, ids: Sequence[int] | None = None,
               db_path: Path | str | None = None) -> int:
     """Mark items processed. Pass ids to ack specific items, or target_role to
     ack all of a role's delivered-but-unacked items."""

@@ -5,6 +5,7 @@ detail page. Reads every sibling; owns nothing.
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 from pathlib import Path
 
 from .. import channels
@@ -20,7 +21,7 @@ from .wake import _human_level, _ladder
 
 # --- board aggregate --------------------------------------------------------
 
-def _meeting_load(conn) -> dict:
+def _meeting_load(conn: sqlite3.Connection) -> dict:
     """Per-role meeting obligations, from the registry's roles."""
     roles = tuple(sorted(_known_roles(conn)))
     wakes = {r: c for r, c in conn.execute(
@@ -41,7 +42,7 @@ def _meeting_load(conn) -> dict:
             """SELECT owed_by, COUNT(*), MIN(due_at) FROM meeting_response_obligations
                WHERE status='pending' GROUP BY owed_by""").fetchall():
         oblig[owed] = {"pending": cnt, "next_due_at": due}
-    active_meetings = {}
+    active_meetings: dict[str, list[dict]] = {}
     for role, thread_id, agenda in conn.execute(
             """SELECT a.role, a.thread_id, m.agenda FROM meeting_attendees a
                JOIN meetings m ON m.thread_id=a.thread_id
@@ -60,7 +61,7 @@ def _meeting_load(conn) -> dict:
     return out
 
 
-def _delivery_health(conn, now_iso: str) -> dict:
+def _delivery_health(conn: sqlite3.Connection, now_iso: str) -> dict:
     """Delivery health from the projected ledger. `stuck_deliveries` is the
     invariant-breach surface: past SLA, unread, and NOT yet escalated.
 

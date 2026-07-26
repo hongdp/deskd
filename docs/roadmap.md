@@ -90,9 +90,11 @@ Same guarantee, new dimension.
 
 **Status: shipped in 0.1.3, except ingress adapters.** The terminal rung and
 the ledger/channel split are done: `deskd.channels` owns pluggable egress
-(meetings re-exports for back-compat), arrival at any `leaves_machine` rung
-writes a durable `wake_escalations` row for EVERY reason kind and mirrors it
-out post-commit, and the board states which channels are wired
+(`deskd.meetings` still resolves the six channel names for hosts that have not
+migrated, but that spelling is deprecated and warns), arrival at any
+`leaves_machine` rung writes a durable `wake_escalations` row for EVERY reason
+kind and mirrors it out post-commit, and the board states which channels are
+wired
 (`health.channels`, `health.human_rung_unwired`,
 `health.undelivered_escalations`). The supervisor-boundary extraction moved to
 P4 (decision 2026-07-19, see there): what this section originally described

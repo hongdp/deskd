@@ -36,9 +36,14 @@ as `deskd`. See README.md and docs/design.md for the architecture.
   internal layering, not API. The meetings clock is `meetings.store._now`,
   called through the module attribute; patch that single point. The split is
   the file boundary only — P4's *extraction* (bounds/integrity primitives,
-  verb registration, meetings leaving the core) remains open.
+  verb registration, meetings leaving the core) remains open. One exception to
+  the facade rule, and it runs the other way: the channel registry
+  (`register_channel` & co.) still resolves through `deskd.meetings` via a
+  PEP 562 hook, but it is **deprecated and warns** — channels are engine
+  infrastructure, so register through `deskd.channels`.
 - `src/deskd/` — `mailbox.py` (threads + receipts), `channels.py`
-  (pluggable human-facing egress; ledger rows never move here), `auth.py`,
+  (pluggable human-facing egress; ledger rows never move here; a host
+  registers its pager here, not through meetings), `auth.py`,
   `cli.py` (`deskd` entry point), `config.py` (holds `__version__`), `web/`
   (console; its `static/*.html` ships in the wheel — keep it under the package)
 - `tests/` — pytest (configured via pyproject); `docs/` — design/security/roadmap

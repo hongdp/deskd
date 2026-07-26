@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sqlite3
 from pathlib import Path
 
 from . import store
@@ -134,7 +135,7 @@ def _presence_row(row: dict, now: dt.datetime) -> dict:
     }
 
 
-def _role_presence(conn, role: str, now: dt.datetime) -> dict:
+def _role_presence(conn: sqlite3.Connection, role: str, now: dt.datetime) -> dict:
     """Derived presence for ONE role, session row or not.
 
     The single place a role with no session row at all is turned into presence.
@@ -150,7 +151,7 @@ def _role_presence(conn, role: str, now: dt.datetime) -> dict:
     return _presence_row(dict(sess) if sess else base, now)
 
 
-def _is_busy(conn, role: str, now: dt.datetime) -> bool:
+def _is_busy(conn: sqlite3.Connection, role: str, now: dt.datetime) -> bool:
     """True if a turn is running that a wake would INTERRUPT.
 
     Deliberately the same predicate the board uses to decide whether a session's
@@ -163,7 +164,7 @@ def _is_busy(conn, role: str, now: dt.datetime) -> bool:
     return _role_presence(conn, role, now)["liveness"] in LIVE_LIVENESS
 
 
-def _presence_list(conn, now: dt.datetime) -> list[dict]:
+def _presence_list(conn: sqlite3.Connection, now: dt.datetime) -> list[dict]:
     """Presence for all enabled roles using an EXISTING connection (so callers
     already inside a write transaction don't open a second, dead-locking one)."""
     reg = conn.execute(
@@ -186,7 +187,8 @@ def presence(db_path: Path | str | None = None) -> list[dict]:
 
 # --- session todo mirror ----------------------------------------------------
 
-def record_todos(role: str, snapshot, *, db_path: Path | str | None = None) -> None:
+def record_todos(role: str, snapshot: object, *,
+                 db_path: Path | str | None = None) -> None:
     """Mirror a session's live todo list (display-only, not authoritative)."""
     now = _iso()
     payload = snapshot if isinstance(snapshot, str) else json.dumps(snapshot)

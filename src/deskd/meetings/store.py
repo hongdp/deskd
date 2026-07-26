@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Sequence
@@ -203,7 +204,8 @@ def _clean(value: str, label: str) -> str:
 
 
 @contextmanager
-def connect(db_path: Path | str | None = None, *, write: bool = False):
+def connect(db_path: Path | str | None = None, *,
+            write: bool = False) -> Iterator[sqlite3.Connection]:
     """Open the shared DB with mailbox + auth + meeting schema.
 
     The auth schema is applied first: the meeting tables foreign-key
@@ -220,7 +222,7 @@ def connect(db_path: Path | str | None = None, *, write: bool = False):
         yield conn
 
 
-def _migrate(conn) -> None:
+def _migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing DB's meeting tables up to schema. Idempotent.
 
     This layer migrates its own tables. `closed_at` was briefly added by
@@ -243,7 +245,7 @@ def _migrate(conn) -> None:
 
 # --- roles ------------------------------------------------------------------
 
-def _known_roles(conn) -> set[str]:
+def _known_roles(conn: sqlite3.Connection) -> set[str]:
     """The enabled agent roles, from the registry the host owns.
 
     The engine ships with no roster at all. When the registry table has not been
@@ -260,12 +262,12 @@ def _known_roles(conn) -> set[str]:
     return {r["role"] for r in rows}
 
 
-def _meeting_roles(conn) -> set[str]:
+def _meeting_roles(conn: sqlite3.Connection) -> set[str]:
     """Everyone who may sit in a meeting: agents plus the supervisor."""
     return _known_roles(conn) | {CONFIG.supervisor_role}
 
 
-def _agent_role(conn, role: str) -> str:
+def _agent_role(conn: sqlite3.Connection, role: str) -> str:
     """Validate a role an *agent* claims to be. Never the supervisor."""
     role = _clean(role, "role")
     if role == CONFIG.supervisor_role:
@@ -291,7 +293,8 @@ def _in_clause(column: str, values: Sequence[str]) -> tuple[str, list[str]]:
     return f"{column} IN ({','.join('?' * len(values))})", list(values)
 
 
-def _visible_message_sql(conn, alias: str = "mm") -> tuple[str, list[str]]:
+def _visible_message_sql(conn: sqlite3.Connection,
+                         alias: str = "mm") -> tuple[str, list[str]]:
     """Predicate: this mailbox row really was *said in the meeting*.
 
     A row counts only when it is either an agent message whose sender is (or
@@ -317,7 +320,7 @@ def _visible_message_sql(conn, alias: str = "mm") -> tuple[str, list[str]]:
 
 # --- attendance primitives --------------------------------------------------
 
-def _active_roles(conn, thread_id: str) -> list[str]:
+def _active_roles(conn: sqlite3.Connection, thread_id: str) -> list[str]:
     return [r["role"] for r in conn.execute(
         """SELECT role FROM meeting_attendees
            WHERE thread_id=? AND checked_in_at IS NOT NULL AND stopped_at IS NULL
@@ -326,7 +329,7 @@ def _active_roles(conn, thread_id: str) -> list[str]:
     ).fetchall()]
 
 
-def _mode(conn, thread_id: str) -> str:
+def _mode(conn: sqlite3.Connection, thread_id: str) -> str:
     """Discussion mode, derived purely from who is currently present.
 
     one_to_one imposes strict turn-taking (every message owes a reply); multi
@@ -340,7 +343,8 @@ def _mode(conn, thread_id: str) -> str:
 
 # --- row helpers --------------------------------------------------------------
 
-def _event(conn, thread_id: str, event: str, actor: str, detail: str,
+def _event(conn: sqlite3.Connection, thread_id: str, event: str, actor: str,
+           detail: str,
            auth_nonce: str | None = None) -> int:
     return int(conn.execute(
         """INSERT INTO meeting_events(thread_id,event,actor,detail,auth_nonce,created_at)
@@ -349,7 +353,8 @@ def _event(conn, thread_id: str, event: str, actor: str, detail: str,
     ).lastrowid)
 
 
-def _supervisor_claim(conn, auth_nonce: str | None, actions: set[str], *,
+def _supervisor_claim(conn: sqlite3.Connection, auth_nonce: str | None,
+                      actions: set[str], *,
                       thread_id: str | None = None) -> dict:
     """Fetch the verified claim behind a nonce and re-check its binding.
 
@@ -362,7 +367,7 @@ def _supervisor_claim(conn, auth_nonce: str | None, actions: set[str], *,
     return auth.claim(conn, auth_nonce, actions, meeting_id=thread_id)
 
 
-def _meeting(conn, thread_id: str):
+def _meeting(conn: sqlite3.Connection, thread_id: str) -> sqlite3.Row:
     """Read the meeting joined to its thread, retiring the thread if it went idle.
 
     The refresh is what makes the idle deadline one of the four bounds design.md
@@ -391,8 +396,9 @@ def _meeting(conn, thread_id: str):
     return row
 
 
-def _attendee(conn, thread_id: str, role: str, *, checked_in: bool = False,
-              allow_stopped: bool = False):
+def _attendee(conn: sqlite3.Connection, thread_id: str, role: str, *,
+              checked_in: bool = False,
+              allow_stopped: bool = False) -> sqlite3.Row:
     row = conn.execute(
         "SELECT * FROM meeting_attendees WHERE thread_id=? AND role=?",
         (thread_id, role),
@@ -406,7 +412,7 @@ def _attendee(conn, thread_id: str, role: str, *, checked_in: bool = False,
     return row
 
 
-def _has_supervisor(conn, thread_id: str) -> bool:
+def _has_supervisor(conn: sqlite3.Connection, thread_id: str) -> bool:
     row = conn.execute(
         """SELECT 1 FROM meeting_attendees
            WHERE thread_id=? AND role=? AND checked_in_at IS NOT NULL
@@ -416,7 +422,7 @@ def _has_supervisor(conn, thread_id: str) -> bool:
     return bool(row)
 
 
-def _thread_last_activity(conn, thread_id: str) -> dt.datetime:
+def _thread_last_activity(conn: sqlite3.Connection, thread_id: str) -> dt.datetime:
     """Newest substantive activity on the thread = last message (not events).
 
     Events (check-in, mode changes, escalations) are bookkeeping, not someone
@@ -432,7 +438,7 @@ def _thread_last_activity(conn, thread_id: str) -> dt.datetime:
     return _parse_time(_meeting(conn, thread_id)["created_at"])
 
 
-def _stamp_notifications(conn, role: str) -> None:
+def _stamp_notifications(conn: sqlite3.Connection, role: str) -> None:
     """Record that `role` has been *notified* of its still-unread meeting
     messages (distinct from having *read* them). Purely additive: this never
     touches mailbox_receipts, so it cannot suppress an unread count or a
