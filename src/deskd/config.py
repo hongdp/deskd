@@ -224,7 +224,6 @@ CONFIG = EngineConfig()
 
 def configure(**kwargs) -> EngineConfig:
     """Convenience: mutate the process-wide default config."""
-    global CONFIG
     for k, v in kwargs.items():
         if not hasattr(CONFIG, k):
             raise ValueError(f"unknown config field: {k}")
