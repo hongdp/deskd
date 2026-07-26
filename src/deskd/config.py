@@ -20,7 +20,7 @@ from pathlib import Path
 
 PROJECT_NAME = "deskd"
 ENV_PREFIX = "DESKD_"
-__version__ = "0.1.5"
+__version__ = "0.2.0"
 
 
 def env(name: str, default: str | None = None) -> str | None:
