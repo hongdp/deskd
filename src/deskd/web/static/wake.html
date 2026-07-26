@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wake ladder · deskd console</title>
+<link rel="stylesheet" href="/static/deskd.css">
+<script src="/static/shell.js"></script>
+</head>
+<body>
+<main class="wrap">
+  <div class="pagehead">
+    <div><h1>Wake ladder</h1><div class="sub">How a demand climbs until someone reacts — rungs, in-flight demands, and the attempt ledger</div></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Escalation ladder in force</h3><span class="quiet">a demand starts low and climbs each rung's SLA until it lands</span></div>
+    <div class="ladder" id="ladder"><div class="loading">Loading…</div></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Pending demands</h3><span class="quiet">one row per demand still climbing, grouped by role · reason · source</span></div>
+    <div id="pending"></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Attempt history</h3><span class="quiet" id="hist-count"></span></div>
+    <div class="filters">
+      <label>Role <select id="f-role"><option value="">all</option></select></label>
+      <label>Reason <select id="f-reason"><option value="">all</option></select></label>
+      <label>Outcome <select id="f-outcome"><option value="">all</option></select></label>
+    </div>
+    <div id="history"></div>
+  </div>
+</main>
+<footer class="foot" id="foot"></footer>
+<script>
+"use strict";
+var S = Shell, esc = S.esc, rel = S.rel;
+S.init("wake", "Wake ladder");
+
+var DATA = null;
+
+function renderLadder(ladder) {
+  S.setHTML(S.$("#ladder"), ladder.map(function (r) {
+    var sla = r.terminal
+      ? '<span class="badge">terminal — recycles if it sits</span>'
+      : '<span class="badge">SLA ' + S.dur(r.sla_seconds) + "</span>";
+    var wired = r.wired
+      ? '<span class="badge ok">wired</span>'
+      : '<span class="badge bad" title="no channel is currently available: escalations arriving here stop at the durable outbox row">unwired — outbox only</span>';
+    var leaves = r.leaves_machine ? '<span class="badge warn">pulls a human in</span>' : "";
+    return '<div class="rung' + (r.leaves_machine ? " human" : "") + '">'
+      + '<span class="lvl">L' + r.level + '</span><span class="ch">' + esc(S.human(r.channel)) + "</span>"
+      + sla + leaves + '<span class="right">' + wired + "</span></div>";
+  }).join(""));
+}
+
+// One row per demand: the pending attempts, grouped by (role, reason, source).
+function renderPending(attempts) {
+  var pending = attempts.filter(function (a) { return a.outcome === "pending"; });
+  if (!pending.length) {
+    S.setHTML(S.$("#pending"), S.empty("Nothing is climbing the ladder — every demand has landed or resolved."));
+    return;
+  }
+  var key = function (a) { return JSON.stringify([a.role, a.reason_kind, a.source_ref]); };
+  var groups = {};
+  pending.forEach(function (a) { groups[key(a)] = [a]; });
+  // The climb so far: the engine keeps one pending attempt per demand and
+  // marks the rungs behind it superseded, so the trajectory is those
+  // superseded attempts (oldest first) plus the current rung.
+  attempts.forEach(function (a) {
+    if (a.outcome === "superseded" && groups[key(a)]) groups[key(a)].push(a);
+  });
+  var rows = Object.keys(groups).map(function (k) {
+    var g = groups[k];
+    g.sort(function (a, b) { return b.level - a.level; });
+    var top = g[0];
+    var trail = "L" + g.map(function (a) { return a.level; }).reverse().join(" → L");
+    return "<tr><td><b>" + esc(top.role) + "</b></td><td>" + esc(S.human(top.reason_kind)) + "</td>"
+      + "<td>" + esc(top.detail || top.source_ref) + "</td>"
+      + '<td><span class="badge ' + (top.level >= 3 ? "bad" : "warn") + '">' + esc(S.human(top.channel)) + " L" + top.level + "</span></td>"
+      + '<td class="num">' + esc(trail) + "</td><td>" + rel(top.attempted_at) + "</td></tr>";
+  });
+  S.setHTML(S.$("#pending"),
+    '<div class="tblwrap"><table><thead><tr><th>Role</th><th>Reason</th><th>Demand</th><th>Current rung</th><th>Trajectory</th><th>Since</th></tr></thead><tbody>'
+    + rows.join("") + "</tbody></table></div>");
+}
+
+function fillFilter(sel, values) {
+  var cur = sel.value;
+  var opts = '<option value="">all</option>' + values.map(function (v) {
+    return '<option value="' + esc(v) + '">' + esc(S.human(v)) + "</option>";
+  }).join("");
+  if (S.setHTML(sel, opts) && cur && values.indexOf(cur) >= 0) sel.value = cur;
+}
+
+function renderHistory() {
+  if (!DATA) return;
+  var fr = S.$("#f-role").value, fk = S.$("#f-reason").value, fo = S.$("#f-outcome").value;
+  var rows = DATA.attempts.filter(function (a) {
+    return (!fr || a.role === fr) && (!fk || a.reason_kind === fk) && (!fo || a.outcome === fo);
+  });
+  S.$("#hist-count").textContent = rows.length + " of " + DATA.attempts.length + " attempts";
+  if (!rows.length) {
+    S.setHTML(S.$("#history"), DATA.attempts.length
+      ? S.empty("No attempts match these filters.")
+      : S.empty("No wake attempts yet — the orchestrator records every rung it climbs here."));
+    return;
+  }
+  S.setHTML(S.$("#history"),
+    '<div class="tblwrap"><table><thead><tr><th>Role</th><th>Reason</th><th>Rung</th><th>Outcome</th><th>Latency</th><th>Demand</th><th>Attempted</th></tr></thead><tbody>'
+    + rows.map(function (a) {
+      return "<tr><td><b>" + esc(a.role) + "</b></td><td>" + esc(S.human(a.reason_kind)) + "</td>"
+        + "<td>" + esc(S.human(a.channel)) + " L" + a.level + "</td><td>" + S.stateBadge(a.outcome) + "</td>"
+        + '<td class="num">' + (a.latency_seconds != null ? S.dur(a.latency_seconds) : "—") + "</td>"
+        + "<td>" + esc(a.detail || a.source_ref || "") + "</td><td>" + rel(a.attempted_at) + "</td></tr>";
+    }).join("") + "</tbody></table></div>");
+}
+
+function uniq(arr) { return Array.from(new Set(arr)).sort(); }
+
+async function load() {
+  DATA = await S.api("/api/wake");
+  renderLadder(DATA.ladder);
+  renderPending(DATA.attempts);
+  fillFilter(S.$("#f-role"), uniq(DATA.attempts.map(function (a) { return a.role; })));
+  fillFilter(S.$("#f-reason"), uniq(DATA.attempts.map(function (a) { return a.reason_kind; })));
+  fillFilter(S.$("#f-outcome"), uniq(DATA.attempts.map(function (a) { return a.outcome; })));
+  renderHistory();
+  S.$("#foot").textContent = "updated " + new Date().toLocaleTimeString();
+}
+["f-role", "f-reason", "f-outcome"].forEach(function (id) {
+  document.getElementById(id).onchange = renderHistory;
+});
+S.autorefresh(load, 10);
+</script>
+</body>
+</html>

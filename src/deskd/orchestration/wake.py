@@ -700,6 +700,40 @@ def wake_attempts_recent(limit: int = 20,
             "SELECT * FROM wake_attempts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
 
 
+def wake_ladder_view() -> list[dict]:
+    """The configured ladder as the console renders it: each rung with its
+    index, SLA, and whether the promise it makes currently means anything.
+
+    `wired` is the operational half of the answer: a machine rung is executed
+    by the driver and is always wired; a rung that leaves the machine is only
+    as real as the channel layer behind it — unwired, its escalations stop at
+    the durable outbox row. Computed here, not in the web layer, because 'is
+    the human rung wired' is an engine fact the host must be TOLD, and two
+    definitions of it is how a console and its engine come to disagree.
+    """
+    reachable = channels.human_reachable()
+    ladder = _ladder()
+    return [{
+        "level": i,
+        "channel": rung.channel,
+        "sla_seconds": rung.sla_seconds,
+        "terminal": rung.sla_seconds is None,
+        "leaves_machine": rung.leaves_machine,
+        "wired": reachable if rung.leaves_machine else True,
+    } for i, rung in enumerate(ladder)]
+
+
+def wake_escalations_recent(limit: int = 100,
+                            db_path: Path | str | None = None) -> list[dict]:
+    """The human-rung outbox, newest first — every arrival of a demand at a
+    rung that leaves the machine. status='queued' means the ledger row is the
+    ONLY delivery so far: nobody was pulled in unless somebody reads this."""
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM wake_escalations ORDER BY id DESC LIMIT ?",
+            (limit,)).fetchall()]
+
+
 def wake_sources(role: str, db_path: Path | str | None = None) -> dict:
     """One-shot answer to 'what can currently wake/remind me, and can I change
     it?' — the role's own registered hooks (self-managed via `hook add/cancel`),

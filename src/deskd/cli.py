@@ -376,7 +376,10 @@ def build_parser() -> argparse.ArgumentParser:
     rv_st.add_argument("thread")
 
     # --- serve --------------------------------------------------------------
-    p_sv = sub.add_parser("serve", help="run the web console (board/agent/meetings)")
+    p_sv = sub.add_parser(
+        "serve",
+        help="run the supervisor console (board, agent detail, meetings, "
+             "wake ladder, escalations, tasks & hooks)")
     # Loopback by default: the console exposes the supervisor adapter, and a
     # host that wants it on a network should say so explicitly.
     p_sv.add_argument("--host", default=env("HOST") or "127.0.0.1")

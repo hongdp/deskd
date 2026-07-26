@@ -46,9 +46,10 @@ belongs in this repo.
 ### Access codes
 
 Never hardcode the code into a client or static file — a pre-filled credential
-in page source *is* the credential, served to anyone who can reach the server
-(which binds all interfaces by default). Use `sessionStorage`: enter once per
-browser session. If a code was ever committed or served, **rotate it**.
+in page source *is* the credential, served to anyone who can reach the server.
+`deskd serve` binds loopback by default, but binding a network interface is one
+flag away and the page must stay safe either way. Use `sessionStorage`: enter
+once per browser session. If a code was ever committed or served, **rotate it**.
 
 ## Probes
 

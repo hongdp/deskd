@@ -167,6 +167,20 @@ def _route_unroutable(conn) -> list[dict]:
     return out
 
 
+def unroutable_list(include_routed: bool = False, limit: int = 100,
+                    db_path: Path | str | None = None) -> list[dict]:
+    """The unroutable-demands ledger, pending first — the read view behind
+    board().health.unroutable_demands, which shipped only the count. A demand
+    nobody is allowed to take must not just be a number: someone has to see
+    WHICH capability is missing to grant it or enable a role."""
+    where = "" if include_routed else "WHERE routed_at IS NULL "
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(
+            f"SELECT * FROM unroutable_demands {where}"
+            "ORDER BY (routed_at IS NOT NULL), id DESC LIMIT ?",
+            (limit,)).fetchall()]
+
+
 _INBOX_RANK = {"urgent": 0, "normal": 1, "low": 2}
 
 
