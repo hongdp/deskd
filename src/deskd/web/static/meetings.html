@@ -8,24 +8,31 @@
 <script src="/static/shell.js"></script>
 </head>
 <body>
-<main class="mshell">
-<aside class="mside">
-  <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" id="open-call">Call meeting</button><button class="btn" id="refresh">Refresh</button></div>
-  <label style="margin-top:10px"><input id="show-closed" type="checkbox"> Show closed</label>
-  <!-- Day picker: real choices from /api/meeting-days, never a blank date box.
-       It narrows HISTORY only — the engine always returns live meetings. -->
-  <div id="day-row" style="display:none"><label>Day</label><select id="day"></select></div>
-  <div class="meeting-list" id="meeting-list"><div class="loading">Loading…</div></div>
-</aside>
-<section class="mmain">
+<!-- Same shell as every other view: .wrap gutters, a pagehead that names the
+     PAGE (the selected meeting is a heading inside the detail column, not the
+     page's h1), and cards on the page background — no full-bleed rail. -->
+<main class="wrap">
   <div class="pagehead">
-    <div><h1 id="title">Select a meeting</h1><div class="sub" id="subtitle">Watch, call, and join agent meetings</div></div>
-    <div id="auth-box" hidden style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
-      <div><label>Supervisor access code</label><input id="access-code" type="password" autocomplete="current-password" placeholder="printed by the server at startup" style="width:230px"></div>
+    <div><h1>Meetings</h1><div class="sub">Watch, call, and join agent meetings — bounded by budget, deadline and a mutual end</div></div>
+    <div id="auth-box" class="authbox" hidden>
+      <div><label>Supervisor access code</label><input id="access-code" type="password" autocomplete="current-password" placeholder="printed by the server at startup"></div>
       <button class="btn" id="remember">Keep for session</button>
     </div>
   </div>
   <div class="security" id="security">Reading auth mode…</div>
+  <div class="mcols">
+  <aside class="card mside">
+    <div class="mside-controls"><button class="btn primary" id="open-call">Call meeting</button><button class="btn" id="refresh">Refresh</button></div>
+    <label class="mside-toggle"><input id="show-closed" type="checkbox"> Show closed</label>
+    <!-- Day picker: real choices from /api/meeting-days, never a blank date box.
+         It narrows HISTORY only — the engine always returns live meetings. -->
+    <div id="day-row" hidden><label>Day</label><select id="day"></select></div>
+    <div class="meeting-list" id="meeting-list"><div class="loading">Loading…</div></div>
+  </aside>
+  <section class="mmain">
+  <div class="mtitle">
+    <h2 id="title">Select a meeting</h2><div class="sub" id="subtitle">Pick one from the list, or call a new one</div>
+  </div>
   <div class="mlayout">
     <section>
       <div class="card">
@@ -60,8 +67,10 @@
       </div>
     </section>
   </div>
-</section>
+  </section>
+  </div>
 </main>
+<footer class="foot" id="foot"></footer>
 
 <dialog id="call-dialog">
   <div class="card-head"><h3>Call a meeting</h3><button class="btn" id="close-call">Close</button></div>
@@ -71,7 +80,7 @@
   <!-- Populated from the agent registry via /api/meeting-meta — never hardcoded. -->
   <div class="chips" id="call-roles"><span class="chip">loading…</span></div>
   <div class="row"><div><label>Message limit</label><input id="call-limit" type="number" min="2" value="20"></div><div><label>Consensus threshold</label><input id="call-threshold" type="number" min="2" value="4"></div></div>
-  <div style="margin-top:13px"><button class="btn primary" id="call">Call now</button></div>
+  <div class="dialog-actions"><button class="btn primary" id="call">Call now</button></div>
   <div class="result" id="call-result"></div>
 </dialog>
 
@@ -146,7 +155,7 @@ async function loadDays() {
 }
 async function load(preserve) {
   var closed = $("#show-closed").checked;
-  $("#day-row").style.display = closed ? "" : "none";
+  $("#day-row").hidden = !closed;
   if (closed && !days.length) await loadDays();
   var q = "/api/meetings?include_closed=" + closed;
   var d = closed ? $("#day").value : "";
@@ -157,6 +166,7 @@ async function load(preserve) {
   }
   renderList();
   if (selected) await loadOne(); else empty();
+  S.$("#foot").textContent = "updated " + new Date().toLocaleTimeString();
 }
 function renderList() {
   var n = $("#meeting-list");
