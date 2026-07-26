@@ -12,6 +12,9 @@ as `deskd`. See README.md and docs/design.md for the architecture.
   live behind the `web` extra; pytest behind `dev`. Do not add core deps.
 - Signature verification is the trust boundary — never make it optional or
   silently degradable.
+- **Commit messages and PR titles/bodies are written in English** (supervisor
+  ruling 2026-07-26). This is a public project: the git history and PR record
+  are part of the product. Chinese messages before this date predate the rule.
 
 ## Layout
 
