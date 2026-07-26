@@ -1501,3 +1501,29 @@ def test_closing_the_meeting_retires_the_close_task(desk):
 
     orch.plan_wakes()
     assert _close_tasks() == []
+
+
+def test_a_closed_meetings_wake_request_raises_no_demand(desk):
+    """_close_meeting settles pending wake requests, but rows predating that
+    rule (or arriving through a path it misses) must still be inert: a closed
+    meeting cannot be checked in to, so the demand could never be satisfied
+    and would regenerate a wake attempt every tick, forever."""
+    status = meetings.call_meeting(agenda="legacy row", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+    meetings.confirm_end(thread_id, role="beta")
+
+    # A legacy pending row on the now-closed meeting.
+    with orch.connect(write=True) as c:
+        c.execute(
+            """INSERT INTO meeting_wake_requests(thread_id,role,status,created_at)
+               VALUES (?,?,'pending',?)
+               ON CONFLICT(thread_id,role) DO UPDATE SET status='pending'""",
+            (thread_id, "beta", iso(0)))
+
+    with orch.connect() as c:
+        demands = [d for d in orch.collect_wake_demand(c)
+                   if d["reason_kind"] == "meeting_wake"]
+    assert demands == [], "a closed meeting must never wake anyone"

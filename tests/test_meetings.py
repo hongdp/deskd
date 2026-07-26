@@ -1418,3 +1418,110 @@ def test_termination_pending_accepts_a_final_reply_and_refuses_new_topics(desk):
                                     reply_to=first["message_id"])
     assert accepted["message_id"]
     assert meetings.confirm_end(thread_id, role="beta")["closed"] is True
+
+
+# --- 12. the termination vote is demand, and silence is not an answer -------
+# A meeting parked in termination_pending is the engine's quietest failure
+# mode: every bound holds, nothing is overdue, and nothing ever happens again.
+# (Observed live 2026-07-25: a counter-proposal landed after the counterpart
+# finished its turn; the meeting sat open for three hours until a human
+# wandered in — and the human's own confirm changed nothing, silently.)
+
+def test_a_pending_proposal_wakes_the_missing_voters(desk):
+    """Proposing an end owes every other required attendee a vote; the wake
+    request is how that debt reaches an agent that already went idle."""
+    thread_id = _start("who votes", ["alpha", "beta", "gamma"])
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+
+    for voter in ("beta", "gamma"):
+        assert [w["thread_id"] for w in meetings.wake_requests(voter)] == [
+            thread_id], f"{voter} owes a vote and must be woken for it"
+    assert meetings.wake_requests("alpha") == [], (
+        "the proposer owes nothing — its proposal auto-confirms")
+
+
+def test_voting_settles_the_wake_and_names_who_is_still_owed(desk):
+    """The vote is the demanded work, so it must acknowledge the wake; and a
+    confirm that does not close must say who it is waiting for, because
+    closed=False with no explanation reads as a silent failure."""
+    thread_id = _start("who is left", ["alpha", "beta", "gamma"])
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+
+    verdict = meetings.confirm_end(thread_id, role="beta")
+    assert verdict["closed"] is False
+    assert verdict["waiting_on"] == ["gamma"]
+    assert meetings.wake_requests("beta") == [], (
+        "beta voted; keeping its wake pending would climb the ladder for work "
+        "already done")
+    assert [w["thread_id"] for w in meetings.wake_requests("gamma")] == [thread_id]
+
+    final = meetings.confirm_end(thread_id, role="gamma")
+    assert final["closed"] is True and final["waiting_on"] == []
+    assert _state(thread_id) == "closed"
+
+
+def test_supervisor_confirm_reports_the_missing_voter(desk):
+    """The supervisor sits outside the required-attendee denominator, so its
+    confirm cannot close the meeting by itself — fine, but the response must
+    say so. This is the console click that looked like it did nothing."""
+    thread_id = _start("supervisor watches", ["alpha", "beta"])
+    proposal = meetings.propose_end(
+        thread_id, role="alpha", resolution="done")["proposal_id"]
+
+    # Voting requires attendance — the console joins first (skipping this is
+    # the 400 the live incident opened with), then confirms, binding the
+    # assertion to the proposal it is voting on.
+    meetings.apply_simple_supervisor_action(
+        {"action": "join", "meeting_id": thread_id})
+    verdict = meetings.apply_simple_supervisor_action(
+        {"action": "confirm_end", "meeting_id": thread_id,
+         "proposal_id": proposal})
+    assert verdict["closed"] is False
+    assert verdict["waiting_on"] == ["beta"]
+    assert _state(thread_id) == "termination_pending"
+
+
+def test_force_close_settles_every_pending_wake_request(desk):
+    """A closed meeting demands nothing: the vote wake a force_close overtakes
+    must be settled with it, or the demand collector regenerates a wake every
+    tick for a meeting nobody can check in to."""
+    thread_id = _start("cut short", ["alpha", "beta"])
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+    assert meetings.wake_requests("beta"), "precondition: beta owes a vote"
+
+    meetings.apply_simple_supervisor_action(
+        {"action": "force_close", "meeting_id": thread_id,
+         "reason": "supervisor decided"})
+
+    assert meetings.wake_requests("beta") == []
+    with _db() as conn:
+        pending = conn.execute(
+            "SELECT COUNT(*) AS n FROM meeting_wake_requests "
+            "WHERE thread_id=? AND status='pending'", (thread_id,),
+        ).fetchone()["n"]
+    assert pending == 0
+
+
+def test_sweep_rearms_a_parked_vote(desk):
+    """An acknowledged wake without a vote is the parked state again — the
+    sweep must re-arm it after the meeting's own wait timeout, exactly like
+    the stale-attendee branch it sits next to."""
+    thread_id = _start("parked vote", ["alpha", "beta"])
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+    meetings.acknowledge_wake(thread_id, role="beta")
+    assert meetings.wake_requests("beta") == []
+
+    # Back-date both clocks past the 300s default wait timeout.
+    with _db() as conn:
+        conn.execute(
+            "UPDATE meeting_terminations SET created_at=? WHERE thread_id=?",
+            (_past(400), thread_id))
+        conn.execute(
+            "UPDATE meeting_wake_requests SET acknowledged_at=? "
+            "WHERE thread_id=? AND role='beta'", (_past(400), thread_id))
+    meetings.sweep_timeouts()
+
+    assert [w["thread_id"] for w in meetings.wake_requests("beta")] == [
+        thread_id], "the parked voter must be woken again"
+    assert meetings.wake_requests("alpha") == [], (
+        "the proposer still owes nothing")
