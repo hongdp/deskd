@@ -39,7 +39,11 @@ S.init("escalations", "Escalations");
 function chanStrip(d) {
   var chans = (d.channels || []).filter(function (c) { return !c.outbox; });
   var avail = chans.filter(function (c) { return c.available; }).length;
-  var queued = (d.wake || []).filter(function (w) { return w.status === "queued"; }).length;
+  // queued AND failed are both "reached nobody": queued has no channel yet,
+  // failed had one and it errored (the engine retries for 24h).
+  var queued = (d.wake || []).filter(function (w) {
+    return w.status === "queued" || w.status === "failed";
+  }).length;
   S.setHTML(S.$("#chan-strip"),
     '<span class="alarm ' + (d.human_reachable ? "" : "bad") + '"><span class="st"></span>'
     + (d.human_reachable ? "human rung wired — an escalation reaches a person"

@@ -1525,3 +1525,22 @@ def test_sweep_rearms_a_parked_vote(desk):
         thread_id], "the parked voter must be woken again"
     assert meetings.wake_requests("alpha") == [], (
         "the proposer still owes nothing")
+
+
+def test_the_meetings_clock_has_one_patch_point(desk, monkeypatch):
+    """The split's contract, mirroring orchestration.store._now: submodules
+    read the clock through the meetings.store module attribute, so patching
+    that SINGLE point steers every SLA. If this breaks, someone bound the
+    clock at import time in a submodule — and every time-dependent test that
+    patches the seam is silently testing nothing."""
+    thread_id = _start("clock seam", ["alpha", "beta"])
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+    meetings.acknowledge_wake(thread_id, role="beta")
+    assert meetings.wake_requests("beta") == []
+
+    future = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=400)
+    monkeypatch.setattr(meetings.store, "_now", lambda: future)
+    meetings.sweep_timeouts()
+
+    assert [w["thread_id"] for w in meetings.wake_requests("beta")] == [
+        thread_id], "the sweep did not follow the patched store clock"

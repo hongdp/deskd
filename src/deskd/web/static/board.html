@@ -31,7 +31,9 @@ function livenessText(a) {
   var age = a.heartbeat_age_seconds != null ? " · heartbeat " + ago(a.heartbeat_age_seconds) + " ago" : "";
   var life = a.phase === "draining" ? ' · <span style="color:var(--warn)">handing off</span>'
     : a.stale_day ? ' · <span style="color:var(--warn)">stale session, rollover due</span>'
-    : (a.session_day ? " · " + esc(a.session_day) : "");
+    // nowrap: a date's hyphens are line-break opportunities, and "2026-07-/26"
+    // split across lines reads like a rendering bug.
+    : (a.session_day ? ' · <span style="white-space:nowrap">' + esc(a.session_day) + "</span>" : "");
   return s + age + life;
 }
 
