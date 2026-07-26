@@ -1,0 +1,27 @@
+name: tests
+
+# Plain pytest on every push and PR — no lint, no coverage gates. release.yml
+# re-runs the suite before publishing; this exists so main always carries a
+# fresh signal (and the README badge tells the truth).
+#
+# httpx is test-only: fastapi's TestClient transports through it, and the
+# package deliberately doesn't depend on it.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install -e ".[web]" pytest httpx
+      - run: python -m pytest -q
