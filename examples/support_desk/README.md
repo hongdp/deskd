@@ -32,7 +32,7 @@ narrated. The demo wipes and recreates `./demo-desk.db` on every run
 
 | Beat | On the console | The engine guarantee |
 |---|---|---|
-| 1 — the desk comes up | Two dots go green with live activity lines; Auditor reads "never seen" | Presence is **derived from heartbeat age** — agents never poll, liveness cannot go stale |
+| 1 — the desk comes up | Three dots go green with live activity lines; watch the Auditor's heartbeat age start climbing once it goes quiet | Presence is **derived from heartbeat age** — agents never poll, liveness cannot go stale |
 | 2 — tickets land | Red `[urgent]` item on Triage; a routed item on Writer; `unroutable demands: 1` in the health strip | One inbox for everything; **dedup** by key; **capability-addressed routing** — an unroutable demand is recorded red, never dropped |
 | 3 — a bounded huddle | Transcript grows; the owed-reply SLA panel fills and clears; the meeting closes with a resolution | **Bounded meetings**: quorum, per-message read receipts, reply obligations with SLAs, message budget, unanimous termination handshake |
 | 4 — the auditor went home | Auditor's dot decays online → suspect → presumed offline; "waking L2" then L3 chips; a boxed **PAGE** prints in the terminal | Demand → attempt → **closed-loop verification** → append-only escalation ladder → durable ledger row, whether or not any channel worked |

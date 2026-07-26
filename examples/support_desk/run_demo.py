@@ -67,13 +67,17 @@ def start_console(port: int):
         create_app(), host="127.0.0.1", port=port, log_level="warning"))
     threading.Thread(target=server.run, daemon=True,
                      name="deskd-console").start()
-    for _ in range(100):  # wait until the socket answers
-        try:
+    for _ in range(100):  # wait until OUR server binds (server.started), then
+        # confirm the socket answers. A bare connect check would pass against a
+        # leftover console from a previous run while our uvicorn dies on
+        # "address already in use" — narrating a console that isn't ours.
+        if server.started:
             socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
             return server
-        except OSError:
-            time.sleep(0.1)
-    raise RuntimeError(f"console did not come up on port {port}")
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"console did not come up on port {port} — is a previous demo still "
+        f"serving there? (pkill -f support_desk, or pass --port)")
 
 
 def supervisor_post(port: int, payload: dict) -> dict:
@@ -355,8 +359,8 @@ class Scenario:
                 supervisor_post(self.port, {"action": "join", "meeting_id": tid})
                 supervisor_post(self.port, {
                     "action": "send", "meeting_id": tid, "kind": "decision",
-                    "body": "Nice save overnight. The auditor was paged exactly "
-                            "once and the ledger is clean — closing this out."})
+                    "body": "Nice save overnight. Every page that fired is in "
+                            "the ledger and none were lost — closing this out."})
                 supervisor_post(self.port, {
                     "action": "force_close", "meeting_id": tid,
                     "reason": "supervisor review complete"})
@@ -490,6 +494,11 @@ def fresh_db(db_path: Path, keep: bool) -> None:
         p = Path(str(db_path) + suffix)
         if p.exists():
             p.unlink()
+    # The pager log is part of the same story: stale pages from a previous
+    # run would show up in this run's epilogue transcript.
+    log = db_path.with_name("pager.log")
+    if log.exists():
+        log.unlink()
 
 
 def parse_pause(values) -> dict:
