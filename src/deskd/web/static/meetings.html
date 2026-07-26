@@ -357,8 +357,17 @@ async function runAction(payload, needJoin) {
   try {
     setResult("Working…", false);
     if (needJoin) await joinIfNeeded();
-    await supervisor(payload);
-    setResult("Done.", false);
+    var res = await supervisor(payload);
+    // closed:false is neither success nor failure: the supervisor's confirm is
+    // recorded but sits outside the required-attendee denominator, so the
+    // meeting stays open until the named voters vote (the engine wakes them).
+    // A silent "Done." here is how a recorded vote reads as a dead button.
+    if (res && res.closed === false && Array.isArray(res.waiting_on) && res.waiting_on.length) {
+      setResult("Confirm recorded — still waiting on: " + res.waiting_on.join(", ")
+        + " (they are woken to vote; use Force close to end it now)", false);
+    } else {
+      setResult("Done.", false);
+    }
     await load(true);
   } catch (e) { setResult(e.message, true); }
 }
