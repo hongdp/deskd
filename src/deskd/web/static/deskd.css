@@ -293,11 +293,16 @@ input[type="checkbox"] { width: auto; }
 .mshell { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 0; max-width: 1400px; margin: 0 auto; }
 .mside { border-right: 1px solid var(--line); padding: 16px 14px 40px; }
 .mmain { padding: 16px clamp(14px, 2.5vw, 30px) 56px; min-width: 0; }
-.meeting-list { display: grid; gap: 6px; margin-top: 10px; }
-.meeting { cursor: pointer; width: 100%; text-align: left; border: 1px solid transparent; border-radius: 9px; padding: 10px 11px; background: transparent; color: var(--text); }
+/* minmax(0,1fr) + min-width:0 down the chain: a grid's auto column tracks
+   max-content, and flex/grid children refuse to shrink below content by
+   default — so a long nowrap agenda silently widens the whole sidebar past
+   its 300px track and bleeds under the main column. The ellipsis only works
+   once every ancestor is allowed to be narrower than the title. */
+.meeting-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; margin-top: 10px; }
+.meeting { cursor: pointer; width: 100%; min-width: 0; text-align: left; border: 1px solid transparent; border-radius: 9px; padding: 10px 11px; background: transparent; color: var(--text); }
 .meeting:hover, .meeting.active { background: var(--surface); border-color: var(--line); }
 .meeting .line { display: flex; gap: 9px; justify-content: space-between; align-items: flex-start; }
-.meeting .agenda { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.meeting .agenda { flex: 1; min-width: 0; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .meeting .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
 .mdot { height: 8px; width: 8px; min-width: 8px; border-radius: 50%; background: var(--muted); margin-top: 5px; }
 .mdot.active, .mdot.consensus { background: var(--ok); }
