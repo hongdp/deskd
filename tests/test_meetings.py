@@ -379,11 +379,16 @@ def test_the_supervisor_s_reply_leaves_the_agent_owing_an_answer(desk):
 
     owed = {o["message_id"]: o for o in
             meetings.meeting_status(thread_id)["response_obligations"]}
-    assert (owed[answer]["owed_by"], owed[answer]["status"]) == (
-        CONFIG.supervisor_role, "resolved"), "the agent's answer was answered"
     assert (owed[followup]["owed_by"], owed[followup]["status"]) == (
         "alpha", "pending"), (
         "a supervisor question sent WITH reply_to must still obligate the agent")
+    # The mirror does NOT hold, deliberately: the agent's answer obligates
+    # nobody, because the other party is a person. An obligation is an SLA with
+    # a wake ladder behind it, and this ladder wakes agents — a supervisor-owed
+    # row makes the planner emit "spawn a session for role=supervisor", the one
+    # role the engine refuses everywhere else. A human's attention is asked for
+    # through the message and the escalation path, never demanded on a clock.
+    assert answer not in owed, "an SLA must not be minted against a human"
 
     # And it is a real SLA, not a decorative row: back-dated past its due_at it
     # survives the sweep as pending, which is what the orchestrator collects as
@@ -1751,3 +1756,57 @@ def test_the_meetings_clock_has_one_patch_point(desk, monkeypatch):
 
     assert [w["thread_id"] for w in meetings.wake_requests("beta")] == [
         thread_id], "the sweep did not follow the patched store clock"
+
+
+def test_a_human_is_never_put_on_a_machine_sla(desk):
+    """The constitutional guard on turn-taking. An obligation is not a note that
+    someone owes an answer — it is an SLA whose enforcement arm wakes agents, so
+    a row owed by the supervisor makes the planner emit "spawn a session for
+    role=supervisor": a role this same engine refuses in _agent_role,
+    agent_detail and wake_sources, and which the host desk's constitution
+    forbids an agent to claim. Measured before this guard: one overnight
+    supervisor DM produced 19 such spawn actions and 38 human pages.
+
+    The engine's own precedent is the attendance sweep — only agents are woken;
+    a missing human rides out on the escalation instead."""
+    called = meetings.apply_simple_supervisor_action(
+        {"action": "call", "agenda": "ask the human", "attendees": ["alpha"]})
+    thread_id = called["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="alpha")
+
+    for kind, body in (("question", "should I size this at 1%?"),
+                       ("evidence", "and here is why I ask")):
+        meetings.send_update(thread_id, role="alpha", kind=kind, body=body)
+
+    owed_by = {o["owed_by"] for o in
+               meetings.meeting_status(thread_id)["response_obligations"]}
+    assert CONFIG.supervisor_role not in owed_by
+
+
+def test_a_debt_nobody_can_pay_is_not_left_standing(desk):
+    """A meeting has three terminal states and only one is `closed`. The mailbox
+    also retires a thread on its idle deadline or its spent message budget — and
+    those pause the THREAD while meetings.state stays 'active'/'consensus'. With
+    every message owing a reply, an unclosed one-to-one strands a debt whose
+    debtor is physically unable to answer (send_update refuses: "thread is
+    paused"), which the collector then re-raised every tick: 114 wake attempts
+    and 76 human pages in 24h, measured, for a conversation both parties had
+    politely finished.
+
+    The rule this pins is payability, not tidiness: the board and the wake
+    collector both ask whether the debtor could act, and a resumed thread makes
+    the demand real again on its own."""
+    thread_id = _start("idle out", ["alpha", "beta"], idle_minutes=45)
+    meetings.send_update(thread_id, role="alpha", kind="question",
+                         body="what do you make of it")
+    _expire(thread_id)
+    with pytest.raises(ValueError, match="idle|expired|paused"):
+        meetings.send_update(thread_id, role="beta", kind="answer",
+                             body="cannot answer a paused thread")
+
+    from deskd import orchestration as orch  # local: this layer never imports it
+
+    load = orch.board()["agents"]
+    beta = next(a for a in load if a["role"] == "beta")
+    assert (beta.get("meetings") or {}).get("obligations", {}).get("pending", 0) == 0, (
+        "an unpayable debt must not sit on the board as work")

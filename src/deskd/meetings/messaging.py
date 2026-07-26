@@ -290,16 +290,30 @@ def _send_update(conn: sqlite3.Connection, thread_id: str, role: str, body: str,
     # imposes strict turn-taking (every message owes a reply)" — this is the
     # first code that implements it.
     #
-    # `recipient in active_roles` is the whole guard, and it is what stops this
-    # minting debt nobody can pay. BROADCAST is owed by nobody, and a reply to a
-    # message from an attendee who has since LEFT must not obligate them: the
-    # leave path just waived their debts, and re-arming one behind them would
-    # wake a role that has no seat. The supervisor is obligated like any other
-    # party (this already happened for non-reply messages) — a question an agent
-    # asks a human must not evaporate either — and orchestration floors a
-    # supervisor-owed wake at the first rung that leaves the machine rather than
-    # spawning a session for a role no session may claim (wake.py::_role_floor).
-    if mode == "one_to_one" and not preamble and recipient in active_roles:
+    # Two guards, and both are load-bearing.
+    #
+    # `recipient in active_roles` stops this minting debt nobody can pay:
+    # BROADCAST is owed by nobody, and a reply to an attendee who has since LEFT
+    # must not obligate them — the leave path just waived their debts, and
+    # re-arming one behind them would wake a role with no seat.
+    #
+    # `recipient != supervisor` is the constitutional one. An obligation is an
+    # SLA with a wake ladder behind it, and this engine's ladder wakes AGENTS:
+    # `collect_wake_demand` filters by nothing, `_start_level` opens at the
+    # `spawn` rung, and the driver executing that plan would be told to launch a
+    # session declaring itself the supervisor — a role the same engine refuses
+    # everywhere else (`_agent_role`, `agent_detail`, `wake_sources` all reject
+    # it) and which the host desk's constitution forbids an agent to claim. A
+    # human cannot be put on an SLA by the machine that is waiting on them; the
+    # engine's own precedent is the attendance sweep — "only agents can be
+    # woken; a missing supervisor is a human problem and rides out on the
+    # escalation instead". So an agent's question to a human is surfaced (the
+    # message, the board, the escalation ladder if it matters) but never minted
+    # as machine-collectable debt. This ALSO closes a pre-existing hole: a
+    # non-reply agent message to the supervisor already created one.
+    if (mode == "one_to_one" and not preamble
+            and recipient in active_roles
+            and recipient != CONFIG.supervisor_role):
         due_at = store._iso(store._now() + dt.timedelta(seconds=meeting["wait_timeout_seconds"]))
         conn.execute(
             """INSERT INTO meeting_response_obligations

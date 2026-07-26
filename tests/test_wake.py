@@ -1592,3 +1592,44 @@ def test_a_closed_meetings_wake_request_raises_no_demand(desk):
         demands = [d for d in orch.collect_wake_demand(c)
                    if d["reason_kind"] == "meeting_wake"]
     assert demands == [], "a closed meeting must never wake anyone"
+
+
+def test_a_paused_meetings_owed_reply_raises_no_demand(desk):
+    """The payability rule from the collector's side. `m.state IN
+    ('active','consensus')` was written to mean "the debtor can still act", but
+    the mailbox retires a thread by PAUSING it — on the idle deadline or a spent
+    message budget — and that leaves meetings.state untouched. The debt then
+    outlived the conversation: the debtor could not send, so nothing discharged
+    it, and every planner tick re-raised it up the ladder to a person. Measured
+    at 114 attempts and 76 pages per 24h before this guard."""
+    status = meetings.call_meeting(agenda="polite finish", called_by="alpha",
+                                   attendees=["alpha", "beta"], idle_minutes=45)
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    mid = meetings.send_update(thread_id, role="alpha", kind="question",
+                               body="last word, over to you")["message_id"]
+    with orch.connect(write=True) as c:
+        c.execute("UPDATE meeting_response_obligations SET due_at=? WHERE message_id=?",
+                  (iso(-60), mid))
+
+    with orch.connect() as c:
+        assert [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"], "precondition: it is due"
+
+    # The thread goes quiet and the mailbox retires it. Nothing else changes.
+    with orch.connect(write=True) as c:
+        c.execute("UPDATE mailbox_threads SET status='paused',stop_reason='idle timeout' "
+                  "WHERE id=?", (thread_id,))
+
+    with orch.connect() as c:
+        assert [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"] == [], (
+            "a debt the debtor cannot pay must raise no demand")
+
+    # And it comes back by itself if the supervisor reopens the conversation.
+    with orch.connect(write=True) as c:
+        c.execute("UPDATE mailbox_threads SET status='open',stop_reason=NULL WHERE id=?",
+                  (thread_id,))
+    with orch.connect() as c:
+        assert [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"], "resuming makes it real again"

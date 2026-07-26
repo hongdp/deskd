@@ -192,16 +192,27 @@ def collect_wake_demand(conn: sqlite3.Connection) -> list[dict]:
     # means "never read it": this one means "read it and has not answered", and
     # only a wake fixes that. meetings used to page a human for this directly,
     # skipping every machine rung; it now leaves the rows and lets the ladder do
-    # its job. Restricted to live meetings for the same reason stuck_delivery
-    # skips closed threads — an obligation in a stopped meeting cannot be
-    # discharged by anything the agent does, so it would regenerate every tick
-    # and climb forever.
+    # its job.
+    #
+    # Two conditions, and the second is the one experience added: the demand
+    # must be PAYABLE. `m.state IN ('active','consensus')` was written to mean
+    # that, but a meeting has three terminal states and only one of them is
+    # `closed` — the mailbox retires a thread on its idle deadline or its spent
+    # message budget by pausing the THREAD, leaving meetings.state at 'active'
+    # or 'consensus'. In that shape the debtor is physically unable to answer
+    # (send_update refuses: "thread is paused"), so demand regenerated every
+    # tick and climbed to a human forever — 76 pages in 24h, measured, for a
+    # conversation both parties had politely finished. Requiring the thread to
+    # be open is what makes the comment above true; if the supervisor resumes
+    # the thread, the demand comes back on its own.
     for r in conn.execute(
             """SELECT o.message_id, o.thread_id, o.owed_by, o.created_at, m.agenda
                FROM meeting_response_obligations o
                JOIN meetings m ON m.thread_id=o.thread_id
+               JOIN mailbox_threads t ON t.id=o.thread_id
                WHERE o.status='pending' AND o.due_at<=?
-                 AND m.state IN ('active','consensus')""", (now_iso,)):
+                 AND m.state IN ('active','consensus')
+                 AND t.status='open'""", (now_iso,)):
         demands.append({"role": r["owed_by"], "reason_kind": "owed_reply",
                         "source_ref": f'{r["thread_id"]}:{r["message_id"]}',
                         "label": f'owes a reply in {r["agenda"]}',
@@ -425,6 +436,12 @@ def _wake_reasons_text(ds: list[dict]) -> str:
         parts.append(f'{len(by["meeting_wake"])} meeting(s) need you ({ags})')
     if by.get("stuck_delivery"):
         parts.append(f'{len(by["stuck_delivery"])} message(s) past their read SLA')
+    if by.get("owed_reply"):
+        # Without this the commonest wake of all reads "pending work" and names
+        # neither the meeting nor the message — an agent booted to answer
+        # something has to go hunting for what.
+        refs = ", ".join(sorted({str(d["label"]) for d in by["owed_reply"]}))
+        parts.append(f'{len(by["owed_reply"])} unanswered question(s) ({refs})')
     if by.get("urgent_task"):
         ts = ", ".join(sorted({str(d["label"]) for d in by["urgent_task"]}))
         parts.append(f'{len(by["urgent_task"])} urgent task(s) ({ts})')

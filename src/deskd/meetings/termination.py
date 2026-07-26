@@ -59,12 +59,11 @@ def _propose_end(conn: sqlite3.Connection, thread_id: str, role: str, resolution
         # you are the only *required* attendee, and _propose_end auto-confirms
         # its own proposer, so a single agent would silently close the human's
         # thread mid-sentence and take the mailbox down with it. Left open costs
-        # little: the idle deadline retires the thread on its own if it truly
-        # goes quiet. It is not free — a DM's last message obligates whoever it
-        # was addressed to, the human included — but an obligation is nudged,
-        # never enforced, and a supervisor-owed one is floored at the rung that
-        # leaves the machine (wake.py::_role_floor), so it reaches the person
-        # whose conversation it is and never spawns a session about it.
+        # nothing now: no obligation is ever owed BY the human (an SLA's
+        # enforcement arm wakes agents, and the supervisor is not one — see the
+        # guard in messaging._send_update), and the idle deadline retires the
+        # thread on its own if it truly goes quiet, after which the collector
+        # raises nothing for it.
         raise ValueError(
             "a one-to-one with the supervisor is theirs to end; leave it open")
     _resolve_obligations(
