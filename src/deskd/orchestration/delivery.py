@@ -6,6 +6,7 @@ overdue when nothing reacts).
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 from pathlib import Path
 
 from ..config import CONFIG
@@ -16,7 +17,7 @@ from .store import (_RECIPIENT_ALL, _iso, _role_params, connect)
 DELIVERY_STATES = {"queued", "notified", "read", "overdue", "escalated"}
 
 
-def sync_delivery(conn) -> int:
+def sync_delivery(conn: sqlite3.Connection) -> int:
     """Idempotently project the durable mailbox tables into message_delivery.
 
     Scope mirrors the transcript's authenticity filter: messages sent by a
@@ -68,7 +69,7 @@ def sync_delivery(conn) -> int:
     return len(pairs)
 
 
-def _wake_keys(conn) -> set:
+def _wake_keys(conn: sqlite3.Connection) -> set:
     """(thread, role) pairs with a PENDING wake request — the per-role signal that
     the system is actively re-driving delivery to that specific role RIGHT NOW.
 
@@ -87,7 +88,7 @@ def _wake_keys(conn) -> set:
         "SELECT thread_id, role FROM meeting_wake_requests WHERE status='pending'")}
 
 
-def _delivery_state(row, now_iso: str, wake: set) -> str:
+def _delivery_state(row: sqlite3.Row | dict, now_iso: str, wake: set) -> str:
     if row["read_at"]:
         return "read"
     if row["sla_due_at"] >= now_iso:            # still within SLA

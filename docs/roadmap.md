@@ -90,9 +90,11 @@ Same guarantee, new dimension.
 
 **Status: shipped in 0.1.3, except ingress adapters.** The terminal rung and
 the ledger/channel split are done: `deskd.channels` owns pluggable egress
-(meetings re-exports for back-compat), arrival at any `leaves_machine` rung
-writes a durable `wake_escalations` row for EVERY reason kind and mirrors it
-out post-commit, and the board states which channels are wired
+(`deskd.meetings` still resolves the six channel names for hosts that have not
+migrated, but that spelling is deprecated and warns), arrival at any
+`leaves_machine` rung writes a durable `wake_escalations` row for EVERY reason
+kind and mirrors it out post-commit, and the board states which channels are
+wired
 (`health.channels`, `health.human_rung_unwired`,
 `health.undelivered_escalations`). The supervisor-boundary extraction moved to
 P4 (decision 2026-07-19, see there): what this section originally described
@@ -294,6 +296,104 @@ supervisor boundary now has a file: `meetings/supervisor.py` holds exactly
 the verb allowlist, the claim-checked adapter, and the uninvited join, and
 nothing imports it — so extracting a generic `deskd.supervisor` becomes a
 move rather than an untangling.
+
+---
+
+## Known structural debt
+
+Found by a supervisor architecture review of `src/` (2026-07-26), recorded here
+rather than fixed, because in each case the fix is either cheaper *after* P4 or
+more expensive than the confusion it removes. An item earns its place on this
+list by having a stated reason it is not being done now; when the reason expires,
+it moves up into a numbered section or gets done.
+
+### `mailbox.py` is now the largest single module (990 lines)
+
+The meetings split broke a 2,248-line module into ten, and that promoted the
+mailbox to the biggest file in the repo — the next candidate on size alone.
+
+Size is the whole of the case, though, and the rest of it does not follow.
+Cohesion here is genuinely good — threads, messages and receipts are one thing,
+and the review workflow that grew alongside them reads the same rows — so a
+split would buy an extra import graph and none of the clarity. What made the
+meetings split worth doing was ten jobs tangled in one file. That is not this
+file's shape.
+
+More importantly, **the mailbox is the meetings substrate**. P4 pulls meetings
+out of the core, and the seam it pulls along is the mailbox's — `bounds` and
+`integrity` are extracted from exactly the transport that `mailbox.py` owns
+today. Splitting the mailbox first would draw file boundaries against a shape
+P4 is about to change, and then P4 would redraw them. So: not urgent, and
+explicitly ordered after P4.
+
+### Two clocks, two `store` modules
+
+`orchestration/store.py` and `meetings/store.py` each own their subpackage's
+schema, `connect()`, `_migrate()` and — the part that matters — their own
+`_now`. Both also define `_iso`, `_clean`, `_agent_role` and `_known_roles`.
+That is real duplication, and it reads like an obvious merge.
+
+It is deliberate, and today it is load-bearing. The clock is the *single patch
+point* for a subsystem's SLAs, and both are pinned by a test that says so
+(`test_presence.py`'s clock, and
+`test_meetings.py::test_the_meetings_clock_has_one_patch_point`). One merged
+clock is one patch point that two subsystems fight over: a meetings test that
+winds time forward 400s to fire an attendance timeout would also age every
+heartbeat into `dead` and every delivery past its SLA, and the test would then
+be asserting about a desk it did not mean to build. The migration split has
+already drawn blood in the other direction — `meetings.closed_at` was briefly
+migrated by orchestration's `_migrate`, which a meetings-only host never runs,
+so `list_meetings` raised `no such column` on every pre-existing DB and only the
+deployment shape nobody exercises broke.
+
+A merge becomes *possible* when P4 moves meetings out of the core (they stop
+being a peer layer and become a consumer with its own store, which is the same
+split drawn at a package boundary instead of inside one) or when the `bounds`
+and `integrity` primitives land and own the time-dependent invariants outright.
+Until one of those, the duplication is documented — see
+[`glossary.md`](glossary.md), *the two collisions* — and unifying it early would
+buy tidiness with a shared mutable seam.
+
+### Ten call-time `from . import views` upward imports
+
+`meetings/lifecycle.py` (3), `meetings/messaging.py` (2) and
+`meetings/termination.py` (5) each import `views` *inside* the function, because
+`views` sits above them in the package layering and importing it at module level
+would make the graph a cycle. The split's own docstring names this as the
+compromise it made.
+
+It is a compromise and not a lie — the module-level graph really is layered, and
+the deferred import is greppable — but ten of them is a smell with a cause: every
+protocol wrapper (`send_update`, `confirm_end`, `pause_meeting`, …) ends by
+handing back `views.meeting_status(...)` for the caller's convenience, and that
+one lightweight assembly is the only thing any of them wants from up there.
+
+The fix is to sink `meeting_status` — or the small status assembly underneath it
+— low enough that the wrappers stop calling up. That is not hard, but doing it as
+its own change is churn across three files for no behavior, and it touches
+precisely the functions P4's extraction rewrites when protocol and views land on
+opposite sides of a package boundary. It rides with P4.
+
+### The `escalation` name collision
+
+`meeting_escalations` (a per-meeting queue: attendance timeouts, an urgent call,
+consensus without the supervisor, a rejected end near the budget, an explicit
+hand-off) and `wake_escalations` (the wake ladder's durable human-rung outbox,
+retried for 24h) share a word and nothing else. `/escalations` shows both, which
+is right — it is the "how does this desk reach a person" page — and is also
+exactly where a reader first assumes they are the same ledger. The word is
+further overloaded by the meeting/thread *state* `escalated` and the delivery
+*state* `escalated`, which is not about humans at all.
+
+Renaming is a public-API break: both `list_escalations()` and
+`wake_escalations_recent()` are exported from their facades, the table names are
+on disk in every host's database, and `/api/escalations` is consumed by the
+console. That is a major-version change, and this collision is a documentation
+problem long before it is a compatibility problem.
+
+So the interim answer is [`glossary.md`](glossary.md), which pins each term with
+its table, its trigger list, its retry behavior and its console view. If a rename
+ever happens it rides a major version, with the glossary as the migration note.
 
 ---
 

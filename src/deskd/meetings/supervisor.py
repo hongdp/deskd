@@ -11,6 +11,7 @@ extracted, this file's contents move rather than untangle.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from .. import auth, mailbox
@@ -53,7 +54,7 @@ REQUIRED_SIGNED_FIELDS: dict[str, tuple[str, ...]] = {
 SUPERVISOR_ACTIONS = frozenset(REQUIRED_SIGNED_FIELDS)
 
 
-def _supervisor_join(conn, thread_id: str, auth_nonce: str) -> None:
+def _supervisor_join(conn: sqlite3.Connection, thread_id: str, auth_nonce: str) -> None:
     """The supervisor may drop into a meeting it was never invited to."""
     supervisor = CONFIG.supervisor_role
     meeting = _meeting(conn, thread_id)
@@ -170,6 +171,7 @@ def _apply_supervisor_payload(verified: auth.VerifiedAssertion, *,
             thread_id, role=supervisor, mark_read=bool(payload.get("mark_read", True)),
             auth_nonce=nonce, db_path=db_path,
         )
+    result: dict        # per-action payload; the shape follows the action
     with connect(db_path, write=True) as conn:
         if action == "join":
             _supervisor_join(conn, thread_id, nonce)

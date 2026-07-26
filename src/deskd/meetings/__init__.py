@@ -33,27 +33,23 @@ sweep.py). Submodule imports stay relative to the package so a violation is
 greppable.
 """
 
-# The public surface is unchanged by the package split: every name that lived
-# on the old single-module `deskd.meetings` — including the underscored
-# helpers the test suites pin — is re-exported here. Import from the facade;
-# the submodule layout (store -> obligations/escalations -> sweep ->
-# lifecycle/messaging/termination -> views -> supervisor) is an internal
+# The public surface is unchanged by the package split: every meetings name
+# that lived on the old single-module `deskd.meetings` — including the
+# underscored helpers the test suites pin — is re-exported here. Import from
+# the facade; the submodule layout (store -> obligations/escalations -> sweep
+# -> lifecycle/messaging/termination -> views -> supervisor) is an internal
 # layering, not API. The one upward call — the protocol wrappers handing back
 # views.meeting_status — is imported at call time so the module-level import
 # graph stays layered. The meetings clock is `meetings.store._now`; submodules
 # call it through the module attribute, so patch that single point (patching
 # the facade binding does not reach internal callers).
+#
+# The one shrinking part of that surface is the channel registry: see the
+# PEP 562 `__getattr__` at the bottom of this module.
+
+import warnings
 
 from .. import auth, mailbox  # noqa: F401  (the old module exposed them)
-from .. import channels as _channels  # noqa: F401
-# Channel machinery lives in `deskd.channels` (engine infrastructure, not a
-# meetings concern — the wake ladder's terminal rung dispatches through it
-# too). Re-exported because hosts historically registered channels via this
-# module; both spellings stay valid.
-from ..channels import (  # noqa: F401  (re-exports)
-    OUTBOX_CHANNEL, CallableChannel, EscalationChannel,
-    register_channel, registered_channels, unregister_channel,
-)
 from ..config import CONFIG, PROJECT_NAME  # noqa: F401  (ditto)
 from .store import (  # noqa: F401
     BROADCAST, DEFAULT_CONSENSUS_THRESHOLD, DEFAULT_IDLE_MINUTES,
@@ -98,3 +94,59 @@ from .supervisor import (  # noqa: F401
     _supervisor_join, apply_simple_supervisor_action,
     apply_supervisor_assertion, apply_supervisor_assertion_bytes,
 )
+
+# --- deprecated: the channel registry was never a meetings concern -----------
+
+# Channel machinery lives in `deskd.channels` — engine infrastructure, not
+# part of the meeting protocol: the wake ladder's terminal rung dispatches
+# through the same registry without a meeting anywhere in sight. These six
+# names sat here only because hosts historically registered their pager or
+# chat webhook through this module, and an import that says `meetings` teaches
+# the wrong mental model for a process-wide egress registry. They still
+# resolve — same objects, one registry, so a channel registered through either
+# spelling is visible to both — but the old spelling now warns.
+_DEPRECATED_CHANNEL_NAMES = frozenset({
+    "OUTBOX_CHANNEL", "CallableChannel", "EscalationChannel",
+    "register_channel", "registered_channels", "unregister_channel",
+})
+
+#: Star-import reads `__dict__` directly and never consults `__getattr__`, so
+#: without an explicit `__all__` the six names would silently disappear from
+#: `from deskd.meetings import *` — a NameError at the call site much later,
+#: which is the failure mode this shim exists to prevent. Naming them here
+#: routes star-import through `__getattr__`, so it still warns.
+#: Removal horizon: the shim goes away when meetings leaves the core (P4);
+#: until then every release keeps it.
+__all__ = sorted(set(globals()) | _DEPRECATED_CHANNEL_NAMES)
+
+
+def __getattr__(name: str):
+    """Resolve the moved channel names from `deskd.channels`, deprecated.
+
+    PEP 562: a module-level `__getattr__` is what a plain attribute access
+    AND a `from deskd.meetings import CallableChannel` both fall through to
+    once the static re-export is gone, so removing the re-export does not
+    break a host that has not migrated yet. (Do not read the warning count as
+    a call count: importing a *name* from a *package* probes the attribute
+    once through `hasattr` — importlib deciding whether the name is a
+    submodule — before the IMPORT_FROM opcode reads it again, so one
+    `from`-import raises this warning twice.)
+    """
+    if name in _DEPRECATED_CHANNEL_NAMES:
+        warnings.warn(
+            f"deskd.meetings.{name} is deprecated: escalation channels are "
+            f"engine infrastructure, not a meetings concern. Use "
+            f"`from deskd import channels` and `deskd.channels.{name}`.",
+            DeprecationWarning, stacklevel=2,
+        )
+        from .. import channels
+        return getattr(channels, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """PEP 562's other half. `__getattr__` alone leaves the deprecated names
+    out of `dir()`, which silently breaks REPL completion and any capability
+    probe written as `"register_channel" in dir(meetings)` — that probe would
+    take the not-supported branch instead of getting the deprecation."""
+    return sorted(set(globals()) | _DEPRECATED_CHANNEL_NAMES)

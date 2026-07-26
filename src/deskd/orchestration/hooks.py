@@ -7,7 +7,10 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import sqlite3
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from . import store
 from ..config import CONFIG
@@ -62,7 +65,7 @@ def _next_cron_fire(expr: str, tzname: str, after: dt.datetime) -> str | None:
     dows = _cron_field(parts[4], 0, 6)
     try:
         from zoneinfo import ZoneInfo
-        tz = ZoneInfo(tzname)
+        tz: dt.tzinfo = ZoneInfo(tzname)
     except Exception:
         tz = CONFIG.tzinfo()
     t = after.astimezone(tz).replace(second=0, microsecond=0) + dt.timedelta(minutes=1)
@@ -90,7 +93,7 @@ def _probe_path_ok(path: str) -> bool:
     return False
 
 
-def _resolve_probe(path: str):
+def _resolve_probe(path: str) -> Callable[[], Any]:
     """Import a 'module:function' probe, restricted to CONFIG.probe_allowlist.
 
     A probe may only OBSERVE and NOTIFY: its return value is turned into inbox
@@ -136,6 +139,7 @@ def hook_add(owner_role: str, title: str, *, at: str | None = None,
         raise ValueError(f"invalid priority: {priority}")
     now = store._now()
     spec: dict = {}
+    next_fire: str | None      # 'at'/'cron' may not resolve; the branches check
     if callable_path:
         _resolve_probe(callable_path)  # fail fast on disallowed / missing probe
         kind = "probe"
@@ -209,7 +213,7 @@ def hook_cancel(hook_id: int, *, actor: str | None = None,
         return bool(cur.rowcount)
 
 
-def _eval_wake_hooks(conn, now: dt.datetime) -> list[dict]:
+def _eval_wake_hooks(conn: sqlite3.Connection, now: dt.datetime) -> list[dict]:
     """Evaluate due hooks inside the caller's write txn; fire -> inbox items.
 
     A probe that raises CONFIG.max_error_streak times in a row is auto-disabled
@@ -254,7 +258,7 @@ def _eval_wake_hooks(conn, now: dt.datetime) -> list[dict]:
                               body=err, ref=f"hook:{h['id']}", priority="normal",
                               dedup_key=f"hook-error:{h['id']}")
             else:
-                nxt = _iso(now + dt.timedelta(
+                nxt: str | None = _iso(now + dt.timedelta(
                     seconds=int(spec.get("every", CONFIG.default_probe_every))))
                 conn.execute(
                     "UPDATE wake_hooks SET error_streak=?, last_error=?, "

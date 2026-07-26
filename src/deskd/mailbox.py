@@ -52,6 +52,7 @@ import hashlib
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -210,7 +211,7 @@ def _iso(value: dt.datetime) -> str:
 # --- connection -------------------------------------------------------------
 
 @contextmanager
-def connect(db_path: Path | str | None = None):
+def connect(db_path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
     """Open the coordination database with the engine's durability settings.
 
     WAL lets a reader (an agent polling its inbox) proceed while a writer
