@@ -4,8 +4,10 @@ name: tests
 # re-runs the suite before publishing; this exists so main always carries a
 # fresh signal (and the README badge tells the truth).
 #
-# httpx is test-only: fastapi's TestClient transports through it, and the
-# package deliberately doesn't depend on it.
+# httpx/httpx2 are test-only: starlette's TestClient transports through
+# httpx (older releases) or httpx2 (2026+ releases) depending on which
+# starlette the fresh resolve picks; installing both keeps this green across
+# the migration. The package deliberately depends on neither.
 
 on:
   push:
@@ -23,5 +25,5 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install -e ".[web]" pytest httpx
+      - run: python -m pip install -e ".[web]" pytest httpx httpx2
       - run: python -m pytest -q
