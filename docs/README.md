@@ -9,9 +9,14 @@ index you can read in one screen beats navigation you have to maintain.
 - [`security.md`](security.md) — threat model, the supervisor boundary
   (`simple` / `signed` / `hybrid` / the `open`-mode surrender), probes, and
   one-session-per-role.
+- [`glossary.md`](glossary.md) — the vocabulary, and the two words that name two
+  different things: `escalation` (a per-meeting queue **and** the wake ladder's
+  human-rung outbox) and `store` (one module per subpackage, with two
+  independent clocks). Read it before you conclude a guarantee applies.
 - [`roadmap.md`](roadmap.md) — where this is going, **in dependency order**;
   each item says what it unlocks, what it must wait for, and which claims are
-  still untested.
+  still untested. Ends with the known structural debt and why each piece is
+  not being fixed yet.
 - [`images/`](images/) — console screenshots (light/dark pairs), captured from
   the seeded demo desk in
   [`examples/support_desk/`](../examples/support_desk/README.md) — never from
