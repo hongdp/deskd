@@ -756,6 +756,71 @@ def test_a_stopped_meetings_owed_reply_stops_waking_anyone(desk):
     )
 
 
+def _supervisor_owed_setup() -> tuple[str, int]:
+    """An obligation owed by the SUPERVISOR — a person, with no session at all.
+
+    The supervisor can genuinely owe a meeting reply, so the demand is real; what
+    changes is that no machine rung can possibly discharge it.
+    """
+    thread_id, mid = _owed_setup()
+    with orch.connect(write=True) as c:
+        c.execute("UPDATE meeting_response_obligations SET owed_by=? WHERE message_id=?",
+                  (CONFIG.supervisor_role, mid))
+    return thread_id, mid
+
+
+def _owed_attempts() -> list[dict]:
+    return [a for a in _open_attempts() if a["reason_kind"] == "owed_reply"]
+
+
+def test_a_supervisor_owed_reply_opens_on_a_human_rung(desk):
+    """The inverse of the rule one branch up, and it bit for real on 2026-07-26.
+
+    A slow AGENT must not open on a rung that pulls a person in — but the
+    supervisor IS the person. Starting this demand on the machine rungs spawned a
+    headless session every ~38 minutes for hours, each handed a prompt telling it
+    to declare itself the supervisor, which the engine forbids outright. There is
+    no session to resume and nothing to spawn: the only rung that can discharge a
+    human's obligation is one that leaves the machine.
+    """
+    thread_id, mid = _supervisor_owed_setup()
+
+    with orch.connect() as c:
+        owed = [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"]
+    assert [(d["role"], d["source_ref"]) for d in owed] == [
+        (CONFIG.supervisor_role, f"{thread_id}:{mid}")]
+
+    orch.plan_wakes()
+    attempt = _owed_attempts()
+    assert len(attempt) == 1 and attempt[0]["role"] == CONFIG.supervisor_role
+    assert CONFIG.wake_ladder[attempt[0]["level"]].leaves_machine, (
+        "a demand owed by a person must never occupy a rung that only boots agents")
+    assert _rows("SELECT * FROM wake_escalations"), (
+        "arriving on a human rung must leave the terminal sink's durable row")
+
+
+def test_a_supervisor_owed_reply_does_not_recycle_back_onto_spawn(desk):
+    """The recycle is what made this permanent rather than merely wrong.
+
+    terminal_retry_seconds drops a parked demand back to the machine rungs so a
+    transient outage cannot strand it. For a supervisor-owed demand that reset
+    lands on `spawn` again — so the loop re-armed itself every cycle and would
+    have run until someone noticed. The floor has to hold on the way back down.
+    """
+    _supervisor_owed_setup()
+    orch.plan_wakes()
+    while _owed_attempts()[0]["level"] < len(CONFIG.wake_ladder) - 1:
+        _escalate_once()
+
+    _backdate(CONFIG.terminal_retry_seconds + 60)
+    orch.plan_wakes()
+    recycled = _owed_attempts()
+    assert len(recycled) == 1
+    assert CONFIG.wake_ladder[recycled[0]["level"]].leaves_machine, (
+        "the recycle must not hand a human's obligation back to the spawner")
+
+
 # --- 11. an idle agent is woken for its own queue ----------------------------
 
 def _idle_attempts() -> list[dict]:

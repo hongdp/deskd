@@ -89,6 +89,32 @@ def _reason_ceiling(reason_kind: str, ladder) -> int:
         return len(ladder) - 1
     return _human_level(ladder) - 1
 
+
+def _role_floor(role: str, ladder) -> int:
+    """The LOWEST rung a demand OWED BY this role may occupy.
+
+    Mirror image of _reason_ceiling, and it exists for the mirror-image reason.
+    Every machine rung ends in the same act: boot or resume a SESSION for the
+    role that owes the thing. That is incoherent when the role is the
+    SUPERVISOR, who is a person and enters only through the authenticated
+    console — there is no session to resume and nothing to spawn. What actually
+    happened (2026-07-26) is worse than a no-op: a supervisor-owed meeting reply
+    started at `spawn`, so the orchestrator launched a headless agent session
+    every ~38 minutes for hours and handed each one a prompt telling it to
+    declare itself the supervisor. The engine's own invariant forbids exactly
+    that (store.py: "supervisor is not an agent role"), so every one of those
+    sessions could do nothing but refuse and burn a session.
+
+    Scoped by ROLE, not by reason kind: any demand can name the supervisor as
+    the owed party (owed_reply does today; stuck_delivery can, since a
+    supervisor can leave a message unread), and every one of them wants the same
+    routing. A person is reached by leaving the machine — so that is where these
+    demands start, and the machine rungs below are skipped, not climbed through.
+    """
+    if role != CONFIG.supervisor_role:
+        return 0
+    return _human_level(ladder)
+
 #: Wake reasons that may never climb to a rung that leaves the machine.
 #:
 #: The ladder exists because a MESSAGE MUST LAND: it keeps climbing until someone
@@ -533,16 +559,25 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
             ceiling = _reason_ceiling(d["reason_kind"], ladder)
             if ceiling < 0:
                 continue
+            # The floor (see _role_floor) can outrank the ceiling: that reads as
+            # "must reach a person, may never reach a person". Unsatisfiable, so
+            # the demand is not raised rather than resolved towards either rule —
+            # honouring the ceiling would spawn sessions for a human, honouring
+            # the floor would page a person for a to-do list.
+            floor = _role_floor(d["role"], ladder)
+            if floor > ceiling:
+                continue
             cur = pend.get((d["role"], d["reason_kind"], d["source_ref"]))
             if cur is None:
-                lvl = min(_start_level(pres.get(d["role"]), ladder), ceiling)
+                lvl = max(min(_start_level(pres.get(d["role"]), ladder), ceiling), floor)
                 if record:
                     _insert_attempt(conn, d, lvl, now_iso, ladder)
                     _log_event(conn, "orchestrator", "wake_attempt", d["source_ref"],
                                {"role": d["role"], "reason": d["reason_kind"],
                                 "level": lvl, "channel": ladder[lvl].channel})
-                # Only a host-defined ladder can START a demand on a human rung,
-                # but arrival is arrival: the sink must fire here too.
+                # A host-defined ladder, or a role floor (_role_floor), can START
+                # a demand on a human rung; arrival is arrival either way, so the
+                # sink must fire here too.
                 if ladder[lvl].leaves_machine:
                     esc_ids.append(_queue_wake_escalation(conn, d, lvl, now_iso))
                 changed.append({**d, "level": lvl, "escalated": False})
@@ -596,7 +631,10 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
                     # escalation ledger keeps the badge red; the machine keeps
                     # trying. No new escalation is queued by the recycle itself
                     # — one fires only if the ladder genuinely climbs back up.
-                    nl = min(_start_level(pres.get(d["role"]), ladder), ceiling)
+                    # The floor applies to the recycle too, or a supervisor-owed
+                    # demand would drop back onto `spawn` every cycle: that is
+                    # precisely the loop _role_floor was added to end.
+                    nl = max(min(_start_level(pres.get(d["role"]), ladder), ceiling), floor)
                     if record:
                         conn.execute(
                             "UPDATE wake_attempts SET outcome='superseded', resolved_at=? "
