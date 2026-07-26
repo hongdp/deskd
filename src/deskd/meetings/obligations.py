@@ -6,12 +6,13 @@ sideways.
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Sequence
 
 from . import store
 
 
-def _resolve_obligations(conn, thread_id: str, role: str, *,
+def _resolve_obligations(conn: sqlite3.Connection, thread_id: str, role: str, *,
                          resolution: str, reply_message_id: int | None = None) -> int:
     now = store._iso()
     cursor = conn.execute(
@@ -23,7 +24,7 @@ def _resolve_obligations(conn, thread_id: str, role: str, *,
     return int(cursor.rowcount)
 
 
-def _discharge_obligations(conn, thread_id: str, role: str,
+def _discharge_obligations(conn: sqlite3.Connection, thread_id: str, role: str,
                            message_ids: Sequence[int], by_message_id: int,
                            now: str | None = None) -> list[int]:
     """Settle obligations owed BY `role`, citing `role`'s own covering message.
@@ -71,7 +72,8 @@ def _discharge_obligations(conn, thread_id: str, role: str,
     return discharged
 
 
-def _waive_pending_obligations(conn, thread_id: str, reason: str) -> int:
+def _waive_pending_obligations(conn: sqlite3.Connection, thread_id: str,
+                               reason: str) -> int:
     now = store._iso()
     cursor = conn.execute(
         """UPDATE meeting_response_obligations

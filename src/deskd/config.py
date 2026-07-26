@@ -209,7 +209,7 @@ class EngineConfig:
     def role_names(self) -> tuple[str, ...]:
         return tuple(r.name for r in self.roles)
 
-    def tzinfo(self):
+    def tzinfo(self) -> dt.tzinfo:
         try:
             from zoneinfo import ZoneInfo
             return ZoneInfo(self.timezone)
@@ -222,7 +222,7 @@ class EngineConfig:
 CONFIG = EngineConfig()
 
 
-def configure(**kwargs) -> EngineConfig:
+def configure(**kwargs: object) -> EngineConfig:
     """Convenience: mutate the process-wide default config."""
     for k, v in kwargs.items():
         if not hasattr(CONFIG, k):

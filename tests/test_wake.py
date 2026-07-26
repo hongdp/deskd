@@ -733,6 +733,71 @@ def test_answering_retires_the_owed_reply_attempt(desk):
     assert _attempts()[-1]["outcome"] == "acked"
 
 
+def test_a_supervisor_question_asked_as_a_reply_becomes_wake_demand(desk):
+    """The live 2026-07-26 failure, end to end and from the consumer's side.
+
+    The console sets reply_to on a supervisor message whenever the supervisor
+    owes a reply, and _send_update treated "settles a debt" and "creates a debt"
+    as mutually exclusive — so the supervisor's question discharged its own
+    obligation and minted none. Nothing downstream could fire, because there was
+    no row for anything downstream to read: no SLA, no overdue sweep, and, here,
+    no owed_reply demand at all. The analyst never answered and no rung of the
+    ladder ever climbed.
+    """
+    called = meetings.apply_simple_supervisor_action(
+        {"action": "call", "agenda": "one on one", "attendees": ["alpha"],
+         "wait_timeout_seconds": 30})
+    thread_id = called["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="alpha")
+    ask = meetings.apply_simple_supervisor_action(
+        {"action": "send", "meeting_id": thread_id, "body": "what is the risk"},
+    )["message_id"]
+    answer = meetings.send_update(thread_id, role="alpha", kind="answer",
+                                  reply_to=ask, body="concentration")["message_id"]
+    # The supervisor answers WITH a question — discharging its turn and asking.
+    followup = meetings.apply_simple_supervisor_action(
+        {"action": "send", "meeting_id": thread_id, "reply_to": answer,
+         "body": "understood. so can we buy apple"},
+    )["message_id"]
+    with orch.connect(write=True) as c:
+        c.execute("UPDATE meeting_response_obligations SET due_at=? WHERE message_id=?",
+                  (iso(-60), followup))
+
+    with orch.connect() as c:
+        owed = [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"]
+    assert [(d["role"], d["source_ref"]) for d in owed] == [
+        ("alpha", f"{thread_id}:{followup}")], (
+        "a question the supervisor asked while answering must still be owed")
+
+    orch.plan_wakes()
+    assert [a["role"] for a in _open_attempts()
+            if a["reason_kind"] == "owed_reply"] == ["alpha"]
+
+
+def test_closing_by_handshake_retires_an_owed_reply_the_way_force_close_does(desk):
+    """Every message owes a reply, so the LAST message of every one-to-one
+    meeting leaves a debt by construction — and the ordinary way a meeting ends
+    is the agents' own handshake, not a supervisor override. Both routes go
+    through _close_meeting, which waives the ledger; collect_wake_demand's state
+    clause is the second line of defence, not the only one."""
+    thread_id, mid = _owed_setup()
+    orch.plan_wakes()
+    assert [a["role"] for a in _open_attempts()
+            if a["reason_kind"] == "owed_reply"] == ["beta"]
+
+    meetings.propose_end(thread_id, role="beta", resolution="answered offline")
+    assert meetings.confirm_end(thread_id, role="alpha")["closed"] is True
+
+    assert [o for o in meetings.meeting_status(thread_id)["response_obligations"]
+            if o["status"] == "pending"] == [], "the ledger is settled, not merely ignored"
+    with orch.connect() as c:
+        assert [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"] == []
+    orch.plan_wakes()
+    assert [a for a in _open_attempts() if a["reason_kind"] == "owed_reply"] == []
+
+
 def test_a_stopped_meetings_owed_reply_stops_waking_anyone(desk):
     """Same trap the stuck_delivery branch documents: an obligation in a meeting
     nobody can rejoin cannot be discharged by anything the agent does, so a
@@ -1527,3 +1592,44 @@ def test_a_closed_meetings_wake_request_raises_no_demand(desk):
         demands = [d for d in orch.collect_wake_demand(c)
                    if d["reason_kind"] == "meeting_wake"]
     assert demands == [], "a closed meeting must never wake anyone"
+
+
+def test_a_paused_meetings_owed_reply_raises_no_demand(desk):
+    """The payability rule from the collector's side. `m.state IN
+    ('active','consensus')` was written to mean "the debtor can still act", but
+    the mailbox retires a thread by PAUSING it — on the idle deadline or a spent
+    message budget — and that leaves meetings.state untouched. The debt then
+    outlived the conversation: the debtor could not send, so nothing discharged
+    it, and every planner tick re-raised it up the ladder to a person. Measured
+    at 114 attempts and 76 pages per 24h before this guard."""
+    status = meetings.call_meeting(agenda="polite finish", called_by="alpha",
+                                   attendees=["alpha", "beta"], idle_minutes=45)
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    mid = meetings.send_update(thread_id, role="alpha", kind="question",
+                               body="last word, over to you")["message_id"]
+    with orch.connect(write=True) as c:
+        c.execute("UPDATE meeting_response_obligations SET due_at=? WHERE message_id=?",
+                  (iso(-60), mid))
+
+    with orch.connect() as c:
+        assert [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"], "precondition: it is due"
+
+    # The thread goes quiet and the mailbox retires it. Nothing else changes.
+    with orch.connect(write=True) as c:
+        c.execute("UPDATE mailbox_threads SET status='paused',stop_reason='idle timeout' "
+                  "WHERE id=?", (thread_id,))
+
+    with orch.connect() as c:
+        assert [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"] == [], (
+            "a debt the debtor cannot pay must raise no demand")
+
+    # And it comes back by itself if the supervisor reopens the conversation.
+    with orch.connect(write=True) as c:
+        c.execute("UPDATE mailbox_threads SET status='open',stop_reason=NULL WHERE id=?",
+                  (thread_id,))
+    with orch.connect() as c:
+        assert [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "owed_reply"], "resuming makes it real again"

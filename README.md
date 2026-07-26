@@ -250,6 +250,7 @@ deliberately unlike a trading desk, you are the second host we're looking for.
 
 - [`docs/design.md`](docs/design.md) — architecture and the decisions behind it
 - [`docs/security.md`](docs/security.md) — threat model and the supervisor boundary
+- [`docs/glossary.md`](docs/glossary.md) — the vocabulary, including the two words that name two different things
 - [`docs/roadmap.md`](docs/roadmap.md) — where this is going, in dependency order
 - [`examples/support_desk/`](examples/support_desk/README.md) — the runnable demo
 - [`skills/agent-orchestration/`](skills/agent-orchestration/) — a skill teaching an agent to operate and evolve a deskd desk

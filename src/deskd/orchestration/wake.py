@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 from .. import channels, meetings
 from . import store
-from ..config import CONFIG, PROJECT_NAME
+from ..config import CONFIG, PROJECT_NAME, WakeRung
 from .delivery import _delivery_state, _wake_keys, sync_delivery
 from .hooks import _eval_wake_hooks
 from .inbox import _inbox_sort_key, _route_unroutable
@@ -28,12 +30,13 @@ WAKE_REASONS = {"meeting_wake", "stuck_delivery", "urgent_task", "owed_reply",
                 "inbox", "idle_task"}
 
 
-def _ladder():
+def _ladder() -> tuple[WakeRung, ...]:
     """The escalation ladder in effect (CONFIG.wake_ladder)."""
     return CONFIG.wake_ladder
 
 
-def _channel_level(ladder, channel: str, fallback: int) -> int:
+def _channel_level(ladder: tuple[WakeRung, ...], channel: str,
+                   fallback: int) -> int:
     """Index of the rung with `channel`, or a clamped fallback.
 
     Levels are ladder INDICES, so nothing may assume a fixed number here: a host
@@ -45,7 +48,7 @@ def _channel_level(ladder, channel: str, fallback: int) -> int:
     return max(0, min(fallback, len(ladder) - 1))
 
 
-def _human_level(ladder) -> int:
+def _human_level(ladder: tuple[WakeRung, ...]) -> int:
     """First rung that leaves the machine (a human is being pulled in).
 
     Used for the 'wakes at human level' health counter — the number that should
@@ -63,7 +66,7 @@ def _human_level(ladder) -> int:
     return max(0, len(ladder) - 2)
 
 
-def _reason_ceiling(reason_kind: str, ladder) -> int:
+def _reason_ceiling(reason_kind: str, ladder: tuple[WakeRung, ...]) -> int:
     """The highest rung this reason may ever occupy. -1 = it may not wake at all.
 
     HARD RULE: a task wake must NEVER page a person. The ladder climbs because a
@@ -99,7 +102,7 @@ def _reason_ceiling(reason_kind: str, ladder) -> int:
 #: that it always resolves quickly (see _reason_ceiling).
 MACHINE_ONLY_REASONS = frozenset({"idle_task"})
 
-def _idle_task_demand(conn, role: str, now: dt.datetime) -> dict | None:
+def _idle_task_demand(conn: sqlite3.Connection, role: str, now: dt.datetime) -> dict | None:
     """THE idle_task predicate — the demand, or None. Nothing else defines it.
 
     "Soft deadlines never wake" was written against INTERRUPTION: deadlines shape
@@ -132,7 +135,7 @@ def _idle_task_demand(conn, role: str, now: dt.datetime) -> dict | None:
             "since_at": min(t["created_at"] for t in actionable)}
 
 
-def collect_wake_demand(conn) -> list[dict]:
+def collect_wake_demand(conn: sqlite3.Connection) -> list[dict]:
     """Unify the DB-derived wake demands.
 
     Note: task ``due_at`` is deliberately NOT a source — soft deadlines never
@@ -189,16 +192,27 @@ def collect_wake_demand(conn) -> list[dict]:
     # means "never read it": this one means "read it and has not answered", and
     # only a wake fixes that. meetings used to page a human for this directly,
     # skipping every machine rung; it now leaves the rows and lets the ladder do
-    # its job. Restricted to live meetings for the same reason stuck_delivery
-    # skips closed threads — an obligation in a stopped meeting cannot be
-    # discharged by anything the agent does, so it would regenerate every tick
-    # and climb forever.
+    # its job.
+    #
+    # Two conditions, and the second is the one experience added: the demand
+    # must be PAYABLE. `m.state IN ('active','consensus')` was written to mean
+    # that, but a meeting has three terminal states and only one of them is
+    # `closed` — the mailbox retires a thread on its idle deadline or its spent
+    # message budget by pausing the THREAD, leaving meetings.state at 'active'
+    # or 'consensus'. In that shape the debtor is physically unable to answer
+    # (send_update refuses: "thread is paused"), so demand regenerated every
+    # tick and climbed to a human forever — 76 pages in 24h, measured, for a
+    # conversation both parties had politely finished. Requiring the thread to
+    # be open is what makes the comment above true; if the supervisor resumes
+    # the thread, the demand comes back on its own.
     for r in conn.execute(
             """SELECT o.message_id, o.thread_id, o.owed_by, o.created_at, m.agenda
                FROM meeting_response_obligations o
                JOIN meetings m ON m.thread_id=o.thread_id
+               JOIN mailbox_threads t ON t.id=o.thread_id
                WHERE o.status='pending' AND o.due_at<=?
-                 AND m.state IN ('active','consensus')""", (now_iso,)):
+                 AND m.state IN ('active','consensus')
+                 AND t.status='open'""", (now_iso,)):
         demands.append({"role": r["owed_by"], "reason_kind": "owed_reply",
                         "source_ref": f'{r["thread_id"]}:{r["message_id"]}',
                         "label": f'owes a reply in {r["agenda"]}',
@@ -222,7 +236,7 @@ def collect_wake_demand(conn) -> list[dict]:
     return demands
 
 
-def _demand_resolved(conn, role: str, reason_kind: str, source_ref: str,
+def _demand_resolved(conn: sqlite3.Connection, role: str, reason_kind: str, source_ref: str,
                      now_iso: str) -> tuple[bool, str]:
     """Closed-loop check: has the underlying demand been satisfied?"""
     if reason_kind == "meeting_wake":
@@ -342,7 +356,7 @@ def _demand_resolved(conn, role: str, reason_kind: str, source_ref: str,
     return (True, "acked")
 
 
-def _start_level(p: dict | None, ladder) -> int:
+def _start_level(p: dict | None, ladder: tuple[WakeRung, ...]) -> int:
     """Which rung a brand-new demand starts on, given the role's presence."""
     spawn = _channel_level(ladder, "spawn", 2)
     if p is None:
@@ -354,7 +368,8 @@ def _start_level(p: dict | None, ladder) -> int:
     return spawn                                  # no live/resumable session
 
 
-def _insert_attempt(conn, d: dict, level: int, now_iso: str, ladder) -> int:
+def _insert_attempt(conn: sqlite3.Connection, d: dict, level: int, now_iso: str,
+                    ladder: tuple[WakeRung, ...]) -> int:
     channel = ladder[level].channel
     cur = conn.execute(
         """INSERT INTO wake_attempts
@@ -366,7 +381,7 @@ def _insert_attempt(conn, d: dict, level: int, now_iso: str, ladder) -> int:
     return cur.lastrowid
 
 
-def _queue_wake_escalation(conn, d: dict, level: int, now_iso: str) -> int:
+def _queue_wake_escalation(conn: sqlite3.Connection, d: dict, level: int, now_iso: str) -> int:
     """Durable half of the human rung, written on ARRIVAL at a leaves_machine
     rung — once per climb, inside the planning transaction. The row exists
     whether or not any channel is registered; dispatch mirrors it out after
@@ -421,6 +436,12 @@ def _wake_reasons_text(ds: list[dict]) -> str:
         parts.append(f'{len(by["meeting_wake"])} meeting(s) need you ({ags})')
     if by.get("stuck_delivery"):
         parts.append(f'{len(by["stuck_delivery"])} message(s) past their read SLA')
+    if by.get("owed_reply"):
+        # Without this the commonest wake of all reads "pending work" and names
+        # neither the meeting nor the message — an agent booted to answer
+        # something has to go hunting for what.
+        refs = ", ".join(sorted({str(d["label"]) for d in by["owed_reply"]}))
+        parts.append(f'{len(by["owed_reply"])} unanswered question(s) ({refs})')
     if by.get("urgent_task"):
         ts = ", ".join(sorted({str(d["label"]) for d in by["urgent_task"]}))
         parts.append(f'{len(by["urgent_task"])} urgent task(s) ({ts})')
@@ -443,7 +464,8 @@ def _wake_prompt(role: str, ds: list[dict], inbox_items: list[dict] | None = Non
 
 
 @contextmanager
-def _planning_txn(db_path, *, record: bool):
+def _planning_txn(db_path: Path | str | None, *,
+                  record: bool) -> Iterator[sqlite3.Connection]:
     """The transaction one tick of ``plan_wakes`` runs in.
 
     A dry run does the SAME work — it must, because the plan needs the delivery

@@ -49,7 +49,7 @@ REVIEW_STAGES = ("report", "review", "finalize")
 
 # NOTE: escalation channels are deliberately NOT a choices list. The engine
 # ships no channels beyond `auto` and `outbox`; a host registers its own at
-# startup (meetings.register_channel), so the valid set is only known at
+# startup (channels.register_channel), so the valid set is only known at
 # runtime — exactly like roles. The engine rejects an unknown channel and names
 # the ones it knows.
 
@@ -62,7 +62,7 @@ def _task_sources() -> tuple[str, ...]:
 
 # --- output -----------------------------------------------------------------
 
-def _emit(out) -> None:
+def _emit(out: object) -> None:
     """One JSON document per invocation, on stdout. ``default=str`` keeps
     stray datetimes/Paths from turning an engine result into a crash."""
     print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
@@ -391,8 +391,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 # --- dispatch ---------------------------------------------------------------
 
-def _cmd_status(args) -> None:
+def _cmd_status(args: argparse.Namespace) -> None:
     from . import orchestration as orch
+    out: dict | list        # a show/list subcommand returns rows
     if args.status_cmd == "set":
         out = orch.set_status(args.role, state=args.state, activity=args.activity,
                               session_id=args.session_id, harness=args.harness)
@@ -404,8 +405,9 @@ def _cmd_status(args) -> None:
     _emit(out)
 
 
-def _cmd_task(args) -> None:
+def _cmd_task(args: argparse.Namespace) -> None:
     from . import orchestration as orch
+    out: dict | list        # a show/list subcommand returns rows
     if args.task_cmd == "add":
         tid = orch.task_add(args.title, assignee_role=args.assignee,
                             detail=args.detail, priority=args.priority,
@@ -428,8 +430,9 @@ def _cmd_task(args) -> None:
     _emit(out)
 
 
-def _cmd_inbox(args) -> None:
+def _cmd_inbox(args: argparse.Namespace) -> None:
     from . import orchestration as orch
+    out: dict | list        # a show/list subcommand returns rows
     if args.inbox_cmd == "enqueue":
         iid = orch.inbox_enqueue(args.target, args.source, args.title,
                                  body=args.body, ref=args.ref,
@@ -446,8 +449,9 @@ def _cmd_inbox(args) -> None:
     _emit(out)
 
 
-def _cmd_wake(args) -> None:
+def _cmd_wake(args: argparse.Namespace) -> None:
     from . import orchestration as orch
+    out: dict | list        # a show/list subcommand returns rows
     if args.wake_cmd == "tick":
         # --dry must not mutate: no attempt rows, no escalation, no delivery
         # marks. It is the only safe way to inspect the plan from a session.
@@ -459,8 +463,9 @@ def _cmd_wake(args) -> None:
     _emit(out)
 
 
-def _cmd_hook(args) -> None:
+def _cmd_hook(args: argparse.Namespace) -> None:
     from . import orchestration as orch
+    out: dict | list        # a show/list subcommand returns rows
     if args.hook_cmd == "add":
         # Probe paths are validated fail-fast at registration against
         # CONFIG.probe_allowlist — never at fire time, when nobody is watching.
@@ -474,12 +479,12 @@ def _cmd_hook(args) -> None:
     _emit(out)
 
 
-def _cmd_session(args) -> None:
+def _cmd_session(args: argparse.Namespace) -> None:
     from . import orchestration as orch
     _emit(orch.rollover_plan(record=not args.dry))
 
 
-def _cmd_delivery(args) -> None:
+def _cmd_delivery(args: argparse.Namespace) -> None:
     from . import orchestration as orch
     _emit(orch.delivery_ledger(args.meeting))
 
@@ -492,8 +497,9 @@ def _roles_arg(value: str | None) -> list[str] | None:
     return [r.strip() for r in value.split(",") if r.strip()]
 
 
-def _cmd_meeting(args) -> None:
+def _cmd_meeting(args: argparse.Namespace) -> None:
     from . import meetings
+    out: dict | list        # a show/list subcommand returns rows
     if args.meeting_cmd == "call":
         out = meetings.call_meeting(
             agenda=args.agenda, called_by=args.caller,
@@ -551,7 +557,7 @@ def _cmd_meeting(args) -> None:
     _emit(out)
 
 
-def _cmd_review(args) -> None:
+def _cmd_review(args: argparse.Namespace) -> None:
     from . import mailbox
     if args.review_cmd == "start":
         from . import meetings
@@ -579,7 +585,7 @@ def _cmd_review(args) -> None:
     _emit(out)
 
 
-def _cmd_serve(args) -> None:
+def _cmd_serve(args: argparse.Namespace) -> None:
     """Run the web console. Imported lazily: fastapi/uvicorn are an optional
     extra, and every other subcommand must work without them installed."""
     try:

@@ -52,6 +52,7 @@ import hashlib
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -210,7 +211,7 @@ def _iso(value: dt.datetime) -> str:
 # --- connection -------------------------------------------------------------
 
 @contextmanager
-def connect(db_path: Path | str | None = None):
+def connect(db_path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
     """Open the coordination database with the engine's durability settings.
 
     WAL lets a reader (an agent polling its inbox) proceed while a writer
@@ -450,8 +451,24 @@ def list_threads(*, include_stopped: bool = False,
 
 # --- messages ---------------------------------------------------------------
 
+def _dedup_key(body: str) -> str:
+    """Whitespace-flattened form of a body, for duplicate detection only.
+
+    Never stored. It exists so the same message re-sent with different wrapping
+    still counts as a repeat; what a reader sees keeps its line structure.
+    """
+    return " ".join(body.split())
+
+
 def _normalize_body(body: str) -> str:
-    normalized = " ".join(body.split())
+    """Trim a body for storage, preserving its internal line structure.
+
+    Flattening newlines here was invisible until it mattered: a supervisor-facing
+    report written as prose plus a markdown table arrived as one 2,800-character
+    run-on line, so the format the desk's own writing rules demand could never
+    survive the transport carrying it.
+    """
+    normalized = body.strip()
     if not normalized:
         raise ValueError("message body is required")
     return normalized
@@ -505,9 +522,10 @@ def _insert_message(conn: sqlite3.Connection, thread: sqlite3.Row, *, sender: st
         raise ValueError(f"invalid message kind: {kind}")
     body = _normalize_body(body)
 
-    # Dedup on normalized body: a woken agent that cannot tell whether it
-    # already spoke would otherwise repeat itself verbatim.
-    digest = hashlib.sha256(body.casefold().encode()).hexdigest()
+    # Dedup on the flattened body: a woken agent that cannot tell whether it
+    # already spoke would otherwise repeat itself verbatim. Hash the flattened
+    # form, store the original — re-wrapping a message must not defeat the check.
+    digest = hashlib.sha256(_dedup_key(body).casefold().encode()).hexdigest()
     duplicate = conn.execute(
         """SELECT id FROM mailbox_messages
            WHERE thread_id=? AND sender=? AND recipient=? AND body_hash=?

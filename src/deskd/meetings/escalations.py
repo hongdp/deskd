@@ -5,6 +5,7 @@ this", and their delivery through the pluggable channel layer.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 from .. import channels as _channels
@@ -13,7 +14,8 @@ from . import store
 from .store import _event, connect
 
 
-def _queue_escalation(conn, thread_id: str, requested_by: str, reason: str,
+def _queue_escalation(conn: sqlite3.Connection, thread_id: str,
+                      requested_by: str, reason: str,
                       channel: str = "auto") -> int:
     cursor = conn.execute(
         """INSERT INTO meeting_escalations

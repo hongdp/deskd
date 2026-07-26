@@ -4,6 +4,7 @@ and the meeting -> task projection.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from ..config import CONFIG
@@ -14,7 +15,7 @@ from .store import (TASK_OPEN_STATUSES, TASK_PRIORITIES, TASK_STATUSES,
 _PRIO_RANK = {"urgent": 0, "normal": 1, "low": 2}
 
 
-def _task_sort_key(t: dict, now_iso: str):
+def _task_sort_key(t: dict, now_iso: str) -> tuple[int, int, str, int, int, str, str]:
     closed = t["status"] in ("done", "cancelled")
     overdue = (not closed) and bool(t["due_at"]) and t["due_at"] < now_iso
     return (
@@ -101,7 +102,7 @@ def task_queue(role: str | None = None,
     return {"actionable": actionable, "stalled": stalled}
 
 
-def _apply_blocked_on(updates: dict, current) -> None:
+def _apply_blocked_on(updates: dict, current: sqlite3.Row) -> None:
     """Hold the resulting row to: blocked IFF it names what it is blocked ON.
 
     'blocked' was the one status with no live obligation attached to it. Nothing
@@ -136,7 +137,8 @@ def _apply_blocked_on(updates: dict, current) -> None:
 
 
 def task_update(task_id: int, *, actor: str | None = None,
-                db_path: Path | str | None = None, **fields) -> bool:
+                db_path: Path | str | None = None,
+                **fields: str | None) -> bool:
     """Update mutable task fields. Only status/priority/due_at/detail/title/
     result_note/assignee_role/blocked_on are settable; unknown or None fields are
     ignored.
@@ -146,7 +148,10 @@ def task_update(task_id: int, *, actor: str | None = None,
     """
     allowed = {"status", "priority", "due_at", "detail", "title",
                "result_note", "assignee_role", "blocked_on"}
-    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    # str | None, not str: _normalize_due below turns a blank due_at back into
+    # None, which is how "clear the deadline" reaches the UPDATE.
+    updates: dict[str, str | None] = {
+        k: v for k, v in fields.items() if k in allowed and v is not None}
     if not updates:
         return False
     if "status" in updates and updates["status"] not in TASK_STATUSES:
@@ -179,7 +184,7 @@ def task_close(task_id: int, *, status: str = "done", note: str | None = None,
     return task_update(task_id, status=status, result_note=note, actor=actor,
                        db_path=db_path)
 
-def sync_meeting_close_tasks(conn) -> int:
+def sync_meeting_close_tasks(conn: sqlite3.Connection) -> int:
     """Project every live work meeting into its attendees' task lists.
 
     An open meeting is unfinished work and closing it is the agents' job — but a
@@ -228,6 +233,7 @@ def sync_meeting_close_tasks(conn) -> int:
                                 "priority": "urgent" if idle else "normal"}
 
     touched = 0
+    info: dict | None     # reused below for the retire pass, where it may miss
     for thread_id, info in live.items():
         for role in info["agents"]:
             row = conn.execute(
@@ -277,7 +283,8 @@ def sync_meeting_close_tasks(conn) -> int:
 #: this whole change exists to close, re-opened at its most expensive task.
 _URGENT_TASK_WHERE = "priority='urgent' AND status='pending'"
 
-def _queued_tasks(conn, role: str | None = None) -> tuple[list[dict], list[dict]]:
+def _queued_tasks(conn: sqlite3.Connection,
+                  role: str | None = None) -> tuple[list[dict], list[dict]]:
     """(actionable, stalled) — open work whose assignee nothing else is waking.
 
     ACTIONABLE is what a wake could still move: assigned, open, not already
@@ -315,7 +322,8 @@ def _queued_tasks(conn, role: str | None = None) -> tuple[list[dict], list[dict]
             FROM agent_tasks t WHERE {" AND ".join(where)} ORDER BY t.id""",
         params).fetchall()
     threshold = CONFIG.idle_task_stall_wakes
-    actionable, stalled = [], []
+    actionable: list[dict] = []
+    stalled: list[dict] = []
     for r in rows:
         (stalled if r["idle_wakes_since_move"] >= threshold
          else actionable).append(dict(r))

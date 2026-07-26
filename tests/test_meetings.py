@@ -286,7 +286,18 @@ def test_a_stale_attendee_is_woken_not_paged(desk):
 
 def test_a_one_to_one_message_creates_a_tracked_response_obligation(desk):
     """With exactly two actives every message owes a reply, and the obligation
-    is durable — the SLA has to survive the sender's session ending."""
+    is durable — the SLA has to survive the sender's session ending.
+
+    A reply settles the debt it answers AND opens one of its own. This assertion
+    used to read the other way ("a reply must not mint a fresh one, or two agents
+    could never stop taking turns"), and that reasoning is the bug: settling and
+    creating were `if`/`elif`, so a message that answered something obligated
+    nobody, and turn-taking ended silently at the first reply. Two agents stop
+    taking turns by CLOSING the meeting — the termination handshake, which is not
+    a message, cannot be blocked by a debt, and waives what is outstanding. They
+    were never meant to stop by one of them falling quiet and the ledger agreeing
+    that this was fine.
+    """
     thread_id = _start("one to one", ["alpha", "beta"])
     assert meetings.meeting_status(thread_id)["mode"] == "one_to_one"
 
@@ -299,12 +310,125 @@ def test_a_one_to_one_message_creates_a_tracked_response_obligation(desk):
     replied = meetings.send_update(thread_id, role="beta", kind="answer",
                                    body="it holds, with one caveat",
                                    reply_to=sent["message_id"])
-    owed = meetings.meeting_status(thread_id)["response_obligations"]
-    assert [(o["owed_by"], o["status"]) for o in owed] == [("beta", "resolved")]
-    assert owed[0]["resolved_by_message_id"] == replied["message_id"]
-    # A reply discharges an obligation; it must not mint a fresh one, or two
-    # agents could never stop taking turns.
-    assert not [o for o in owed if o["status"] == "pending"]
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert (owed[sent["message_id"]]["owed_by"],
+            owed[sent["message_id"]]["status"]) == ("beta", "resolved")
+    assert owed[sent["message_id"]]["resolved_by_message_id"] == replied["message_id"]
+    # ...and the ball is back in alpha's court, on beta's reply.
+    assert (owed[replied["message_id"]]["owed_by"],
+            owed[replied["message_id"]]["status"]) == ("alpha", "pending")
+
+
+@pytest.mark.parametrize("asker", ROLE_NAMES)
+def test_answering_a_question_with_a_question_still_owes_a_reply(desk, asker):
+    """THE live defect, 2026-07-26, in its role-agnostic form. Settling an
+    inbound debt and opening a new one were mutually exclusive branches, so the
+    single commonest move in any real conversation — answering with a question —
+    left nobody owing anything. No obligation row means no SLA, no overdue
+    sweep, and no owed_reply wake demand: the counterpart could read it and
+    never answer, and the engine would report a healthy meeting.
+
+    `_mode` has documented the contract from the start ("one_to_one imposes
+    strict turn-taking (every message owes a reply)"); this pins that the code
+    now means it, whichever pair of roles is talking.
+    """
+    answerer = next(r for r in ROLE_NAMES if r != asker)
+    thread_id = _start("answered with a question", [asker, answerer])
+
+    q1 = meetings.send_update(thread_id, role=asker, kind="question",
+                              body="does the thesis still hold")["message_id"]
+    # The reply IS a question. It discharges q1 and must hand the turn back.
+    q2 = meetings.send_update(thread_id, role=answerer, kind="question",
+                              reply_to=q1,
+                              body="it holds — over what horizon are you asking")["message_id"]
+
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert (owed[q1]["owed_by"], owed[q1]["status"]) == (answerer, "resolved")
+    assert (owed[q2]["owed_by"], owed[q2]["status"]) == (asker, "pending"), (
+        "a message that resolves a debt must still create one, or the "
+        "conversation ends here with nobody owing anything")
+    assert owed[q2]["due_at"], "the new debt carries an SLA of its own"
+
+
+def test_the_supervisor_s_reply_leaves_the_agent_owing_an_answer(desk):
+    """The exact shape observed live: the supervisor asked an analyst "can we
+    buy Apple?" from the console, which sets reply_to on every supervisor
+    message sent while the supervisor owes a reply — it was discharging the
+    previous turn. The question therefore settled its own debt and created none.
+    The analyst read it and never answered in thread; no obligation, no SLA, no
+    sweep, no wake. The engine's only turn-taking guarantee was reachable only by
+    the one path a real conversation never takes.
+    """
+    called = meetings.apply_simple_supervisor_action(
+        {"action": "call", "agenda": "one on one", "attendees": ["alpha"]})
+    thread_id = called["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="alpha")
+
+    ask = meetings.apply_simple_supervisor_action(
+        {"action": "send", "meeting_id": thread_id, "body": "what is the risk here"},
+    )["message_id"]
+    answer = meetings.send_update(thread_id, role="alpha", kind="answer",
+                                  reply_to=ask, body="concentration, mainly")["message_id"]
+    # The supervisor now owes, and answers WITH a question — the live shape.
+    followup = meetings.apply_simple_supervisor_action(
+        {"action": "send", "meeting_id": thread_id, "reply_to": answer,
+         "body": "understood. so can we buy apple"},
+    )["message_id"]
+
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert (owed[followup]["owed_by"], owed[followup]["status"]) == (
+        "alpha", "pending"), (
+        "a supervisor question sent WITH reply_to must still obligate the agent")
+    # The mirror does NOT hold, deliberately: the agent's answer obligates
+    # nobody, because the other party is a person. An obligation is an SLA with
+    # a wake ladder behind it, and this ladder wakes agents — a supervisor-owed
+    # row makes the planner emit "spawn a session for role=supervisor", the one
+    # role the engine refuses everywhere else. A human's attention is asked for
+    # through the message and the escalation path, never demanded on a clock.
+    assert answer not in owed, "an SLA must not be minted against a human"
+
+    # And it is a real SLA, not a decorative row: back-dated past its due_at it
+    # survives the sweep as pending, which is what the orchestrator collects as
+    # owed_reply demand (asserted from the orchestration side in test_wake —
+    # this layer must never import it).
+    with _db() as conn:
+        conn.execute("UPDATE meeting_response_obligations SET due_at=? WHERE message_id=?",
+                     (_past(60), followup))
+    meetings._sweep_timeouts()
+    still = {o["message_id"]: o for o in
+             meetings.meeting_status(thread_id)["response_obligations"]}
+    assert still[followup]["status"] == "pending"
+
+
+def test_a_reply_to_a_departed_attendee_obligates_nobody(desk):
+    """The one debt this must never mint. Three actives minus one leaves a pair,
+    so the mode flips to one_to_one — but a reply is addressed to the message's
+    SENDER, who may be the attendee who just left. Their debts were waived on the
+    way out precisely because they have no seat to answer from; arming a fresh
+    one behind them would wake a role the meeting no longer contains, and nothing
+    the remaining pair does could ever discharge it.
+    """
+    thread_id = _start("gamma speaks then leaves", ["alpha", "beta", "gamma"],
+                       wait_timeout_seconds=30)
+    said = meetings.send_update(thread_id, role="gamma", kind="evidence",
+                                body="gamma's parting evidence")["message_id"]
+    with _db() as conn:
+        conn.execute("UPDATE mailbox_messages SET created_at=? WHERE thread_id=?",
+                     (_past(600), thread_id))
+    meetings.leave_meeting(thread_id, role="gamma", reason="handing this over")
+    assert meetings.meeting_status(thread_id)["mode"] == "one_to_one"
+
+    replied = meetings.send_update(thread_id, role="alpha", kind="answer",
+                                   reply_to=said, body="picking that up")["message_id"]
+
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert replied not in owed, "a departed attendee must not be handed a new debt"
+    assert not [o for o in owed.values() if o["owed_by"] == "gamma"
+                and o["status"] == "pending"]
 
 
 def test_meetings_track_stacked_questions_instead_of_refusing_them(desk):
@@ -478,6 +602,94 @@ def test_a_vote_binds_only_to_the_pending_proposal(desk):
     assert [(v["role"], v["vote"]) for v in votes] == [("alpha", "confirm")]
     assert meetings.confirm_end(thread_id, role="beta")["closed"] is True
     assert _thread_row(thread_id)["stop_reason"] == "second resolution"
+
+
+def _pending_owed(thread_id: str) -> list[tuple]:
+    return [(o["owed_by"], o["message_id"]) for o
+            in meetings.meeting_status(thread_id)["response_obligations"]
+            if o["status"] == "pending"]
+
+
+def test_a_conversation_where_both_sides_keep_owing_still_reaches_a_close(desk):
+    """The wind-down proof for "every message owes a reply".
+
+    Turn-taking that never lapses is only safe if a meeting can still END while
+    a debt is outstanding, and it can — because ending is not a message. The
+    handshake writes to meeting_terminations, spends no budget, and passes
+    through no gate that consults the ledger (the one that did was removed with
+    the turn-taking gate). Both halves settle debts on their way past instead:
+    _propose_end and _vote_end each resolve the debts owed BY the actor, so the
+    party that owes is never the party that cannot act.
+    """
+    thread_id = _start("nobody ever stops owing", ["alpha", "beta"])
+    q1 = meetings.send_update(thread_id, role="alpha", kind="question",
+                              body="does the thesis still hold")["message_id"]
+    q2 = meetings.send_update(thread_id, role="beta", kind="question", reply_to=q1,
+                              body="it does — over what horizon")["message_id"]
+    q3 = meetings.send_update(thread_id, role="alpha", kind="question", reply_to=q2,
+                              body="through the quarter; does that change it")["message_id"]
+    assert _pending_owed(thread_id) == [("beta", q3)], (
+        "the ball is in beta's court and has been all along")
+
+    # The DEBTOR proposes the end. Nothing about owing a reply may bar this.
+    meetings.propose_end(thread_id, role="beta", resolution="answered, closing")
+    assert meetings.confirm_end(thread_id, role="alpha")["closed"] is True
+
+    assert _state(thread_id) == "closed"
+    assert _pending_owed(thread_id) == [], (
+        "a closed meeting owes nothing; a permanently-pending debt would sit on "
+        "the board forever for a conversation nobody can rejoin")
+
+
+def test_a_reply_sent_during_the_termination_handshake_does_not_outlive_it(desk):
+    """The other side of the coin. A proposal and a vote are not messages, so
+    they mint no obligation of their own — but `termination_pending` still
+    accepts REPLIES (the last link of the evidence chain), and a reply owes one
+    like any other message. That debt belongs to whoever was addressed, which is
+    exactly the party the closing vote does NOT settle for. Closing waives it.
+    """
+    thread_id = _start("last word", ["alpha", "beta"])
+    correction = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                                      body="correcting the sizing i gave you")["message_id"]
+    meetings.propose_end(thread_id, role="alpha", resolution="correction acknowledged")
+    assert _state(thread_id) == "termination_pending"
+    # A proposal is not a message: it neither spends the budget nor owes a reply.
+    # It settled alpha's own debt on the way past, and left beta owing nothing new.
+    assert _pending_owed(thread_id) == [("beta", correction)]
+
+    accepted = meetings.send_update(thread_id, role="beta", kind="answer",
+                                    reply_to=correction,
+                                    body="understood, my sizing was wrong")["message_id"]
+    assert _pending_owed(thread_id) == [("alpha", accepted)], (
+        "the terminal reply hands the turn back like any other message")
+
+    meetings.confirm_end(thread_id, role="beta")
+
+    assert _state(thread_id) == "closed"
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert owed[accepted]["status"] == "waived", (
+        "waived, not resolved — nobody answered, and the ledger must not "
+        "claim they did")
+    assert "closed" in owed[accepted]["resolution"]
+
+
+def test_force_close_clears_the_reply_ledger_too(desk):
+    """The supervisor's override reaches the same end state as the handshake.
+    force_close skips propose/vote entirely, so it is the route with the most
+    outstanding debt at close — and it goes through the one function that closes
+    a meeting, which is why the waive lives there and not in the handshake."""
+    thread_id = _start("cut it short", ["alpha", "beta"])
+    ask = meetings.send_update(thread_id, role="alpha", kind="question",
+                               body="a question nobody will ever answer")["message_id"]
+    assert _pending_owed(thread_id) == [("beta", ask)]
+
+    meetings.apply_simple_supervisor_action(
+        {"action": "force_close", "meeting_id": thread_id, "reason": "done here"})
+
+    assert _pending_owed(thread_id) == []
+    owed = meetings.meeting_status(thread_id)["response_obligations"]
+    assert [o["status"] for o in owed] == ["waived"]
 
 
 # --- 6. the tally counts only ACTIVE attendees ------------------------------
@@ -1544,3 +1756,120 @@ def test_the_meetings_clock_has_one_patch_point(desk, monkeypatch):
 
     assert [w["thread_id"] for w in meetings.wake_requests("beta")] == [
         thread_id], "the sweep did not follow the patched store clock"
+
+
+def test_a_human_is_never_put_on_a_machine_sla(desk):
+    """The constitutional guard on turn-taking. An obligation is not a note that
+    someone owes an answer — it is an SLA whose enforcement arm wakes agents, so
+    a row owed by the supervisor makes the planner emit "spawn a session for
+    role=supervisor": a role this same engine refuses in _agent_role,
+    agent_detail and wake_sources, and which the host desk's constitution
+    forbids an agent to claim. Measured before this guard: one overnight
+    supervisor DM produced 19 such spawn actions and 38 human pages.
+
+    The engine's own precedent is the attendance sweep — only agents are woken;
+    a missing human rides out on the escalation instead."""
+    called = meetings.apply_simple_supervisor_action(
+        {"action": "call", "agenda": "ask the human", "attendees": ["alpha"]})
+    thread_id = called["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="alpha")
+
+    for kind, body in (("question", "should I size this at 1%?"),
+                       ("evidence", "and here is why I ask")):
+        meetings.send_update(thread_id, role="alpha", kind=kind, body=body)
+
+    owed_by = {o["owed_by"] for o in
+               meetings.meeting_status(thread_id)["response_obligations"]}
+    assert CONFIG.supervisor_role not in owed_by
+
+
+def test_a_debt_nobody_can_pay_is_not_left_standing(desk):
+    """A meeting has three terminal states and only one is `closed`. The mailbox
+    also retires a thread on its idle deadline or its spent message budget — and
+    those pause the THREAD while meetings.state stays 'active'/'consensus'. With
+    every message owing a reply, an unclosed one-to-one strands a debt whose
+    debtor is physically unable to answer (send_update refuses: "thread is
+    paused"), which the collector then re-raised every tick: 114 wake attempts
+    and 76 human pages in 24h, measured, for a conversation both parties had
+    politely finished.
+
+    The rule this pins is payability, not tidiness: the board and the wake
+    collector both ask whether the debtor could act, and a resumed thread makes
+    the demand real again on its own."""
+    thread_id = _start("idle out", ["alpha", "beta"], idle_minutes=45)
+    meetings.send_update(thread_id, role="alpha", kind="question",
+                         body="what do you make of it")
+    _expire(thread_id)
+    with pytest.raises(ValueError, match="idle|expired|paused"):
+        meetings.send_update(thread_id, role="beta", kind="answer",
+                             body="cannot answer a paused thread")
+
+    from deskd import orchestration as orch  # local: this layer never imports it
+
+    load = orch.board()["agents"]
+    beta = next(a for a in load if a["role"] == "beta")
+    assert (beta.get("meetings") or {}).get("obligations", {}).get("pending", 0) == 0, (
+        "an unpayable debt must not sit on the board as work")
+
+
+def test_proposing_an_end_does_not_erase_what_you_owe(desk):
+    """Proposing is not answering. The debts of whoever proposed used to be
+    marked resolved on the way past — harmless while a reply could not create
+    one, and a loophole the moment every message owes an answer: propose an end,
+    have it rejected, and the question you never answered is gone from the
+    ledger while the conversation carries on.
+
+    Nobody is nagged mid-vote either, and that is handled a layer up:
+    `termination_pending` is outside the collector's active/consensus predicate,
+    so a pending proposal raises no demand at all."""
+    thread_id = _start("owe then propose", ["alpha", "beta"])
+    asked = meetings.send_update(thread_id, role="alpha", kind="question",
+                                 body="why this sizing?")["message_id"]
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert owed[asked]["owed_by"] == "beta" and owed[asked]["status"] == "pending"
+
+    meetings.propose_end(thread_id, role="beta", resolution="nothing more from me")
+    still = {o["message_id"]: o for o in
+             meetings.meeting_status(thread_id)["response_obligations"]}
+    assert still[asked]["status"] == "pending", "proposing must not discharge a debt"
+
+    meetings.reject_end(thread_id, role="alpha", reason="you did not answer me")
+    after = {o["message_id"]: o for o in
+             meetings.meeting_status(thread_id)["response_obligations"]}
+    assert after[asked]["status"] == "pending", (
+        "a rejected end returns the conversation AND the debt")
+
+    # Accepting is the honest way out: nobody answered, so it is waived.
+    meetings.propose_end(thread_id, role="beta", resolution="agreed, closing")
+    meetings.confirm_end(thread_id, role="alpha")
+    closed = {o["message_id"]: o for o in
+              meetings.meeting_status(thread_id)["response_obligations"]}
+    assert closed[asked]["status"] == "waived"
+
+
+def test_a_consensus_position_obligates_nobody(desk):
+    """A debt with no legal way to pay it. Consensus mode accepts exactly two
+    kinds — one position per attendee, or a decision — so a counterpart
+    obligated by a position cannot answer it: evidence/question/answer/proposal
+    are refused by the gate, a second position by the one-position rule. The
+    protocol's own next step after positions is the handshake, not a reply."""
+    thread_id = _start("positions", ["alpha", "beta"],
+                       max_messages=4, consensus_threshold=3)
+    meetings.send_update(thread_id, role="alpha", kind="evidence", body="the case")
+    assert _state(thread_id) == "consensus"
+
+    position = meetings.submit_position(
+        thread_id, role="alpha", body="I am for it")["message_id"]
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert position not in owed, (
+        "a position must not mint a debt the gate then refuses to let anyone pay")
+    # The earlier `evidence` debt is untouched and stays payable: consensus
+    # still accepts a `decision`, which is the reply shape this mode is for.
+    assert owed[1]["owed_by"] == "beta" and owed[1]["status"] == "pending"
+    meetings.send_update(thread_id, role="beta", kind="decision", reply_to=1,
+                         body="agreed, and here is my call")
+    settled = {o["message_id"]: o for o in
+               meetings.meeting_status(thread_id)["response_obligations"]}
+    assert settled[1]["status"] == "resolved"

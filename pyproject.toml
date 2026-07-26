@@ -31,6 +31,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
 ]
 # The engine core is stdlib + cryptography, and that is a deliberate constraint:
 # it stores state in SQLite and holds the supervisor trust boundary, so it must
@@ -59,10 +60,12 @@ deskd = "deskd.cli:main"
 [tool.hatch.version]
 path = "src/deskd/config.py"
 
-# This ships every file under src/deskd, including web/static/*.html — the
-# console's pages are data, not code, and a wheel without them would leave
-# `deskd serve` returning a FileResponse to a path that does not exist. Do not
-# add a force-include for them: they are already here, and hatchling refuses to
+# This ships every file under src/deskd, including web/static/*.html and the
+# PEP 561 `py.typed` marker — the console's pages are data, not code, and a
+# wheel without them would leave `deskd serve` returning a FileResponse to a
+# path that does not exist, while a wheel without py.typed makes every
+# annotation in here invisible to a downstream type checker. Do not add a
+# force-include for either: they are already here, and hatchling refuses to
 # write the same archive path twice.
 [tool.hatch.build.targets.wheel]
 packages = ["src/deskd"]
