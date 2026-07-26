@@ -226,3 +226,30 @@ def test_dry_run_neither_records_nor_sends(desk, recording_channel):
     assert recording_channel == []
     with o.connect() as conn:
         assert scalar(conn, "SELECT COUNT(*) FROM wake_escalations") == 0
+
+
+def test_the_deprecated_names_survive_star_import_and_dir():
+    """PEP 562's `__getattr__` covers attribute access and `from X import Y`,
+    but NOT star-import (which reads `__dict__`) and NOT `dir()`. Both gaps
+    fail silently — a vanished star-import surfaces as a NameError somewhere
+    else entirely, and a capability probe written as `"register_channel" in
+    dir(meetings)` quietly takes the unsupported branch instead of getting the
+    deprecation. `__all__` and `__dir__` close them; this pins both."""
+    import warnings
+
+    from deskd import meetings
+
+    for name in meetings._DEPRECATED_CHANNEL_NAMES:
+        assert name in dir(meetings), f"{name} vanished from dir()"
+
+    namespace: dict = {}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        exec("from deskd.meetings import *", namespace)
+    for name in meetings._DEPRECATED_CHANNEL_NAMES:
+        assert name in namespace, f"{name} vanished from star-import"
+    assert any("deprecated" in str(c.message) for c in caught), (
+        "star-import resolved the names without warning — the shim must not "
+        "become a silent permanent alias")
+    # The real API must still come through the same door.
+    assert "call_meeting" in namespace and "meeting_status" in namespace

@@ -146,7 +146,9 @@ skips when the per-role lock is held, and launches fail.
 meeting. Written when a meeting is called (every agent invitee except the
 caller — the invitation is itself a wake demand, whatever the priority), on an
 attendance timeout, when a checked-in attendee sits on unread messages past the
-SLA, and when a termination vote parks.
+SLA, when an end is proposed (every other required attendee then owes a vote),
+and when a termination vote parks — five write sites, the last two distinct:
+proposing fires once, the sweep re-arms a vote that never came.
 *Lives in:* table `meeting_wake_requests` (`thread_id`, `role`, `status` =
 `pending|acknowledged`); `meetings/lifecycle.py` and `meetings/sweep.py`.
 *Prevents:* confusing it with a wake attempt. A request is meetings *asking*; an
@@ -194,8 +196,10 @@ else; anything that can block does not belong in one.
 
 **`plan_wakes` vs the driver** — `plan_wakes` collects, records and returns a
 plan; it never spawns or resumes anything. The driver holds the per-role lock
-and executes. `record=False` is a genuinely side-effect-free preview: it makes
-the same decisions and rolls every write back.
+and executes. `record=False` is a genuinely side-effect-free preview — every
+write is rolled back — but it is not quite the same run: wake hooks are
+evaluated only when `record` is true, so a hook due this tick would enqueue an
+inbox item (and hence an `inbox` demand) that the preview never sees.
 
 ---
 
@@ -214,12 +218,20 @@ The five states (`DELIVERY_STATES`), all computed by `_delivery_state`:
   front of the role. Stamped by `meetings.discover` (`_stamp_notifications`).
   *Not* read, and purely additive — it can never suppress an unread count.
 - **`read`** — a `mailbox_receipts` row exists: an **explicit** ack, written
-  only by `meeting_updates(..., mark_read=True)`, `mailbox.inbox(mark_read=
-  True)`, or `mailbox.acknowledge()`. Nothing stamps it on the agent's behalf.
+  for a *delivery row* only by `meeting_updates(..., mark_read=True)`,
+  `mailbox.inbox(mark_read=True)`, or `mailbox.acknowledge()`. Nothing stamps a
+  recipient's read on their behalf. (A fourth writer exists but never touches a
+  delivery row: `_send_update` self-receipts the sender on their own outgoing
+  message, and `sync_delivery` joins `role != sender`.)
 - **`escalated`** — past `sla_due_at`, unread, **and** a *pending*
   `meeting_wake_requests` row exists for that exact `(thread, role)` pair:
-  something is re-driving delivery right now. Scope is `(recipient, item)`,
-  never the containing thread, and the test is present-tense.
+  something is re-driving delivery right now. The key is `(thread, recipient)`
+  and the test is present-tense — so one pending request marks *every* past-SLA
+  unread message to that role on that thread, not only the one that triggered
+  it. The guarantee the key buys is the role axis: a wake request for one role
+  never masks another role's stuck message. (`design.md` calls this scope
+  "never the containing thread"; the code — `delivery.py::_wake_keys` — keys on
+  the thread. The code wins.)
 - **`overdue`** — past SLA, unread, nothing reacting. **This is the guarantee
   breaking**; it is surfaced red and it raises the `stuck_delivery` demand.
 

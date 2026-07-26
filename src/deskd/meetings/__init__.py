@@ -110,6 +110,15 @@ _DEPRECATED_CHANNEL_NAMES = frozenset({
     "register_channel", "registered_channels", "unregister_channel",
 })
 
+#: Star-import reads `__dict__` directly and never consults `__getattr__`, so
+#: without an explicit `__all__` the six names would silently disappear from
+#: `from deskd.meetings import *` — a NameError at the call site much later,
+#: which is the failure mode this shim exists to prevent. Naming them here
+#: routes star-import through `__getattr__`, so it still warns.
+#: Removal horizon: the shim goes away when meetings leaves the core (P4);
+#: until then every release keeps it.
+__all__ = sorted(set(globals()) | _DEPRECATED_CHANNEL_NAMES)
+
 
 def __getattr__(name: str):
     """Resolve the moved channel names from `deskd.channels`, deprecated.
@@ -133,3 +142,11 @@ def __getattr__(name: str):
         from .. import channels
         return getattr(channels, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """PEP 562's other half. `__getattr__` alone leaves the deprecated names
+    out of `dir()`, which silently breaks REPL completion and any capability
+    probe written as `"register_channel" in dir(meetings)` — that probe would
+    take the not-supported branch instead of getting the deprecation."""
+    return sorted(set(globals()) | _DEPRECATED_CHANNEL_NAMES)
