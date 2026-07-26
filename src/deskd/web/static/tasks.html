@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tasks &amp; hooks · deskd console</title>
+<link rel="stylesheet" href="/static/deskd.css">
+<script src="/static/shell.js"></script>
+</head>
+<body>
+<main class="wrap">
+  <div class="pagehead">
+    <div><h1>Tasks &amp; hooks</h1><div class="sub">Cross-role work queue and every registered wake hook</div></div>
+  </div>
+  <div class="alarms" id="callouts"></div>
+  <div class="card" id="tasks-card">
+    <div class="card-head"><h3>Tasks</h3><span class="quiet" id="task-count"></span></div>
+    <div class="filters">
+      <label>Role <select id="f-role"><option value="">all</option></select></label>
+      <label>Status <select id="f-status"><option value="">all open</option>
+        <option value="pending">pending</option><option value="in_progress">in progress</option>
+        <option value="blocked">blocked</option><option value="done">done</option>
+        <option value="cancelled">cancelled</option></select></label>
+      <label>Priority <select id="f-priority"><option value="">all</option>
+        <option value="urgent">urgent</option><option value="normal">normal</option><option value="low">low</option></select></label>
+      <label>Source <select id="f-source"><option value="">all</option></select></label>
+      <label><input type="checkbox" id="f-overdue"> overdue only</label>
+      <label><input type="checkbox" id="f-closed"> include closed</label>
+    </div>
+    <div id="tasks"><div class="loading">Loading…</div></div>
+  </div>
+  <div class="card" id="hooks">
+    <div class="card-head"><h3>Wake hooks · all statuses</h3><span class="quiet" id="hook-count"></span></div>
+    <div id="hooks-body"><div class="loading">Loading…</div></div>
+  </div>
+</main>
+<footer class="foot" id="foot"></footer>
+<script>
+"use strict";
+var S = Shell, esc = S.esc, rel = S.rel;
+S.init("tasks", "Tasks & hooks");
+
+var TASKS = [], STALLED = {}, HOOKS = [];
+
+// Deep-linkable: /tasks?role=x pre-sets the role filter (board cards link here).
+(function () {
+  var q = new URLSearchParams(location.search);
+  if (q.get("role")) S.$("#f-role").dataset.want = q.get("role");
+})();
+
+function fillSelect(sel, values) {
+  var cur = sel.value || sel.dataset.want || "";
+  S.setHTML(sel, '<option value="">all</option>' + values.map(function (v) {
+    return '<option value="' + esc(v) + '">' + esc(S.human(v)) + "</option>";
+  }).join(""));
+  if (cur && values.indexOf(cur) >= 0) sel.value = cur;
+  delete sel.dataset.want;
+}
+
+function callouts() {
+  var stalledN = Object.keys(STALLED).length;
+  var blockedUnspec = TASKS.filter(function (t) { return t.status === "blocked" && !(t.blocked_on || "").trim(); }).length;
+  var overdue = TASKS.filter(function (t) { return t.overdue; }).length;
+  S.setHTML(S.$("#callouts"),
+    '<span class="alarm ' + (stalledN ? "bad" : "") + '" title="woken for these repeatedly without movement; they no longer wake anyone — move, block on a named dependency, transfer, or escalate"><span class="st"></span>stalled <b>' + stalledN + "</b></span>"
+    + '<span class="alarm ' + (blockedUnspec ? "bad" : "") + '" title="blocked without naming what they wait ON — no path can ever raise them again"><span class="st"></span>blocked without dependency <b>' + blockedUnspec + "</b></span>"
+    + '<span class="alarm ' + (overdue ? "warn" : "") + '"><span class="st"></span>overdue <b>' + overdue + "</b></span>");
+}
+
+function taskRows() {
+  var fr = S.$("#f-role").value, fs = S.$("#f-status").value, fp = S.$("#f-priority").value,
+      fsrc = S.$("#f-source").value, fo = S.$("#f-overdue").checked;
+  var rows = TASKS.filter(function (t) {
+    return (!fr || t.assignee_role === fr) && (!fs || t.status === fs)
+      && (!fp || t.priority === fp) && (!fsrc || t.source_kind === fsrc) && (!fo || t.overdue);
+  });
+  S.$("#task-count").textContent = rows.length + " of " + TASKS.length + " tasks";
+  if (!rows.length) {
+    S.setHTML(S.$("#tasks"), TASKS.length
+      ? S.empty("No tasks match these filters.")
+      : S.empty("No tasks yet — cross-session work items land here.", "deskd task add --for ROLE --title \"…\""));
+    return;
+  }
+  S.setHTML(S.$("#tasks"),
+    '<div class="tblwrap"><table><thead><tr><th>id</th><th>Role</th><th>State</th><th>Priority</th><th>Title</th><th>Source</th><th>Due</th><th>Updated</th></tr></thead><tbody>'
+    + rows.map(function (t) {
+      var flags = (t.overdue ? ' <span class="badge bad">overdue</span>' : "")
+        + (STALLED[t.id] ? ' <span class="badge bad" title="woken for it repeatedly without movement — no longer wakes anyone; somebody must decide">stalled</span>' : "")
+        + (t.status === "blocked" && !(t.blocked_on || "").trim() ? ' <span class="badge bad" title="blocked without naming a dependency — nothing can ever raise it again">no dependency named</span>' : "");
+      return "<tr><td>#" + t.id + '</td><td><a href="/agent/' + encodeURIComponent(t.assignee_role) + '">' + esc(t.assignee_role) + "</a></td>"
+        + "<td>" + S.stateBadge(t.status) + flags + "</td><td>" + esc(t.priority) + "</td><td>" + esc(t.title)
+        + (t.blocked_on ? '<div class="quiet">blocked on: ' + esc(t.blocked_on) + "</div>" : "")
+        + (t.result_note ? '<div class="quiet">' + esc(t.result_note) + "</div>" : "") + "</td>"
+        + "<td>" + esc(S.human(t.source_kind)) + (t.source_ref ? " · " + esc(t.source_ref) : "") + "</td>"
+        + "<td>" + (t.due_at ? rel(t.due_at) : "—") + "</td><td>" + rel(t.updated_at) + "</td></tr>";
+    }).join("") + "</tbody></table></div>");
+}
+
+function hookSpec(h) {
+  var sp = h.spec || {};
+  if (h.kind === "probe") return esc(sp.callable || "") + " · every " + S.dur(sp.every);
+  if (h.kind === "interval") return "every " + S.dur(sp.every);
+  if (h.kind === "cron") return esc(sp.cron || "") + (sp.tz ? " (" + esc(sp.tz) + ")" : "");
+  return sp.at ? "at " + rel(sp.at) : "—";
+}
+function hookRows() {
+  S.$("#hook-count").textContent = HOOKS.length + " hooks";
+  if (!HOOKS.length) {
+    S.setHTML(S.$("#hooks-body"),
+      S.empty("No hooks registered — agents schedule their own wakes here.",
+        "deskd hook add --for ROLE --title \"…\" (--at ISO | --every SECONDS | --cron \"m h dom mon dow\" | --probe module.path:fn)"));
+    return;
+  }
+  S.setHTML(S.$("#hooks-body"),
+    '<div class="tblwrap"><table><thead><tr><th>id</th><th>Owner</th><th>Kind</th><th>Title</th><th>Spec</th><th>Status</th><th>Next fire</th><th>Fired</th><th>Errors</th></tr></thead><tbody>'
+    + HOOKS.map(function (h) {
+      var errs = h.error_streak
+        ? '<span class="badge bad" title="' + esc(h.last_error || "") + '">streak ×' + h.error_streak + "</span>"
+        : (h.last_error ? '<span class="badge warn" title="' + esc(h.last_error) + '">recovered</span>' : "—");
+      return "<tr><td>#" + h.id + '</td><td><a href="/agent/' + encodeURIComponent(h.owner_role) + '">' + esc(h.owner_role) + "</a></td>"
+        + "<td>" + esc(S.human(h.kind)) + "</td><td>" + esc(h.title)
+        + (h.priority === "urgent" ? ' <span class="badge bad">urgent</span>' : "") + "</td>"
+        + "<td>" + hookSpec(h) + "</td><td>" + S.stateBadge(h.status) + "</td>"
+        + "<td>" + (h.next_fire_at ? rel(h.next_fire_at) : "—") + '</td><td class="num">×' + h.fire_count + "</td><td>" + errs + "</td></tr>";
+    }).join("") + "</tbody></table></div>");
+}
+
+async function load() {
+  var closed = S.$("#f-closed").checked;
+  var td = await S.api("/api/tasks?include_closed=" + closed);
+  var hooks = await S.api("/api/hooks?include_closed=true");
+  TASKS = td.tasks || [];
+  STALLED = {};
+  (td.stalled_ids || []).forEach(function (id) { STALLED[id] = true; });
+  HOOKS = hooks || [];
+  fillSelect(S.$("#f-role"), Array.from(new Set(TASKS.map(function (t) { return t.assignee_role; })
+    .concat(HOOKS.map(function (h) { return h.owner_role; })))).sort());
+  fillSelect(S.$("#f-source"), Array.from(new Set(TASKS.map(function (t) { return t.source_kind; }))).sort());
+  callouts(); taskRows(); hookRows();
+  S.$("#foot").textContent = "updated " + new Date().toLocaleTimeString();
+}
+["f-role", "f-status", "f-priority", "f-source"].forEach(function (id) {
+  document.getElementById(id).onchange = taskRows;
+});
+S.$("#f-overdue").onchange = taskRows;
+S.$("#f-closed").onchange = function () { load(); };
+S.autorefresh(load, 10);
+</script>
+</body>
+</html>

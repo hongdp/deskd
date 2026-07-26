@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Escalations · deskd console</title>
+<link rel="stylesheet" href="/static/deskd.css">
+<script src="/static/shell.js"></script>
+</head>
+<body>
+<main class="wrap">
+  <div class="pagehead">
+    <div><h1>Escalations</h1><div class="sub">Every path by which this desk pulls a human in — and whether each one currently works</div></div>
+  </div>
+  <div class="alarms" id="chan-strip"></div>
+  <div class="card">
+    <div class="card-head"><h3>Wake escalations · human-rung ledger</h3><span class="quiet">queued = only this page has seen it</span></div>
+    <div id="wake-led"><div class="loading">Loading…</div></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Meeting escalations</h3><a class="quiet" href="/meetings">meeting console →</a></div>
+    <div id="mtg-led"></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Unroutable demands</h3><span class="quiet">work no enabled role has the capability to take</span></div>
+    <div id="unroutable"></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Channels</h3><span class="quiet">the outbox is always listed: with nothing registered, it is the only delivery</span></div>
+    <div id="channels"></div>
+  </div>
+</main>
+<footer class="foot" id="foot"></footer>
+<script>
+"use strict";
+var S = Shell, esc = S.esc, rel = S.rel;
+S.init("escalations", "Escalations");
+
+function chanStrip(d) {
+  var chans = (d.channels || []).filter(function (c) { return !c.outbox; });
+  var avail = chans.filter(function (c) { return c.available; }).length;
+  var queued = (d.wake || []).filter(function (w) { return w.status === "queued"; }).length;
+  S.setHTML(S.$("#chan-strip"),
+    '<span class="alarm ' + (d.human_reachable ? "" : "bad") + '"><span class="st"></span>'
+    + (d.human_reachable ? "human rung wired — an escalation reaches a person"
+                         : "human rung UNWIRED — escalations stop at the outbox rows below") + "</span>"
+    + '<span class="alarm ' + (queued ? "bad" : "") + '"><span class="st"></span>undelivered wake escalations <b>' + queued + "</b></span>"
+    + '<span class="alarm"><span class="st"></span>channels available <b>' + avail + "</b> of " + chans.length + "</span>");
+}
+
+function wakeLedger(rows) {
+  if (!rows.length) {
+    S.setHTML(S.$("#wake-led"), S.empty("No demand has reached the human rung — the machine rungs have handled everything so far."));
+    return;
+  }
+  S.setHTML(S.$("#wake-led"),
+    '<div class="tblwrap"><table><thead><tr><th>Status</th><th>Role</th><th>Reason</th><th>Demand</th><th>Rung</th><th>Channel</th><th>Created</th><th>Sent</th></tr></thead><tbody>'
+    + rows.map(function (w) {
+      var st = w.status === "queued"
+        ? '<span class="badge bad" title="the ledger row is the only delivery so far: nobody was pulled in unless somebody reads this page">queued — reached nobody</span>'
+        : S.stateBadge(w.status);
+      return "<tr><td>" + st + "</td><td><b>" + esc(w.role) + "</b></td><td>" + esc(S.human(w.reason_kind)) + "</td>"
+        + "<td>" + esc(w.reason || w.source_ref) + "</td><td>L" + w.level + "</td><td>" + esc(S.human(w.channel)) + "</td>"
+        + "<td>" + rel(w.created_at) + "</td><td>" + (w.sent_at ? rel(w.sent_at) : "—") + "</td></tr>";
+    }).join("") + "</tbody></table></div>");
+}
+
+function meetingLedger(rows) {
+  if (!rows.length) {
+    S.setHTML(S.$("#mtg-led"), S.empty("No meeting escalations — attendance and reply SLAs have held."));
+    return;
+  }
+  S.setHTML(S.$("#mtg-led"),
+    '<div class="tblwrap"><table><thead><tr><th>Status</th><th>Meeting</th><th>Requested by</th><th>Reason</th><th>Channel</th><th>Created</th></tr></thead><tbody>'
+    + rows.map(function (e) {
+      return "<tr><td>" + S.stateBadge(e.status) + "</td><td>" + esc(e.thread_id) + "</td><td>" + esc(e.requested_by)
+        + "</td><td>" + esc(e.reason) + "</td><td>" + esc(S.human(e.channel)) + "</td><td>" + rel(e.created_at) + "</td></tr>";
+    }).join("") + "</tbody></table></div>");
+}
+
+function unroutable(rows) {
+  if (!rows.length) {
+    S.setHTML(S.$("#unroutable"), S.empty("Every demand has a role that can take it — nothing is stuck on the authority axis."));
+    return;
+  }
+  S.setHTML(S.$("#unroutable"),
+    '<div class="tblwrap"><table><thead><tr><th>Status</th><th>Needs capability</th><th>Title</th><th>Priority</th><th>Enqueued</th><th>Routed</th></tr></thead><tbody>'
+    + rows.map(function (u) {
+      var st = u.routed_at
+        ? '<span class="badge ok">routed → ' + esc(u.routed_to) + "</span>"
+        : '<span class="badge bad" title="no enabled role declares this capability: grant it or enable a role, and plan_wakes routes it the next tick">unroutable</span>';
+      return "<tr><td>" + st + "</td><td><code>" + esc(u.require_capability) + "</code></td><td>" + esc(u.title)
+        + (u.priority === "urgent" ? ' <span class="badge bad">urgent</span>' : "") + "</td><td>" + esc(u.priority)
+        + "</td><td>" + rel(u.enqueued_at) + "</td><td>" + (u.routed_at ? rel(u.routed_at) : "—") + "</td></tr>";
+    }).join("") + "</tbody></table></div>");
+}
+
+function channels(d) {
+  S.setHTML(S.$("#channels"), '<div class="chips">' + (d.channels || []).map(function (c) {
+    if (c.outbox) return '<span class="chip" title="the durable ledger row itself — always available, reaches nobody by itself">' + esc(c.name) + " · durable outbox</span>";
+    return '<span class="chip ' + (c.available ? "ok" : "bad") + '">' + esc(c.name) + " · " + (c.available ? "available" : "unavailable") + "</span>";
+  }).join("") + "</div>"
+  + ((d.channels || []).filter(function (c) { return !c.outbox; }).length ? "" :
+    '<div style="margin-top:10px">' + S.empty("No channels registered — the host wires one with deskd.channels.register(name, channel) at startup.") + "</div>"));
+}
+
+async function load() {
+  var d = await S.api("/api/escalations");
+  chanStrip(d);
+  wakeLedger(d.wake || []);
+  meetingLedger(d.meetings || []);
+  unroutable(d.unroutable || []);
+  channels(d);
+  S.$("#foot").textContent = "updated " + new Date().toLocaleTimeString();
+}
+S.autorefresh(load, 10);
+</script>
+</body>
+</html>
