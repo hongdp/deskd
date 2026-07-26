@@ -24,8 +24,17 @@ as `deskd`. See README.md and docs/design.md for the architecture.
   the submodule layout is internal layering, not API. The engine clock is
   `orchestration.store._now`; submodules call it through the module attribute
   so tests can patch that single point.
-- `src/deskd/` — `mailbox.py` (threads + receipts), `meetings.py` (bounded
-  meetings; its split is P4's job, not a file-size cleanup), `channels.py`
+- `src/deskd/meetings/` — bounded meetings as a layered subpackage:
+  `store.py` (schema/clock/role gates/row helpers) → `obligations.py` /
+  `escalations.py` → `sweep.py` (SLA clocks + the wake-request ledger) →
+  `lifecycle.py` / `messaging.py` / `termination.py` → `views.py` →
+  `supervisor.py` (verb allowlist + adapter — the P4 supervisor boundary in
+  embryo). Same facade rule: **import from `deskd.meetings`** — the layout is
+  internal layering, not API. The meetings clock is `meetings.store._now`,
+  called through the module attribute; patch that single point. The split is
+  the file boundary only — P4's *extraction* (bounds/integrity primitives,
+  verb registration, meetings leaving the core) remains open.
+- `src/deskd/` — `mailbox.py` (threads + receipts), `channels.py`
   (pluggable human-facing egress; ledger rows never move here), `auth.py`,
   `cli.py` (`deskd` entry point), `config.py` (holds `__version__`), `web/`
   (console; its `static/*.html` ships in the wheel — keep it under the package)

@@ -284,6 +284,17 @@ instead of copying the logic and missing a bound. That third shape is not
 hypothetical: `mailbox_threads.kind` already discriminates two shapes today, and a
 review workflow already grew alongside meetings.
 
+### Status — the file boundary is drawn (2026-07-25)
+
+`meetings.py` became the `meetings/` subpackage: a mechanical move mirroring
+the orchestration split, not this extraction. Everything P4 owes is still
+owed — the `bounds` and `integrity` primitives, the verb-registration API,
+meetings actually leaving the core. What the split buys P4 is that the
+supervisor boundary now has a file: `meetings/supervisor.py` holds exactly
+the verb allowlist, the claim-checked adapter, and the uninvited join, and
+nothing imports it — so extracting a generic `deskd.supervisor` becomes a
+move rather than an untangling.
+
 ---
 
 ## What this does not become
