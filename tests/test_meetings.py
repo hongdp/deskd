@@ -1810,3 +1810,66 @@ def test_a_debt_nobody_can_pay_is_not_left_standing(desk):
     beta = next(a for a in load if a["role"] == "beta")
     assert (beta.get("meetings") or {}).get("obligations", {}).get("pending", 0) == 0, (
         "an unpayable debt must not sit on the board as work")
+
+
+def test_proposing_an_end_does_not_erase_what_you_owe(desk):
+    """Proposing is not answering. The debts of whoever proposed used to be
+    marked resolved on the way past — harmless while a reply could not create
+    one, and a loophole the moment every message owes an answer: propose an end,
+    have it rejected, and the question you never answered is gone from the
+    ledger while the conversation carries on.
+
+    Nobody is nagged mid-vote either, and that is handled a layer up:
+    `termination_pending` is outside the collector's active/consensus predicate,
+    so a pending proposal raises no demand at all."""
+    thread_id = _start("owe then propose", ["alpha", "beta"])
+    asked = meetings.send_update(thread_id, role="alpha", kind="question",
+                                 body="why this sizing?")["message_id"]
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert owed[asked]["owed_by"] == "beta" and owed[asked]["status"] == "pending"
+
+    meetings.propose_end(thread_id, role="beta", resolution="nothing more from me")
+    still = {o["message_id"]: o for o in
+             meetings.meeting_status(thread_id)["response_obligations"]}
+    assert still[asked]["status"] == "pending", "proposing must not discharge a debt"
+
+    meetings.reject_end(thread_id, role="alpha", reason="you did not answer me")
+    after = {o["message_id"]: o for o in
+             meetings.meeting_status(thread_id)["response_obligations"]}
+    assert after[asked]["status"] == "pending", (
+        "a rejected end returns the conversation AND the debt")
+
+    # Accepting is the honest way out: nobody answered, so it is waived.
+    meetings.propose_end(thread_id, role="beta", resolution="agreed, closing")
+    meetings.confirm_end(thread_id, role="alpha")
+    closed = {o["message_id"]: o for o in
+              meetings.meeting_status(thread_id)["response_obligations"]}
+    assert closed[asked]["status"] == "waived"
+
+
+def test_a_consensus_position_obligates_nobody(desk):
+    """A debt with no legal way to pay it. Consensus mode accepts exactly two
+    kinds — one position per attendee, or a decision — so a counterpart
+    obligated by a position cannot answer it: evidence/question/answer/proposal
+    are refused by the gate, a second position by the one-position rule. The
+    protocol's own next step after positions is the handshake, not a reply."""
+    thread_id = _start("positions", ["alpha", "beta"],
+                       max_messages=4, consensus_threshold=3)
+    meetings.send_update(thread_id, role="alpha", kind="evidence", body="the case")
+    assert _state(thread_id) == "consensus"
+
+    position = meetings.submit_position(
+        thread_id, role="alpha", body="I am for it")["message_id"]
+    owed = {o["message_id"]: o for o in
+            meetings.meeting_status(thread_id)["response_obligations"]}
+    assert position not in owed, (
+        "a position must not mint a debt the gate then refuses to let anyone pay")
+    # The earlier `evidence` debt is untouched and stays payable: consensus
+    # still accepts a `decision`, which is the reply shape this mode is for.
+    assert owed[1]["owed_by"] == "beta" and owed[1]["status"] == "pending"
+    meetings.send_update(thread_id, role="beta", kind="decision", reply_to=1,
+                         body="agreed, and here is my call")
+    settled = {o["message_id"]: o for o in
+               meetings.meeting_status(thread_id)["response_obligations"]}
+    assert settled[1]["status"] == "resolved"

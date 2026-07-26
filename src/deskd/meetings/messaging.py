@@ -311,7 +311,15 @@ def _send_update(conn: sqlite3.Connection, thread_id: str, role: str, body: str,
     # message, the board, the escalation ladder if it matters) but never minted
     # as machine-collectable debt. This ALSO closes a pre-existing hole: a
     # non-reply agent message to the supervisor already created one.
-    if (mode == "one_to_one" and not preamble
+    # `kind != "position"` closes the third shape of the same error: a debt with
+    # no legal way to pay it. A position is a statement of where you stand, and
+    # consensus mode then accepts exactly two kinds — one position per attendee,
+    # or a decision — so a counterpart obligated by a position cannot answer it:
+    # evidence/question/answer/proposal are refused by the consensus gate, a
+    # second position by the one-position rule, and the only in-band move left
+    # is a `decision`, which is a different speech act entirely. The protocol's
+    # own next step after positions is the termination handshake, not a reply.
+    if (mode == "one_to_one" and not preamble and kind != "position"
             and recipient in active_roles
             and recipient != CONFIG.supervisor_role):
         due_at = store._iso(store._now() + dt.timedelta(seconds=meeting["wait_timeout_seconds"]))
