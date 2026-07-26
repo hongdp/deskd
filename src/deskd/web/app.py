@@ -135,6 +135,18 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     def meetings_page():
         return FileResponse(STATIC / "meetings.html")
 
+    @app.get("/wake", include_in_schema=False)
+    def wake_page():
+        return FileResponse(STATIC / "wake.html")
+
+    @app.get("/escalations", include_in_schema=False)
+    def escalations_page():
+        return FileResponse(STATIC / "escalations.html")
+
+    @app.get("/tasks", include_in_schema=False)
+    def tasks_page():
+        return FileResponse(STATIC / "tasks.html")
+
     # --- read-only projections ----------------------------------------------
 
     @app.get("/api/board")
