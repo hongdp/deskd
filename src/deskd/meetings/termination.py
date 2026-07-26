@@ -12,7 +12,7 @@ from ..channels import OUTBOX_CHANNEL, registered_channels
 from ..config import CONFIG
 from . import store
 from .escalations import _queue_escalation, dispatch_escalation
-from .obligations import _resolve_obligations
+from .obligations import _waive_pending_obligations
 from .store import (_active_roles, _agent_role, _attendee, _clean, _event,
                     _has_supervisor, _known_roles, _meeting, _supervisor_claim,
                     connect)
@@ -59,13 +59,23 @@ def _propose_end(conn: sqlite3.Connection, thread_id: str, role: str, resolution
         # you are the only *required* attendee, and _propose_end auto-confirms
         # its own proposer, so a single agent would silently close the human's
         # thread mid-sentence and take the mailbox down with it. Left open costs
-        # nothing now: no obligation is owed by the human, and the idle deadline
-        # retires the thread on its own if it truly goes quiet.
+        # nothing now: no obligation is ever owed BY the human (an SLA's
+        # enforcement arm wakes agents, and the supervisor is not one — see the
+        # guard in messaging._send_update), and the idle deadline retires the
+        # thread on its own if it truly goes quiet, after which the collector
+        # raises nothing for it.
         raise ValueError(
             "a one-to-one with the supervisor is theirs to end; leave it open")
-    _resolve_obligations(
-        conn, thread_id, role, resolution="termination proposal answered pending update",
-    )
+    # Proposing an end does NOT discharge what you owe. It used to: the debts
+    # of whoever proposed were marked resolved on the way past, which was
+    # harmless while a reply could not create one and became a loophole the
+    # moment every message owed an answer — propose an end, get rejected, and
+    # the question you never answered is gone from the ledger while the
+    # conversation carries on. The concern that motivated the resolve (do not
+    # nag someone mid-vote) is already handled a layer up: `termination_pending`
+    # is not in the collector's `active`/`consensus` predicate, so no demand is
+    # raised at all while a proposal is on the table. Accepted, the close waives
+    # it; rejected, the debt is real again, which is the correct answer.
     now = store._iso()
     cursor = conn.execute(
         """INSERT INTO meeting_terminations
@@ -152,6 +162,20 @@ def _close_meeting(conn: sqlite3.Connection, thread_id: str, resolution: str,
            WHERE thread_id=? AND status='pending'""",
         (now, thread_id),
     )
+    # Same rule, same reason, the other ledger: a closed meeting owes no replies.
+    # Every one-to-one message owes one, so the LAST message of every such
+    # meeting leaves a pending debt by construction — and a debt in a meeting
+    # nobody can rejoin cannot be discharged by anything an agent does.
+    # collect_wake_demand's owed_reply already declines to raise those (its
+    # predicate requires state IN ('active','consensus')), so this is not what
+    # stops the wake loop; it stops the row from OUTLIVING the conversation.
+    # Left standing it is a permanent "owes a reply" badge on the board —
+    # _meeting_load counts pending obligations with no state filter at all — and
+    # a standing invitation for the next consumer to forget the state clause.
+    # Waived, never resolved: nobody answered, and the ledger must not say they
+    # did. This is the single place a meeting closes, so it is the single place
+    # this can be done once for the handshake and force_close alike.
+    _waive_pending_obligations(conn, thread_id, f"meeting closed: {resolution}")
     _event(conn, thread_id, "closed", actor, resolution, auth_nonce)
 
 
@@ -220,9 +244,9 @@ def _vote_end(conn: sqlite3.Connection, thread_id: str, role: str, vote: str,
                 "supervisor assertion is bound to a different termination proposal")
         if expected_action == "reject_end" and claim.get("reason") != reason:
             raise ValueError("supervisor assertion rejection reason mismatch")
-    _resolve_obligations(
-        conn, thread_id, role, resolution=f"termination {vote} answered pending update",
-    )
+    # Same for voting, and the reject case is why it matters: a vote is not an
+    # answer to the question you were asked, and rejecting an end explicitly
+    # continues the conversation the debt belongs to.
     now = store._iso()
     conn.execute(
         """INSERT OR REPLACE INTO meeting_termination_votes

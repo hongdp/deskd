@@ -272,7 +272,56 @@ def _send_update(conn: sqlite3.Connection, thread_id: str, role: str, body: str,
                WHERE message_id=? AND owed_by=? AND status='pending'""",
             (now, message_id, reply_to, role),
         )
-    elif mode == "one_to_one" and not preamble:
+    # INDEPENDENT of the settle above, not the other arm of it. These two were
+    # `if`/`elif`, and that quietly ended turn-taking in the commonest case a
+    # conversation has: answering a question with a question. Observed live on
+    # 2026-07-26 — the console sets reply_to on a supervisor message whenever the
+    # supervisor owes a reply, so a supervisor asking an analyst "can we buy
+    # Apple?" while discharging the previous turn settled its own debt and
+    # created none. No obligation row, therefore no SLA, no overdue sweep, no
+    # owed_reply wake demand: the analyst read it, never answered in thread, and
+    # nothing in the engine noticed. Agent-to-agent pairs had the identical hole.
+    #
+    # What a message ANSWERS and what it ASKS are two different facts about it,
+    # and a protocol that stores them in one slot can only ever record one. That
+    # is the same conflation `resolves` was split out of reply_to to undo (see
+    # above), one layer down: reply_to settles, mode creates, neither speaks for
+    # the other. `_mode` has documented the contract all along — "one_to_one
+    # imposes strict turn-taking (every message owes a reply)" — this is the
+    # first code that implements it.
+    #
+    # Two guards, and both are load-bearing.
+    #
+    # `recipient in active_roles` stops this minting debt nobody can pay:
+    # BROADCAST is owed by nobody, and a reply to an attendee who has since LEFT
+    # must not obligate them — the leave path just waived their debts, and
+    # re-arming one behind them would wake a role with no seat.
+    #
+    # `recipient != supervisor` is the constitutional one. An obligation is an
+    # SLA with a wake ladder behind it, and this engine's ladder wakes AGENTS:
+    # `collect_wake_demand` filters by nothing, `_start_level` opens at the
+    # `spawn` rung, and the driver executing that plan would be told to launch a
+    # session declaring itself the supervisor — a role the same engine refuses
+    # everywhere else (`_agent_role`, `agent_detail`, `wake_sources` all reject
+    # it) and which the host desk's constitution forbids an agent to claim. A
+    # human cannot be put on an SLA by the machine that is waiting on them; the
+    # engine's own precedent is the attendance sweep — "only agents can be
+    # woken; a missing supervisor is a human problem and rides out on the
+    # escalation instead". So an agent's question to a human is surfaced (the
+    # message, the board, the escalation ladder if it matters) but never minted
+    # as machine-collectable debt. This ALSO closes a pre-existing hole: a
+    # non-reply agent message to the supervisor already created one.
+    # `kind != "position"` closes the third shape of the same error: a debt with
+    # no legal way to pay it. A position is a statement of where you stand, and
+    # consensus mode then accepts exactly two kinds — one position per attendee,
+    # or a decision — so a counterpart obligated by a position cannot answer it:
+    # evidence/question/answer/proposal are refused by the consensus gate, a
+    # second position by the one-position rule, and the only in-band move left
+    # is a `decision`, which is a different speech act entirely. The protocol's
+    # own next step after positions is the termination handshake, not a reply.
+    if (mode == "one_to_one" and not preamble and kind != "position"
+            and recipient in active_roles
+            and recipient != CONFIG.supervisor_role):
         due_at = store._iso(store._now() + dt.timedelta(seconds=meeting["wait_timeout_seconds"]))
         conn.execute(
             """INSERT INTO meeting_response_obligations

@@ -38,9 +38,17 @@ def _meeting_load(conn: sqlite3.Connection) -> dict:
              AND r.message_id IS NULL
            GROUP BY a.role""", (_RECIPIENT_ALL,)).fetchall()}
     oblig = {}
+    # Same payable-or-not rule the wake collector uses: a debt in a meeting
+    # nobody can speak in is not work the role can do, and counting it leaves a
+    # permanent "owes a reply" badge on the board that no action clears.
     for owed, cnt, due in conn.execute(
-            """SELECT owed_by, COUNT(*), MIN(due_at) FROM meeting_response_obligations
-               WHERE status='pending' GROUP BY owed_by""").fetchall():
+            """SELECT o.owed_by, COUNT(*), MIN(o.due_at)
+               FROM meeting_response_obligations o
+               JOIN meetings m ON m.thread_id=o.thread_id
+               JOIN mailbox_threads t ON t.id=o.thread_id
+               WHERE o.status='pending' AND m.state IN ('active','consensus')
+                 AND t.status='open'
+               GROUP BY o.owed_by""").fetchall():
         oblig[owed] = {"pending": cnt, "next_due_at": due}
     active_meetings: dict[str, list[dict]] = {}
     for role, thread_id, agenda in conn.execute(
