@@ -42,9 +42,10 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import auth
+from .. import auth, channels
 from .. import config as config_mod
 from .. import meetings, orchestration
 from ..config import EngineConfig
@@ -109,6 +110,11 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
 
     app = FastAPI(title=f"{config_mod.PROJECT_NAME} console")
 
+    # Shared shell assets (deskd.css + shell.js): every page loads these two
+    # files instead of pasting its own CSS/JS — the design system lives in one
+    # place. Starlette's StaticFiles is read-only and part of FastAPI itself.
+    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
     # --- pages --------------------------------------------------------------
 
     @app.get("/", include_in_schema=False)
@@ -129,6 +135,18 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     def meetings_page():
         return FileResponse(STATIC / "meetings.html")
 
+    @app.get("/wake", include_in_schema=False)
+    def wake_page():
+        return FileResponse(STATIC / "wake.html")
+
+    @app.get("/escalations", include_in_schema=False)
+    def escalations_page():
+        return FileResponse(STATIC / "escalations.html")
+
+    @app.get("/tasks", include_in_schema=False)
+    def tasks_page():
+        return FileResponse(STATIC / "tasks.html")
+
     # --- read-only projections ----------------------------------------------
 
     @app.get("/api/board")
@@ -147,8 +165,73 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
         return orchestration.delivery_ledger(meeting)
 
     @app.get("/api/meetings")
-    def api_meetings(include_closed: bool = False):
-        return meetings.list_meetings(include_closed=include_closed)
+    def api_meetings(include_closed: bool = False, day: str | None = None):
+        # `day` narrows CLOSED meetings only — the engine refuses to let a
+        # history filter hide a live meeting (see list_meetings).
+        try:
+            return meetings.list_meetings(include_closed=include_closed, day=day)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/meeting-days")
+    def api_meeting_days():
+        """Local dates with at least one closed meeting — real choices for the
+        console's day picker instead of a blank date box."""
+        return meetings.meeting_days()
+
+    @app.get("/api/agent/{role}/wake-sources")
+    def api_agent_wake_sources(role: str):
+        """'What can currently wake this agent' — the engine's own answer."""
+        try:
+            return orchestration.wake_sources(role)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/api/wake")
+    def api_wake(limit: int = 200):
+        """The escalation ladder in force (with per-rung wiring status) and the
+        attempt ledger. Pending demands are the attempts with outcome='pending';
+        grouping them per demand is presentation, so it stays in the client."""
+        return {
+            "ladder": orchestration.wake_ladder_view(),
+            "attempts": orchestration.wake_attempts_recent(min(limit, 1000)),
+        }
+
+    @app.get("/api/escalations")
+    def api_escalations(limit: int = 200):
+        """Every path by which this desk pulls a human in, and whether each one
+        currently works: the wake_escalations human-rung ledger, meeting
+        escalations, demands no enabled role may take, and channel health."""
+        capped = min(limit, 1000)
+        return {
+            "wake": orchestration.wake_escalations_recent(capped),
+            "meetings": meetings.list_escalations()[:capped],
+            "unroutable": orchestration.unroutable_list(include_routed=True,
+                                                        limit=capped),
+            "channels": channels.channel_status(),
+            "human_reachable": channels.human_reachable(),
+        }
+
+    @app.get("/api/tasks")
+    def api_tasks(role: str | None = None, status: str | None = None,
+                  include_closed: bool = False):
+        """Cross-role task browser + the engine's actionable/stalled verdict.
+        stalled_ids lets the client mark rows without re-deriving the split."""
+        queue = orchestration.task_queue(role)
+        return {
+            "tasks": orchestration.tasks(assignee_role=role, status=status,
+                                         include_closed=include_closed),
+            "stalled_ids": [t["id"] for t in queue["stalled"]],
+        }
+
+    @app.get("/api/hooks")
+    def api_hooks(role: str | None = None, include_closed: bool = True):
+        return orchestration.hooks(owner_role=role, include_closed=include_closed)
+
+    @app.get("/api/channels")
+    def api_channels():
+        return {"channels": channels.channel_status(),
+                "human_reachable": channels.human_reachable()}
 
     @app.get("/api/meeting-meta")
     def api_meeting_meta():

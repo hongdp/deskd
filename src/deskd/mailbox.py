@@ -111,8 +111,9 @@ _STAGE_NEXT_PHASE = {"report": "cross_review", "review": "discussion"}
 # not configuration.
 #
 # A HOST vocabulary MUST NOT. No CHECK below names a role, sender, recipient or
-# provenance kind — that is orchestration.py's principle ("a CHECK would freeze
-# one host's vocabulary into every host's database file"), and it holds because
+# provenance kind — that is the orchestration package's principle (see
+# orchestration/store.py: "a CHECK would freeze one host's vocabulary into
+# every host's database file"), and it holds because
 # those words come from CONFIG and the registry, which no DDL can see. They are
 # validated in Python against the registry instead.
 #

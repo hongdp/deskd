@@ -90,6 +90,17 @@ def tasks(*, assignee_role: str | None = None, status: str | None = None,
     return rows
 
 
+def task_queue(role: str | None = None,
+               db_path: Path | str | None = None) -> dict:
+    """The (actionable, stalled) split as a public read view. The board ships
+    only the stalled COUNT; the tasks console needs the rows, and the split is
+    engine logic (_queued_tasks reads the wake ledger), so it is surfaced here
+    rather than re-derived in any web layer."""
+    with connect(db_path) as conn:
+        actionable, stalled = _queued_tasks(conn, role)
+    return {"actionable": actionable, "stalled": stalled}
+
+
 def _apply_blocked_on(updates: dict, current) -> None:
     """Hold the resulting row to: blocked IFF it names what it is blocked ON.
 
