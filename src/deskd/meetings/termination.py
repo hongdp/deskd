@@ -12,7 +12,7 @@ from ..channels import OUTBOX_CHANNEL, registered_channels
 from ..config import CONFIG
 from . import store
 from .escalations import _queue_escalation, dispatch_escalation
-from .obligations import _resolve_obligations
+from .obligations import _resolve_obligations, _waive_pending_obligations
 from .store import (_active_roles, _agent_role, _attendee, _clean, _event,
                     _has_supervisor, _known_roles, _meeting, _supervisor_claim,
                     connect)
@@ -59,8 +59,12 @@ def _propose_end(conn: sqlite3.Connection, thread_id: str, role: str, resolution
         # you are the only *required* attendee, and _propose_end auto-confirms
         # its own proposer, so a single agent would silently close the human's
         # thread mid-sentence and take the mailbox down with it. Left open costs
-        # nothing now: no obligation is owed by the human, and the idle deadline
-        # retires the thread on its own if it truly goes quiet.
+        # little: the idle deadline retires the thread on its own if it truly
+        # goes quiet. It is not free — a DM's last message obligates whoever it
+        # was addressed to, the human included — but an obligation is nudged,
+        # never enforced, and a supervisor-owed one is floored at the rung that
+        # leaves the machine (wake.py::_role_floor), so it reaches the person
+        # whose conversation it is and never spawns a session about it.
         raise ValueError(
             "a one-to-one with the supervisor is theirs to end; leave it open")
     _resolve_obligations(
@@ -152,6 +156,20 @@ def _close_meeting(conn: sqlite3.Connection, thread_id: str, resolution: str,
            WHERE thread_id=? AND status='pending'""",
         (now, thread_id),
     )
+    # Same rule, same reason, the other ledger: a closed meeting owes no replies.
+    # Every one-to-one message owes one, so the LAST message of every such
+    # meeting leaves a pending debt by construction — and a debt in a meeting
+    # nobody can rejoin cannot be discharged by anything an agent does.
+    # collect_wake_demand's owed_reply already declines to raise those (its
+    # predicate requires state IN ('active','consensus')), so this is not what
+    # stops the wake loop; it stops the row from OUTLIVING the conversation.
+    # Left standing it is a permanent "owes a reply" badge on the board —
+    # _meeting_load counts pending obligations with no state filter at all — and
+    # a standing invitation for the next consumer to forget the state clause.
+    # Waived, never resolved: nobody answered, and the ledger must not say they
+    # did. This is the single place a meeting closes, so it is the single place
+    # this can be done once for the handshake and force_close alike.
+    _waive_pending_obligations(conn, thread_id, f"meeting closed: {resolution}")
     _event(conn, thread_id, "closed", actor, resolution, auth_nonce)
 
 

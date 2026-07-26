@@ -272,7 +272,34 @@ def _send_update(conn: sqlite3.Connection, thread_id: str, role: str, body: str,
                WHERE message_id=? AND owed_by=? AND status='pending'""",
             (now, message_id, reply_to, role),
         )
-    elif mode == "one_to_one" and not preamble:
+    # INDEPENDENT of the settle above, not the other arm of it. These two were
+    # `if`/`elif`, and that quietly ended turn-taking in the commonest case a
+    # conversation has: answering a question with a question. Observed live on
+    # 2026-07-26 — the console sets reply_to on a supervisor message whenever the
+    # supervisor owes a reply, so a supervisor asking an analyst "can we buy
+    # Apple?" while discharging the previous turn settled its own debt and
+    # created none. No obligation row, therefore no SLA, no overdue sweep, no
+    # owed_reply wake demand: the analyst read it, never answered in thread, and
+    # nothing in the engine noticed. Agent-to-agent pairs had the identical hole.
+    #
+    # What a message ANSWERS and what it ASKS are two different facts about it,
+    # and a protocol that stores them in one slot can only ever record one. That
+    # is the same conflation `resolves` was split out of reply_to to undo (see
+    # above), one layer down: reply_to settles, mode creates, neither speaks for
+    # the other. `_mode` has documented the contract all along — "one_to_one
+    # imposes strict turn-taking (every message owes a reply)" — this is the
+    # first code that implements it.
+    #
+    # `recipient in active_roles` is the whole guard, and it is what stops this
+    # minting debt nobody can pay. BROADCAST is owed by nobody, and a reply to a
+    # message from an attendee who has since LEFT must not obligate them: the
+    # leave path just waived their debts, and re-arming one behind them would
+    # wake a role that has no seat. The supervisor is obligated like any other
+    # party (this already happened for non-reply messages) — a question an agent
+    # asks a human must not evaporate either — and orchestration floors a
+    # supervisor-owed wake at the first rung that leaves the machine rather than
+    # spawning a session for a role no session may claim (wake.py::_role_floor).
+    if mode == "one_to_one" and not preamble and recipient in active_roles:
         due_at = store._iso(store._now() + dt.timedelta(seconds=meeting["wait_timeout_seconds"]))
         conn.execute(
             """INSERT INTO meeting_response_obligations
