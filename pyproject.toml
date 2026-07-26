@@ -4,23 +4,31 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deskd"
-description = "A domain-agnostic orchestration engine for multi-agent desks: presence, a unified inbox, bounded meetings, and a wake ladder that proves delivery."
+description = "Between-turn orchestration for headless AI agents: a durable wake ladder, per-message delivery receipts, bounded meetings, and a supervisor boundary — one SQLite file, no daemons."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "deskd contributors" }]
-keywords = ["agents", "orchestration", "multi-agent", "scheduling", "sqlite"]
+keywords = [
+    "agents", "orchestration", "multi-agent", "scheduling", "sqlite",
+    "ai", "llm", "ai-agents", "agent-orchestration", "claude", "claude-code",
+    "human-in-the-loop", "cron", "scheduler", "durable",
+]
 # No "License :: OSI Approved :: MIT License" classifier: PEP 639 supersedes it
 # with the SPDX `license` field above, and PyPI rejects an upload that carries
 # both a License-Expression and a license classifier.
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: Web Environment",
     "Intended Audience :: Developers",
+    "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Topic :: System :: Distributed Computing",
 ]
@@ -33,14 +41,17 @@ dependencies = ["cryptography>=41"]
 dynamic = ["version"]
 
 [project.optional-dependencies]
-# The console (board / agent detail / meetings + the supervisor adapter).
+# The console (six views: board, agent detail, meetings, wake ladder,
+# escalations, tasks & hooks — plus the supervisor adapter).
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
 dev = ["pytest>=8"]
 
 [project.urls]
 Homepage = "https://github.com/hongdp/deskd"
-Documentation = "https://github.com/hongdp/deskd/blob/main/docs/design.md"
-Source = "https://github.com/hongdp/deskd"
+Repository = "https://github.com/hongdp/deskd"
+Documentation = "https://github.com/hongdp/deskd/blob/main/docs/README.md"
+Issues = "https://github.com/hongdp/deskd/issues"
+Changelog = "https://github.com/hongdp/deskd/releases"
 
 [project.scripts]
 deskd = "deskd.cli:main"
