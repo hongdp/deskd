@@ -42,6 +42,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import auth
@@ -108,6 +109,11 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
               "port acts as supervisor. Bind to a host you trust.")
 
     app = FastAPI(title=f"{config_mod.PROJECT_NAME} console")
+
+    # Shared shell assets (deskd.css + shell.js): every page loads these two
+    # files instead of pasting its own CSS/JS — the design system lives in one
+    # place. Starlette's StaticFiles is read-only and part of FastAPI itself.
+    app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     # --- pages --------------------------------------------------------------
 
