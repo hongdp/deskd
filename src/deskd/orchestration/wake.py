@@ -150,12 +150,45 @@ def collect_wake_demand(conn: sqlite3.Connection) -> list[dict]:
     # rows that predate that rule (or arrive through a future path it misses)
     # must not wake anyone — a closed meeting cannot even be checked in to, so
     # the demand would regenerate every tick with no legal way to satisfy it.
+    seen_meeting: set = set()
     for r in conn.execute(
             """SELECT w.role, w.thread_id, m.agenda, w.created_at
                FROM meeting_wake_requests w JOIN meetings m ON m.thread_id=w.thread_id
                WHERE w.status='pending' AND m.state!='closed'"""):
+        seen_meeting.add((r["role"], r["thread_id"]))
         demands.append({"role": r["role"], "reason_kind": "meeting_wake",
                         "source_ref": r["thread_id"], "label": r["agenda"],
+                        "since_at": r["created_at"]})
+    # An unpaid vote is demand even when the notification was signed for. The
+    # request table records what was SENT; this asks what is OWED, and for a
+    # termination vote the ledger can tell the difference. Measured on a live
+    # desk 2026-07-27: proposal at 07:38:31, the voter acked within 30s while
+    # mid-turn on other work, never read the thread, and the demand vanished
+    # with the ack — four planner ticks passed with a meeting that could not
+    # close and nothing asking anyone to close it, until the sweep's timeout
+    # re-arm five minutes later. A safety net was doing a first-order job.
+    #
+    # Deliberately narrow: only the vote, because only the vote has a ledger
+    # row that says whether the work happened. Ordinary meeting wakes keep
+    # settling on the ack — an agent that acks has the thread in front of it,
+    # and a demand that no action can clear would climb forever.
+    for r in conn.execute(
+            """SELECT a.role, t.thread_id, m.agenda, t.created_at
+                 FROM meeting_terminations t
+                 JOIN meetings m ON m.thread_id=t.thread_id
+                 JOIN meeting_attendees a ON a.thread_id=t.thread_id
+                WHERE t.status='pending' AND m.state='termination_pending'
+                  AND a.required=1 AND a.checked_in_at IS NOT NULL
+                  AND a.stopped_at IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM meeting_termination_votes v
+                                   WHERE v.proposal_id=t.id AND v.role=a.role)"""):
+        if (r["role"], r["thread_id"]) in seen_meeting:
+            continue
+        if r["role"] not in _known_roles(conn):
+            continue    # the supervisor votes from the console, not on an SLA
+        demands.append({"role": r["role"], "reason_kind": "meeting_wake",
+                        "source_ref": r["thread_id"],
+                        "label": f'{r["agenda"]} — your vote closes it',
                         "since_at": r["created_at"]})
     wake = _wake_keys(conn)
     # A CLOSED thread raises no wake. Its ledger rows still read `overdue` — that
@@ -244,7 +277,29 @@ def _demand_resolved(conn: sqlite3.Connection, role: str, reason_kind: str, sour
             "SELECT 1 FROM meeting_wake_requests WHERE thread_id=? AND role=? "
             "AND status='pending'",
             (source_ref, role)).fetchone()
-        return (pend is None, "acked")
+        if pend is not None:
+            return (False, "")
+        # An ack is a signature, not the work. For most meeting wakes the two
+        # are close enough — an agent that acks has the thread in front of it.
+        # A termination vote is the exception, because the ledger can tell the
+        # difference: acking says "seen", voting is the thing the meeting is
+        # actually waiting for, and an agent that acks mid-turn and returns to
+        # what it was doing leaves a meeting that cannot close with no demand
+        # standing anywhere. Measured on a live desk 2026-07-27: proposal
+        # 07:38:31, ack within 30s, thread never read, and nothing raised it
+        # again until the sweep's timeout re-arm at 07:44:01.
+        owes_vote = conn.execute(
+            """SELECT 1 FROM meeting_terminations t
+                JOIN meetings m ON m.thread_id=t.thread_id
+                JOIN meeting_attendees a ON a.thread_id=t.thread_id AND a.role=?
+               WHERE t.thread_id=? AND t.status='pending'
+                 AND m.state='termination_pending'
+                 AND a.required=1 AND a.checked_in_at IS NOT NULL
+                 AND a.stopped_at IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM meeting_termination_votes v
+                                  WHERE v.proposal_id=t.id AND v.role=a.role)""",
+            (role, source_ref)).fetchone()
+        return (owes_vote is None, "acked")
     if reason_kind == "urgent_task":
         try:
             tid = int(source_ref)
