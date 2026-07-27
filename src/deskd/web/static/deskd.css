@@ -582,8 +582,24 @@ a.dk-phone:hover { text-decoration: none; filter: brightness(1.04); }
 @keyframes dk-ring { 0%,70%,100% { transform: rotate(0deg); } 75% { transform: rotate(-12deg); } 85% { transform: rotate(12deg); } }
 @media (prefers-reduced-motion: reduce) { .dk-phone.live svg { animation: none; } }
 /* An away desk now carries its state as well as its rooms; keep them apart. */
-.desk.away .dk-now { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+
 /* `idle` was in neither dot map, so a parked agent inherited the muted default
    and read like a dead one. It is resumable; give it its own colour. */
 .dot.idle { background: var(--accent); }
 .av.lv-idle { box-shadow: inset 0 0 0 2px var(--accent); }
+
+/* --- an away desk is an EMPTY desk ---------------------------------------- */
+/* It used to carry the same avatar, liveness dot and state line as an occupied
+   one, so an agent seated in a meeting room ALSO read as sitting at their
+   desk: one person, two places, on a map whose only job is where everybody
+   is. The chair is hollow now and the room is the headline; what the engine
+   still knows about them survives as a footnote (deleting it was the previous
+   mistake, in the other direction). */
+.av.ghost { background: transparent; color: var(--muted); box-shadow: inset 0 0 0 1px var(--line); }
+.desk.away .dk-name { color: var(--text-2); }
+.dk-live.vacated { color: var(--muted); font-style: italic; }
+.desk.away .dk-away { background: var(--surface-2); border-radius: 8px; padding: 7px 9px; }
+.desk.away .dk-away-h { color: var(--text-2); font-weight: 600; }
+.dk-elsewhere { margin-top: 8px; padding-top: 7px; border-top: 1px dashed var(--line); opacity: .72; font-size: 11.5px; }
+.dk-elsewhere .dk-state { font-weight: 500; color: var(--muted); }
+.dk-elsewhere .dk-state::before { content: "still reporting · "; }
