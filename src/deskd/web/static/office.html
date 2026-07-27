@@ -92,35 +92,43 @@ function seatHtml(p) {
     + owes + "</div>";
 }
 
-// People are drawn AROUND the table: alternating chairs above and below it, so
-// a room with one person reads as one person at the head of a table, and six
-// still fit without the card growing a scrollbar.
+// Chairs wrap around one table rather than being split above and below it. The
+// alternating version read as two tables the moment a third person arrived —
+// index parity put 4 above and 3 below at seven, and the top group wrapped to
+// its own row — so a room of colleagues looked like two rooms.
 function tableHtml(room) {
   var chairs = room.seated.concat(room.invited);
-  var top = chairs.filter(function (_, i) { return i % 2 === 0; });
-  var bottom = chairs.filter(function (_, i) { return i % 2 === 1; });
-  var used = room.maxMessages ? Math.min(100, Math.round(100 * (room.messageCount || 0) / room.maxMessages)) : 0;
+  var used = room.maxMessages
+    ? Math.min(100, Math.round(100 * (room.messageCount || 0) / room.maxMessages)) : 0;
   var budget = room.messagesRemaining == null ? "no budget"
     : room.messagesRemaining + " of " + room.maxMessages + " messages left";
-  var seats = function (arr) {
-    return arr.length ? '<div class="seats">' + arr.map(seatHtml).join("") + "</div>" : "";
-  };
-  return '<div class="rm-floor">' + seats(top)
-    + '<div class="rm-table" title="' + esc(budget) + '"><span class="rm-burn" style="width:' + used + '%"></span>'
-    + '<span class="rm-budget">' + esc(budget) + "</span></div>"
-    + seats(bottom)
-    + (chairs.length ? "" : '<div class="rm-nobody">no chairs taken</div>') + "</div>";
+  return '<div class="rm-floor">'
+    + (chairs.length ? '<div class="seats">' + chairs.map(seatHtml).join("") + "</div>"
+                     : '<div class="rm-nobody">no chairs taken</div>')
+    // The budget is the one thing physically on the table: a meter that fills
+    // as the room spends its words, labelled, with the spent share shaded
+    // strongly enough to read in both themes.
+    + '<div class="rm-table" title="' + esc(budget) + " — a bounded meeting cannot run forever"
+    + '"><span class="rm-burn" style="width:' + used + '%"></span>'
+    + '<span class="rm-budget">' + esc(budget) + "</span></div></div>";
 }
 
 function roomNotes(room) {
   var out = "";
   if (room.threadRetired)
+    // The status is a fact; WHY it was retired (idle deadline? spent budget?
+    // stopped by hand?) is not in this payload, and naming a cause we cannot
+    // see is how a map starts lying.
     out += '<div class="rm-note bad">Thread ' + esc(S.human(room.threadStatus))
-      + " — the idle deadline retired it; nobody can speak in this room.</div>";
-  if (room.empty) {
+      + " — nobody can speak in this room until it is resumed.</div>";
+  if (room.neverArrived) {
     var waiting = room.invited.map(function (p) { return p.name; });
     out += '<div class="rm-note warn">Nobody has walked in yet'
       + (waiting.length ? " — waiting on <b>" + esc(waiting.join(", ")) + "</b>" : "") + ".</div>";
+  } else if (room.emptied) {
+    out += '<div class="rm-note warn">The room is empty — everyone who was here has left'
+      + (room.invited.length ? ", and <b>" + esc(room.invited.map(function (p) { return p.name; }).join(", "))
+         + "</b> never arrived" : "") + ".</div>";
   }
   if (room.wrappingUp && room.termination) {
     var t = room.termination;
@@ -146,13 +154,16 @@ function roomNotes(room) {
 function roomHtml(room) {
   var badges = '<span class="badge ' + S.stateClass(room.state) + '">' + esc(S.human(room.state)) + "</span>"
     + (room.priority === "urgent" ? '<span class="badge bad">urgent</span>' : "")
-    + '<span class="badge">' + esc(S.human(room.mode)) + "</span>";
+    + (S.human(room.mode) === S.human(room.state) ? ""
+       : '<span class="badge" title="discussion mode: one_to_one imposes strict turn-taking">'
+         + esc(S.human(room.mode)) + "</span>");
   return '<section class="room' + (room.empty ? " vacant" : "") + (room.wrappingUp ? " wrapping" : "")
     + '" id="' + esc(room.anchor) + '">'
     + '<div class="rm-head"><h3 title="' + esc(room.agenda) + '"><a href="/meetings">' + esc(room.agenda) + "</a></h3>"
     + '<div class="rm-tags">' + badges + "</div></div>"
     + '<div class="rm-meta">' + esc(S.human(room.meetingType)) + " · called by " + esc(room.calledBy)
     + " · started " + rel(room.createdAt) + " · " + room.seated.length + " at the table"
+    + (room.invited.length ? " · " + room.invited.length + " invited" : "")
     + (room.humanPresent ? ' · <span class="hint-human">the supervisor is in the room</span>' : "") + "</div>"
     + tableHtml(room) + roomNotes(room) + "</section>";
 }
@@ -179,19 +190,28 @@ function phoneHtml(d) {
   if (!d.ringing) return "";
   var r = d.ringing;
   var rung = r.channel ? "L" + r.level + " · " + S.human(r.channel) : "rung L" + r.level;
-  var why = r.leavesMachine
-    ? (r.wired ? "a person is being pulled in" : "the human rung is UNWIRED — it stops at the outbox")
-    : "machine rungs are still trying";
-  return '<a class="dk-phone ' + (r.leavesMachine ? "bad" : "warn") + '" href="/wake" title="' + esc(why) + '">'
-    + PHONE + "<span>ringing · " + esc(rung) + " · <b>" + r.pending + "</b> pending</span></a>";
+  var lead = { ringing: "ringing", parked: "parked on the board", unwired: "reaching nobody" }[r.mode];
+  var why = {
+    ringing: r.leavesMachine ? "a person is being pulled in" : "machine rungs are still trying",
+    parked: "the terminal rung: it sits on the console until someone acts — nothing is ringing",
+    unwired: "this rung leaves the machine but no channel is wired, so the page IS the delivery"
+  }[r.mode];
+  // Only a genuinely ringing phone animates and only an unreachable one is red:
+  // an operator who sees the same alarm for "help is coming" and "nobody will
+  // come" learns to read neither.
+  var cls = r.mode === "unwired" ? "bad" : (r.mode === "parked" ? "" : "warn")
+    + (r.mode === "ringing" ? " live" : "");
+  return '<a class="dk-phone ' + cls + '" href="/wake" title="' + esc(why) + '">'
+    + PHONE + "<span>" + esc(lead) + " · " + esc(rung) + " · <b>" + r.pending
+    + "</b> pending</span></a>";
 }
 // An empty desk says where its owner went. Each room is one ellipsized line
 // with the full agenda on hover: a 200-character agenda must not turn a desk
 // card into a paragraph (and two of them, for an agent sitting in two meetings,
 // into a wall).
 function awayHtml(d) {
-  var head = d.away.length === 1 ? "Away — in this room:"
-    : "Away — in " + d.away.length + " rooms at once:";
+  var head = d.away.length === 1 ? "In this room:"
+    : "In " + d.away.length + " rooms at once:";
   return '<div class="dk-away"><span class="dk-away-h">' + head + "</span>"
     + d.away.map(function (m) {
       return '<a class="rmlink" href="#' + esc(m.anchor) + '" title="' + esc(m.agenda)
@@ -216,7 +236,10 @@ function nowHtml(d) {
 }
 function deskHtml(d) {
   var url = "/agent/" + encodeURIComponent(d.role);
-  var body = d.atDesk ? nowHtml(d) : awayHtml(d);
+  // Away shows BOTH: which rooms, and the state the engine still has for them.
+  // The first version replaced the state entirely, so an agent in a meeting
+  // read as a blank desk and the summary line counted it as nobody working.
+  var body = d.atDesk ? nowHtml(d) : (awayHtml(d) + nowHtml(d));
   return '<section class="desk' + (d.atDesk ? "" : " away") + (d.ringing ? " ringing" : "") + '">'
     + '<div class="dk-head">' + avatar(d.name, d.liveness)
     + '<div class="dk-id"><a class="dk-name" href="' + url + '">' + esc(d.name) + "</a>"
@@ -232,7 +255,7 @@ function strip(st) {
       + (n == null ? "" : " <b>" + n + "</b>") + "</span>";
   }
   S.setHTML(S.$("#strip"),
-    cell("working at their desks", st.working)
+    cell("at their desks, working", st.working)
     + (st.quiet ? cell("desks quiet — parked or offline", st.quiet, "mute") : "")
     + cell("in a meeting", st.inMeetings)
     + cell("rooms in use", st.rooms - st.roomsEmpty)

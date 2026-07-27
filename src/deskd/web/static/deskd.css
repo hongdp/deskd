@@ -552,3 +552,28 @@ a.dk-phone:hover { text-decoration: none; filter: brightness(1.04); }
   .tb-inner { padding: 8px clamp(10px, 3vw, 28px); }
   .rooms, .desks { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* --- office floor: corrections from the first visual review ---------------- */
+/* A room reached from a desk link must land below the sticky topbar, not
+   behind it — the page's signature interaction was scrolling its own answer
+   out of sight. */
+.room { scroll-margin-top: 68px; }
+/* The spent share of a meeting's message budget has to be legible in both
+   themes; at --line-soft over --surface-2 it computed to ~1.15:1 and read as
+   an empty bar pointing the wrong way. */
+.rm-burn { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+:root:not([data-theme=light]) .rm-burn { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme=light]) .rm-burn { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+}
+/* Only a phone that is genuinely ringing animates. Parked and unwired rungs
+   are states to read, not alarms to obey. */
+.dk-phone.live svg { animation: dk-ring 1.6s ease-in-out infinite; }
+@keyframes dk-ring { 0%,70%,100% { transform: rotate(0deg); } 75% { transform: rotate(-12deg); } 85% { transform: rotate(12deg); } }
+@media (prefers-reduced-motion: reduce) { .dk-phone.live svg { animation: none; } }
+/* An away desk now carries its state as well as its rooms; keep them apart. */
+.desk.away .dk-now { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+/* `idle` was in neither dot map, so a parked agent inherited the muted default
+   and read like a dead one. It is resumable; give it its own colour. */
+.dot.idle { background: var(--accent); }
+.av.lv-idle { box-shadow: inset 0 0 0 2px var(--accent); }

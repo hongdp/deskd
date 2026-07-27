@@ -474,9 +474,13 @@ def test_floor_model_survives_a_never_seen_agent_and_a_long_activity(tmp_path):
     assert alpha["ringing"] is None and alpha["trays"]["inbox"] == 0
     assert beta["activity"] == activity           # untruncated in the model
     # A climbing ladder names its rung, and says it has left the machine.
+    # `mode` is the honest half: only a wired, non-terminal rung is a phone
+    # actually ringing. A terminal rung is a badge parked on the console and an
+    # unwired one reaches nobody — drawing all three the same told an operator
+    # help was coming when it was not.
     assert beta["ringing"] == {"pending": 2, "level": 3, "channel": "human",
                                "leavesMachine": True, "wired": True,
-                               "terminal": False}
+                               "terminal": False, "mode": "ringing"}
     assert beta["trays"] == {"inbox": 4, "inboxUrgent": 1, "tasks": 1,
                              "overdue": 1, "hooks": 1, "owed": 1,
                              "owedDueAt": beta["trays"]["owedDueAt"],

@@ -77,7 +77,14 @@
       // Pending reply debts, soonest deadline first. `response_obligations`
       // carries resolved and waived rows too — only a pending one is somebody
       // still owing an answer.
-      var owed = (s.response_obligations || [])
+      // Payable, not merely pending. The engine landed this rule in the
+      // collector and the board: a debt in a paused thread or a meeting past
+      // active/consensus cannot be discharged by anything the debtor does, so
+      // it is not work — counting it here would put a countdown on the wall for
+      // an answer nobody can give.
+      var payable = (m.state === "active" || m.state === "consensus")
+        && (!m.thread_status || m.thread_status === "open");
+      var owed = (payable ? (s.response_obligations || []) : [])
         .filter(function (o) { return o.status === "pending"; })
         .map(function (o) {
           return {
@@ -98,7 +105,9 @@
       // roles that voted confirm (the proposer's own confirm is recorded at
       // propose time, so it drops out here without a special case).
       var termination = null;
-      if (s.termination) {
+      // Gated on the STATE, not merely on a proposal row existing: a chair
+      // tagged "vote owed" with no banner explaining why is a rebus.
+      if (s.termination && m.state === "termination_pending") {
         var confirmed = {};
         (s.votes || []).forEach(function (v) {
           if (v.vote === "confirm") confirmed[v.role] = true;
@@ -160,6 +169,11 @@
         threadStatus: m.thread_status,
         seated: seated, invited: invited, left: left,
         empty: seated.length === 0,
+        // "Nobody has walked in yet" is a claim about history, and it is false
+        // for a room everybody walked OUT of. Two different states, two
+        // different sentences.
+        neverArrived: seated.length === 0 && left.length === 0,
+        emptied: seated.length === 0 && left.length > 0,
         humanPresent: seated.some(function (p) { return p.isSupervisor; }),
         nextOwed: owed.length ? owed[0] : null,
         owedCount: owed.length,
@@ -185,13 +199,20 @@
         // host configuration, so it is read from /api/wake rather than guessed;
         // without it the level still shows, unnamed.
         var rung = (wake.max_level != null && ladder[wake.max_level]) || null;
+        var wired = rung ? rung.wired !== false : true;
+        var terminal = !!(rung && rung.terminal);
         ringing = {
           pending: wake.pending,
           level: wake.max_level,
           channel: rung ? rung.channel : null,
           leavesMachine: !!(rung && rung.leaves_machine),
-          wired: rung ? rung.wired !== false : true,
-          terminal: !!(rung && rung.terminal)
+          wired: wired,
+          terminal: terminal,
+          // Only one of these is a phone actually ringing. A terminal rung is a
+          // badge sitting on a board, and an unwired one reaches nobody at all
+          // — drawing either as a ringing phone tells an operator help is on
+          // the way when it is not.
+          mode: terminal ? "parked" : (wired ? "ringing" : "unwired")
         };
       }
       var away = seatedIn[a.role] || [];
