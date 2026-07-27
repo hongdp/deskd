@@ -125,6 +125,12 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     def board_page() -> FileResponse:
         return FileResponse(STATIC / "board.html")
 
+    @app.get("/office", include_in_schema=False)
+    def office_page() -> FileResponse:
+        # The floor plan. Pure projection like every other page: it joins
+        # /api/board with /api/meetings in the browser and adds no endpoint.
+        return FileResponse(STATIC / "office.html")
+
     @app.get("/agent/{role}", include_in_schema=False)
     def agent_page(role: str) -> FileResponse:
         # The page reads the role off its own URL and calls /api/agent/{role};

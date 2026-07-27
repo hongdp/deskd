@@ -154,6 +154,7 @@ window.Shell = (function () {
   // --- nav shell ----------------------------------------------------------------
   var NAV = [
     ["board", "/", "Board"],
+    ["office", "/office", "Office floor"],
     ["meetings", "/meetings", "Meetings"],
     ["wake", "/wake", "Wake ladder"],
     ["escalations", "/escalations", "Escalations"],
@@ -184,6 +185,18 @@ window.Shell = (function () {
       '<button id="sh-theme" class="tb-btn" title="theme: auto follows the system">' + themeLabel() + "</button>" +
       "</div></div>";
     document.body.insertBefore(bar, document.body.firstChild);
+    // Publish the bar's real height. Anything that scrolls something into view
+    // has to clear a STICKY bar that wraps: at 1440 it is one row, at 380 it is
+    // three, and a constant offset that works on a desktop drops the target
+    // 97px behind the bar on a phone (measured on the office floor's room
+    // links, which is the whole point of that page's desk cards).
+    var publishBarHeight = function () {
+      document.documentElement.style.setProperty(
+        "--topbar-h", Math.round(bar.getBoundingClientRect().height) + "px");
+    };
+    publishBarHeight();
+    if (window.ResizeObserver) new ResizeObserver(publishBarHeight).observe(bar);
+    else window.addEventListener("resize", publishBarHeight);
 
     $("#sh-theme").onclick = function () {
       var order = ["auto", "light", "dark"];

@@ -169,7 +169,7 @@ silently lost.
 | **Bounded meetings** | Check-in/quorum, mandatory 1:1 replies with an SLA, message budgets, and a mutual termination handshake. Bounded by construction — no infinite agent chatter — and no agent can fabricate the other side's attendance, reports, or votes. |
 | **Cross-session tasks** | Work items that outlive a session. Soft deadlines (`due_at`) sort to the top but **never wake anyone**; only `priority=urgent` does — and a task wake can never reach a human rung. |
 | **Session lifecycle** | Intraday continuity, cross-day rollover: wind the old session down with a handoff, start fresh the next day. |
-| **Supervisor console** | Six views over one shell: the board (every number links to the view that explains it), per-agent detail (wake history, delivery ledger, full event log), meetings, the wake ladder, escalation ledgers, and tasks & hooks — behind an access-code or Ed25519 trusted-device gate. |
+| **Supervisor console** | Seven views over one shell: the board (every number links to the view that explains it), the office floor (who is at a desk, who is in which room and with whom), per-agent detail (wake history, delivery ledger, full event log), meetings, the wake ladder, escalation ledgers, and tasks & hooks — behind an access-code or Ed25519 trusted-device gate. |
 
 ## Works with headless Claude Code
 
