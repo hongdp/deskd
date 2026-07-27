@@ -1633,3 +1633,61 @@ def test_a_paused_meetings_owed_reply_raises_no_demand(desk):
     with orch.connect() as c:
         assert [d for d in orch.collect_wake_demand(c)
                 if d["reason_kind"] == "owed_reply"], "resuming makes it real again"
+
+
+def test_acking_a_wake_does_not_settle_an_unpaid_vote(desk):
+    """An ack is a signature, not the work.
+
+    Measured on a live desk 2026-07-27: the trader proposed an end at 07:38:31,
+    the propose-time wake armed immediately (as designed), and the analyst —
+    mid-turn on unrelated work — acked it within 30 seconds and went back to
+    what it was doing. It never read the thread and never voted. Because the
+    demand's only test was "is a wake request still pending", the ack made the
+    demand disappear, and four planner ticks passed with a meeting that could
+    not close and nothing asking anyone to close it. The sweep's timeout re-arm
+    caught it five minutes later, which is a safety net doing a first-order
+    job.
+
+    Most meeting wakes can keep the cheap test — an agent that acks has the
+    thread in front of it. A termination vote is the exception the ledger can
+    actually check."""
+    status = meetings.call_meeting(agenda="who closes this", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    meetings.propose_end(thread_id, role="alpha", resolution="done here")
+
+    # The propose-time wake is armed for the voter who owes.
+    assert [w["thread_id"] for w in meetings.wake_requests("beta")] == [thread_id]
+
+    # Beta signs for the wake and goes back to its own work.
+    meetings.acknowledge_wake(thread_id, role="beta")
+    assert meetings.wake_requests("beta") == []
+
+    with orch.connect() as c:
+        still = [d for d in orch.collect_wake_demand(c)
+                 if d["reason_kind"] == "meeting_wake" and d["role"] == "beta"]
+    assert still, "the vote is still owed, so the demand must still stand"
+
+    # Voting is what settles it — and it settles immediately, without waiting
+    # for a sweep.
+    meetings.confirm_end(thread_id, role="beta")
+    with orch.connect() as c:
+        assert [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "meeting_wake" and d["role"] == "beta"] == []
+
+
+def test_an_ordinary_meeting_wake_still_settles_on_the_ack(desk):
+    """The counterweight. Only the vote case is special; if an ack stopped
+    settling ordinary meeting wakes, every agent that read its thread and had
+    nothing to say would keep a demand alive forever and climb the ladder for
+    it."""
+    status = meetings.call_meeting(agenda="just an invitation", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    assert [w["thread_id"] for w in meetings.wake_requests("beta")] == [thread_id]
+
+    meetings.acknowledge_wake(thread_id, role="beta")
+    with orch.connect() as c:
+        assert [d for d in orch.collect_wake_demand(c)
+                if d["reason_kind"] == "meeting_wake" and d["role"] == "beta"] == []
