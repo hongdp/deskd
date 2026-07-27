@@ -223,8 +223,8 @@ function phoneHtml(d) {
 // card into a paragraph (and two of them, for an agent sitting in two meetings,
 // into a wall).
 function awayHtml(d) {
-  var head = d.away.length === 1 ? "In this room:"
-    : "In " + d.away.length + " rooms at once:";
+  var head = d.away.length === 1 ? "Sitting in:"
+    : "Sitting in " + d.away.length + " rooms at once:";
   return '<div class="dk-away"><span class="dk-away-h">' + head + "</span>"
     + d.away.map(function (m) {
       return '<a class="rmlink" href="#' + esc(m.anchor) + '" title="' + esc(m.agenda)
@@ -249,15 +249,24 @@ function nowHtml(d) {
 }
 function deskHtml(d) {
   var url = "/agent/" + encodeURIComponent(d.role);
+  // An away desk is EMPTY: the person is at a table upstairs, and drawing them
+  // here too puts one person in two places on a map whose whole job is
+  // answering "where is everybody". So the chair is empty (a hollow avatar, no
+  // liveness dot), the room is the headline, and the state the engine still
+  // holds is demoted to a footnote rather than deleted — the first version
+  // erased it, which was the opposite error.
   // Away shows BOTH: which rooms, and the state the engine still has for them.
   // The first version replaced the state entirely, so an agent in a meeting
   // read as a blank desk and the summary line counted it as nobody working.
-  var body = d.atDesk ? nowHtml(d) : (awayHtml(d) + nowHtml(d));
+  var body = d.atDesk ? nowHtml(d) : (awayHtml(d) + '<div class="dk-elsewhere">' + nowHtml(d) + "</div>");
   var frame = d.ringing ? " " + { ringing: "ringing", unwired: "unwired", parked: "parked" }[d.ringing.mode] : "";
   return '<section class="desk' + (d.atDesk ? "" : " away") + frame + '">'
-    + '<div class="dk-head">' + avatar(d.name, d.liveness)
+    + '<div class="dk-head">' + avatar(d.name, d.atDesk ? d.liveness : null, d.atDesk ? "" : "ghost")
     + '<div class="dk-id"><a class="dk-name" href="' + url + '">' + esc(d.name) + "</a>"
-    + '<div class="dk-live"><span class="dot ' + esc(d.liveness) + '"></span>' + esc(livenessText(d)) + "</div></div></div>"
+    + (d.atDesk
+        ? '<div class="dk-live"><span class="dot ' + esc(d.liveness) + '"></span>' + esc(livenessText(d)) + "</div>"
+        : '<div class="dk-live vacated">desk empty · ' + (d.away.length > 1 ? "in " + d.away.length + " rooms" : "in a meeting") + "</div>")
+    + "</div></div>"
     + body + phoneHtml(d) + traysHtml(d) + "</section>";
 }
 

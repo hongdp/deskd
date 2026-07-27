@@ -501,3 +501,19 @@ def test_new_surface_is_get_only(client):
     for url in ["/api/wake", "/api/escalations", "/api/tasks",
                 "/api/hooks", "/api/channels", "/api/meeting-days"]:
         assert client.post(url, json={}).status_code == 405, url
+
+
+def test_an_away_desk_draws_the_desk_not_the_person(client):
+    """One person, one place. An agent seated in a meeting room used to keep a
+    desk card carrying the same avatar, liveness dot and state line as an
+    occupied one, so the floor showed them upstairs at a table AND downstairs
+    at their desk — on a map whose only job is where everybody is. The chair is
+    hollow now (`ghost`, no liveness dot), the room is the headline, and what
+    the engine still knows survives as a footnote: deleting it was the earlier
+    mistake, in the other direction."""
+    page = client.get("/office").text
+    # The view is data-driven, so pin the vocabulary the model and CSS agree on
+    # rather than a rendered instance the test would have to fabricate.
+    assert "ghost" in page and "vacated" in page
+    assert "dk-elsewhere" in page
+    assert "Sitting in:" in page
