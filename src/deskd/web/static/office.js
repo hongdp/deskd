@@ -177,7 +177,6 @@
       var meeting = a.meeting || {};
       var obligations = meeting.response_obligations || {};
       var inbox = a.inbox || {};
-      var counts = a.task_counts || {};
       var wake = a.wake || {};
       var ringing = null;
       if (wake.pending) {
