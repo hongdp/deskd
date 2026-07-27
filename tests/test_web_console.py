@@ -517,3 +517,28 @@ def test_an_away_desk_draws_the_desk_not_the_person(client):
     assert "ghost" in page and "vacated" in page
     assert "dk-elsewhere" in page
     assert "Sitting in:" in page
+
+def test_the_console_assets_must_be_revalidated_not_reused(client):
+    """The nav lives in shell.js, so a browser holding an old copy silently
+    hides every view added since — the page is there, the link is not, and
+    nothing looks broken. Starlette sends ETag and Last-Modified but no
+    Cache-Control, which leaves browsers on heuristic freshness, and an asset
+    stable for days can then be served from cache for hours after a release.
+    Observed on a live desk the day the office view shipped: the page 200'd and
+    the operator could not find it.
+
+    `no-cache` still stores and still answers 304 — it only forbids using the
+    copy without asking."""
+    for asset in ("/static/shell.js", "/static/deskd.css"):
+        r = client.get(asset)
+        assert r.status_code == 200, asset
+        assert "no-cache" in r.headers.get("cache-control", ""), asset
+        assert r.headers.get("etag"), asset + " must still support a cheap 304"
+
+    # And the revalidation is genuinely cheap: a conditional request is a 304
+    # with no body, not a re-download.
+    first = client.get("/static/shell.js")
+    again = client.get("/static/shell.js",
+                       headers={"If-None-Match": first.headers["etag"]})
+    assert again.status_code == 304
+    assert not again.content

@@ -81,6 +81,28 @@ def _install_config(config: EngineConfig | None) -> EngineConfig:
     return live
 
 
+class _RevalidatingStatic(StaticFiles):
+    """Static files that must be re-checked, not re-downloaded.
+
+    The console's nav lives in shell.js, so a browser holding an old copy
+    silently hides every view added since — the page is there, the link is
+    not, and nothing looks broken. Starlette sends ETag and Last-Modified but
+    no Cache-Control, which leaves browsers on heuristic freshness (a fraction
+    of the file's age), so an asset that had been stable for days could be
+    served from cache for hours after a release. Observed exactly that on a
+    live desk the day the office view shipped.
+
+    `no-cache` does not mean "do not store" — it means "revalidate before
+    use", so the conditional request still answers 304 and costs one header
+    round trip.
+    """
+
+    def file_response(self, *args, **kwargs):  # type: ignore[override]
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def create_app(config: EngineConfig | None = None) -> FastAPI:
     """Build the console app. `config` defaults to the process-wide CONFIG."""
     # `deskd serve` runs uvicorn with factory=True, so this factory is what a
@@ -113,7 +135,7 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     # Shared shell assets (deskd.css + shell.js): every page loads these two
     # files instead of pasting its own CSS/JS — the design system lives in one
     # place. Starlette's StaticFiles is read-only and part of FastAPI itself.
-    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    app.mount("/static", _RevalidatingStatic(directory=STATIC), name="static")
 
     # --- pages --------------------------------------------------------------
 
