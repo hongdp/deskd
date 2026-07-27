@@ -259,7 +259,12 @@
       working: desks.filter(function (d) { return d.atDesk && d.live; }).length,
       quiet: desks.filter(function (d) { return d.atDesk && !d.live; }).length,
       inMeetings: desks.filter(function (d) { return !d.atDesk; }).length,
-      ringing: desks.filter(function (d) { return !!d.ringing; }).length,
+      // Split by mode: one of these is help arriving, one is a badge on a
+      // board, and one is a wake that reaches nobody. A single count in a red
+      // chip taught the reader to ignore all three.
+      ringing: desks.filter(function (d) { return d.ringing && d.ringing.mode === "ringing"; }).length,
+      parked: desks.filter(function (d) { return d.ringing && d.ringing.mode === "parked"; }).length,
+      unwired: desks.filter(function (d) { return d.ringing && d.ringing.mode === "unwired"; }).length,
       rooms: rooms.length,
       roomsEmpty: rooms.filter(function (r) { return r.empty; }).length,
       roomsWrapping: rooms.filter(function (r) { return r.wrappingUp; }).length,

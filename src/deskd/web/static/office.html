@@ -67,6 +67,14 @@ function slaText(sec) {
 
 // --- rooms ---------------------------------------------------------------------
 
+// What each discussion mode actually means, so the badge's tooltip matches the
+// badge (it used to describe one_to_one whatever the mode said).
+var MODE_HELP = {
+  one_to_one: "one-to-one: strict turn-taking — every message owes a reply",
+  multi: "multi-party: a broadcast cannot sensibly obligate everyone, so replies are optional",
+  waiting: "waiting: a required attendee has not checked in, so the meeting has not started"
+};
+
 function seatHtml(p) {
   var cls = "seat " + p.seat + (p.isSupervisor ? " human" : "")
     + (p.owes ? " owes" : "") + (p.voteOwed ? " novote" : "");
@@ -98,8 +106,12 @@ function seatHtml(p) {
 // its own row — so a room of colleagues looked like two rooms.
 function tableHtml(room) {
   var chairs = room.seated.concat(room.invited);
-  var used = room.maxMessages
-    ? Math.min(100, Math.round(100 * (room.messageCount || 0) / room.maxMessages)) : 0;
+  // What is LEFT, because that is what the label says. Filling with the spent
+  // share under a "N of M messages left" caption made a fresh room read as an
+  // empty bar at maximum budget and an exhausted one as a full bar.
+  var left = room.maxMessages && room.messagesRemaining != null
+    ? Math.max(0, Math.min(100, Math.round(100 * room.messagesRemaining / room.maxMessages)))
+    : 100;
   var budget = room.messagesRemaining == null ? "no budget"
     : room.messagesRemaining + " of " + room.maxMessages + " messages left";
   return '<div class="rm-floor">'
@@ -109,7 +121,7 @@ function tableHtml(room) {
     // as the room spends its words, labelled, with the spent share shaded
     // strongly enough to read in both themes.
     + '<div class="rm-table" title="' + esc(budget) + " — a bounded meeting cannot run forever"
-    + '"><span class="rm-burn" style="width:' + used + '%"></span>'
+    + '"><span class="rm-burn" style="width:' + left + '%"></span>'
     + '<span class="rm-budget">' + esc(budget) + "</span></div></div>";
 }
 
@@ -155,8 +167,8 @@ function roomHtml(room) {
   var badges = '<span class="badge ' + S.stateClass(room.state) + '">' + esc(S.human(room.state)) + "</span>"
     + (room.priority === "urgent" ? '<span class="badge bad">urgent</span>' : "")
     + (S.human(room.mode) === S.human(room.state) ? ""
-       : '<span class="badge" title="discussion mode: one_to_one imposes strict turn-taking">'
-         + esc(S.human(room.mode)) + "</span>");
+       : '<span class="badge" title="' + esc(MODE_HELP[room.mode] || "discussion mode")
+         + '">' + esc(S.human(room.mode)) + "</span>");
   return '<section class="room' + (room.empty ? " vacant" : "") + (room.wrappingUp ? " wrapping" : "")
     + '" id="' + esc(room.anchor) + '">'
     + '<div class="rm-head"><h3 title="' + esc(room.agenda) + '"><a href="/meetings">' + esc(room.agenda) + "</a></h3>"
@@ -199,8 +211,9 @@ function phoneHtml(d) {
   // Only a genuinely ringing phone animates and only an unreachable one is red:
   // an operator who sees the same alarm for "help is coming" and "nobody will
   // come" learns to read neither.
-  var cls = r.mode === "unwired" ? "bad" : (r.mode === "parked" ? "" : "warn")
-    + (r.mode === "ringing" ? " live" : "");
+  var cls = r.mode === "unwired" ? "bad"
+    : r.mode === "ringing" ? "warn live"
+    : "";   // parked: the quiet base treatment — a badge to read, not an alarm
   return '<a class="dk-phone ' + cls + '" href="/wake" title="' + esc(why) + '">'
     + PHONE + "<span>" + esc(lead) + " · " + esc(rung) + " · <b>" + r.pending
     + "</b> pending</span></a>";
@@ -240,7 +253,8 @@ function deskHtml(d) {
   // The first version replaced the state entirely, so an agent in a meeting
   // read as a blank desk and the summary line counted it as nobody working.
   var body = d.atDesk ? nowHtml(d) : (awayHtml(d) + nowHtml(d));
-  return '<section class="desk' + (d.atDesk ? "" : " away") + (d.ringing ? " ringing" : "") + '">'
+  var frame = d.ringing ? " " + { ringing: "ringing", unwired: "unwired", parked: "parked" }[d.ringing.mode] : "";
+  return '<section class="desk' + (d.atDesk ? "" : " away") + frame + '">'
     + '<div class="dk-head">' + avatar(d.name, d.liveness)
     + '<div class="dk-id"><a class="dk-name" href="' + url + '">' + esc(d.name) + "</a>"
     + '<div class="dk-live"><span class="dot ' + esc(d.liveness) + '"></span>' + esc(livenessText(d)) + "</div></div></div>"
@@ -261,7 +275,11 @@ function strip(st) {
     + cell("rooms in use", st.rooms - st.roomsEmpty)
     + (st.roomsEmpty ? cell("rooms still waiting on someone", st.roomsEmpty, "warn") : "")
     + (st.owed ? cell("replies owed", st.owed, "warn") : cell("replies owed", 0))
-    + (st.ringing ? cell("desks ringing", st.ringing, "bad") : cell("desks ringing", 0)));
+    // The strip must not re-merge what the desks separate: a floor whose only
+    // chip says "nothing is ringing" was headlined as ringing, in red.
+    + (st.ringing ? cell("desks ringing", st.ringing, "warn") : cell("desks ringing", 0))
+    + (st.unwired ? cell("wakes reaching nobody — no channel wired", st.unwired, "bad") : "")
+    + (st.parked ? cell("wakes parked on the board", st.parked, "mute") : ""));
 }
 
 function render(plan) {
