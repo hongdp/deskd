@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Office floor · deskd console</title>
+<link rel="stylesheet" href="/static/deskd.css">
+<script src="/static/shell.js"></script>
+<script src="/static/office.js"></script>
+</head>
+<body>
+<!-- The floor plan. Same shell as every other view (deskd.css tokens, shell.js
+     nav/theme/refresh); the only thing this page adds is a MAP: rooms across
+     the top, the open desk area below, and every agent drawn in exactly one
+     place — at its desk, or in the room it actually checked into. The join that
+     decides which lives in office.js, so it can be unit-tested headlessly. -->
+<main class="wrap">
+  <div class="pagehead">
+    <div><h1>Office floor</h1><div class="sub">Where everybody is right now — at their desk, or in a room, and with whom</div></div>
+  </div>
+  <div class="alarms" id="strip"></div>
+
+  <section class="zone" id="zone-rooms">
+    <div class="zone-head"><h2>Meeting rooms</h2><span class="quiet" id="rooms-note">…</span></div>
+    <div class="rooms" id="rooms"><div class="loading">Loading…</div></div>
+  </section>
+
+  <section class="zone" id="zone-desks">
+    <div class="zone-head"><h2>Desk area</h2><span class="quiet" id="desks-note">…</span></div>
+    <div class="desks" id="desks"><div class="loading">Loading…</div></div>
+  </section>
+</main>
+<footer class="foot" id="foot"></footer>
+<script>
+"use strict";
+var S = Shell, esc = S.esc, rel = S.rel, ago = S.ago, dur = S.dur;
+S.init("office", "Office floor");
+
+// Fail-closed default, replaced by /api/meeting-meta: the supervisor identity
+// is host configuration, never a literal in a view.
+var SUPERVISOR = "supervisor";
+// The wake ladder is static host config; read ONCE so a ringing desk can name
+// its rung instead of showing a bare level number. A failure here degrades the
+// label to "rung L2" — it never blocks the floor.
+var LADDER = [];
+
+var PHONE = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true">'
+  + '<path fill="currentColor" d="M5.2 1.6 6.9 5 5.5 6.4c.7 1.6 2 2.9 3.6 3.6L10.5 8.6l3.4 1.7-.5 3c-.1.5-.6.9-1.1.8C6.6 13.3 2.2 8.9 1.5 3.1c-.1-.5.3-1 .8-1.1l2.9-.4z"/>'
+  + '<path fill="currentColor" d="M11.4 1.1a.6.6 0 0 1 .8-.2 6 6 0 0 1 2.4 2.6.6.6 0 1 1-1.1.5 4.8 4.8 0 0 0-1.9-2.1.6.6 0 0 1-.2-.8z"/></svg>';
+
+var LIVENESS = { online: "online", suspect: "suspect", idle: "parked",
+                 dead: "presumed offline", offline: "session ended",
+                 never: "never seen" };
+function livenessText(d) {
+  var base = LIVENESS[d.liveness] || d.liveness || "unknown";
+  return base + (d.heartbeatAge != null ? " · heartbeat " + ago(d.heartbeatAge) + " ago" : "");
+}
+function avatar(name, liveness, extra) {
+  return '<span class="av ' + (liveness ? "lv-" + esc(liveness) : "") + (extra ? " " + extra : "")
+    + '">' + esc(Office.initials(name)) + "</span>";
+}
+// Countdown text for a deadline, phrased as a person would say it.
+function slaText(sec) {
+  if (sec == null) return "no deadline";
+  return sec >= 0 ? dur(sec) + " left" : "overdue by " + dur(-sec);
+}
+
+// --- rooms ---------------------------------------------------------------------
+
+function seatHtml(p) {
+  var cls = "seat " + p.seat + (p.isSupervisor ? " human" : "")
+    + (p.owes ? " owes" : "") + (p.voteOwed ? " novote" : "");
+  var when = p.seat === "left" ? "left " + rel(p.stoppedAt)
+    : p.seat === "invited" ? "invited " + rel(p.invitedAt)
+    : "since " + rel(p.checkedInAt);
+  var tags = "";
+  if (p.isSupervisor) tags += '<span class="badge ok" title="the human supervisor — a participant here like anyone else">human</span>';
+  else if (!p.hasDesk) tags += '<span class="badge" title="attends this meeting but has no desk on this floor (role not in the registry)">guest</span>';
+  if (p.seat === "invited") tags += '<span class="badge warn">not here yet</span>';
+  if (p.seat === "left") tags += '<span class="badge">left</span>';
+  if (p.voteOwed) tags += '<span class="badge warn">vote owed</span>';
+  var owes = p.owes
+    ? '<span class="sla ' + (p.owes.secondsLeft != null && p.owes.secondsLeft < 0 ? "over" : "")
+      + '" title="' + esc(S.human(p.owes.kind) + " from " + p.owes.sender) + '">owes a reply · '
+      + esc(slaText(p.owes.secondsLeft)) + "</span>"
+    : "";
+  return '<div class="' + cls + '">'
+    + avatar(p.name, p.seat === "seated" ? p.liveness : null)
+    + '<span class="nm" title="' + esc(p.role) + '">' + esc(p.name) + "</span>"
+    + '<span class="sub">' + when + "</span>"
+    + (tags ? '<span class="tags">' + tags + "</span>" : "")
+    + owes + "</div>";
+}
+
+// People are drawn AROUND the table: alternating chairs above and below it, so
+// a room with one person reads as one person at the head of a table, and six
+// still fit without the card growing a scrollbar.
+function tableHtml(room) {
+  var chairs = room.seated.concat(room.invited);
+  var top = chairs.filter(function (_, i) { return i % 2 === 0; });
+  var bottom = chairs.filter(function (_, i) { return i % 2 === 1; });
+  var used = room.maxMessages ? Math.min(100, Math.round(100 * (room.messageCount || 0) / room.maxMessages)) : 0;
+  var budget = room.messagesRemaining == null ? "no budget"
+    : room.messagesRemaining + " of " + room.maxMessages + " messages left";
+  var seats = function (arr) {
+    return arr.length ? '<div class="seats">' + arr.map(seatHtml).join("") + "</div>" : "";
+  };
+  return '<div class="rm-floor">' + seats(top)
+    + '<div class="rm-table" title="' + esc(budget) + '"><span class="rm-burn" style="width:' + used + '%"></span>'
+    + '<span class="rm-budget">' + esc(budget) + "</span></div>"
+    + seats(bottom)
+    + (chairs.length ? "" : '<div class="rm-nobody">no chairs taken</div>') + "</div>";
+}
+
+function roomNotes(room) {
+  var out = "";
+  if (room.threadRetired)
+    out += '<div class="rm-note bad">Thread ' + esc(S.human(room.threadStatus))
+      + " — the idle deadline retired it; nobody can speak in this room.</div>";
+  if (room.empty) {
+    var waiting = room.invited.map(function (p) { return p.name; });
+    out += '<div class="rm-note warn">Nobody has walked in yet'
+      + (waiting.length ? " — waiting on <b>" + esc(waiting.join(", ")) + "</b>" : "") + ".</div>";
+  }
+  if (room.wrappingUp && room.termination) {
+    var t = room.termination;
+    out += '<div class="rm-note warn"><b>Wrapping up</b> — end proposed by ' + esc(t.proposer)
+      + ': “' + esc(t.resolution) + '”. '
+      + (t.waitingOn.length ? "Waiting on <b>" + esc(t.waitingOn.join(", ")) + "</b> to vote."
+                            : "Every vote is in.") + "</div>";
+  }
+  if (room.nextOwed) {
+    var o = room.nextOwed, over = o.secondsLeft != null && o.secondsLeft < 0;
+    out += '<div class="rm-note ' + (over ? "bad" : "warn") + '">Reply owed by <b>' + esc(o.role)
+      + "</b> · " + esc(slaText(o.secondsLeft)) + " <span class=\"quiet\">(" + esc(S.human(o.kind))
+      + " from " + esc(o.sender) + (room.owedCount > 1 ? ", " + (room.owedCount - 1) + " more owed" : "")
+      + ")</span></div>";
+  }
+  if (room.left.length)
+    out += '<div class="rm-left">Left the room: ' + room.left.map(function (p) {
+      return "<b>" + esc(p.name) + "</b> " + rel(p.stoppedAt);
+    }).join(" · ") + "</div>";
+  return out;
+}
+
+function roomHtml(room) {
+  var badges = '<span class="badge ' + S.stateClass(room.state) + '">' + esc(S.human(room.state)) + "</span>"
+    + (room.priority === "urgent" ? '<span class="badge bad">urgent</span>' : "")
+    + '<span class="badge">' + esc(S.human(room.mode)) + "</span>";
+  return '<section class="room' + (room.empty ? " vacant" : "") + (room.wrappingUp ? " wrapping" : "")
+    + '" id="' + esc(room.anchor) + '">'
+    + '<div class="rm-head"><h3 title="' + esc(room.agenda) + '"><a href="/meetings">' + esc(room.agenda) + "</a></h3>"
+    + '<div class="rm-tags">' + badges + "</div></div>"
+    + '<div class="rm-meta">' + esc(S.human(room.meetingType)) + " · called by " + esc(room.calledBy)
+    + " · started " + rel(room.createdAt) + " · " + room.seated.length + " at the table"
+    + (room.humanPresent ? ' · <span class="hint-human">the supervisor is in the room</span>' : "") + "</div>"
+    + tableHtml(room) + roomNotes(room) + "</section>";
+}
+
+// --- desks ------------------------------------------------------------------------
+
+function trayHtml(label, n, cls, title) {
+  return '<span class="tray ' + (n ? (cls || "") : "zero") + '" title="' + esc(title) + '">'
+    + esc(label) + " <b>" + n + "</b></span>";
+}
+function traysHtml(d) {
+  var t = d.trays;
+  return '<div class="dk-trays">'
+    + trayHtml("inbox", t.inbox, t.inboxUrgent ? "bad" : "warn",
+        t.inboxUrgent ? t.inboxUrgent + " urgent, queued for delivery" : "notifications queued for delivery")
+    + trayHtml("tasks", t.tasks, t.overdue ? "bad" : "",
+        t.overdue ? t.overdue + " past their soft deadline" : "open tasks assigned to this role")
+    + trayHtml("hooks", t.hooks, "", "wake hooks this agent registered for itself")
+    + trayHtml("owed", t.owed, "warn",
+        t.owedDueAt ? "next reply due " + S.exact(t.owedDueAt) : "meeting replies this role owes")
+    + "</div>";
+}
+function phoneHtml(d) {
+  if (!d.ringing) return "";
+  var r = d.ringing;
+  var rung = r.channel ? "L" + r.level + " · " + S.human(r.channel) : "rung L" + r.level;
+  var why = r.leavesMachine
+    ? (r.wired ? "a person is being pulled in" : "the human rung is UNWIRED — it stops at the outbox")
+    : "machine rungs are still trying";
+  return '<a class="dk-phone ' + (r.leavesMachine ? "bad" : "warn") + '" href="/wake" title="' + esc(why) + '">'
+    + PHONE + "<span>ringing · " + esc(rung) + " · <b>" + r.pending + "</b> pending</span></a>";
+}
+// An empty desk says where its owner went. Each room is one ellipsized line
+// with the full agenda on hover: a 200-character agenda must not turn a desk
+// card into a paragraph (and two of them, for an agent sitting in two meetings,
+// into a wall).
+function awayHtml(d) {
+  var head = d.away.length === 1 ? "Away — in this room:"
+    : "Away — in " + d.away.length + " rooms at once:";
+  return '<div class="dk-away"><span class="dk-away-h">' + head + "</span>"
+    + d.away.map(function (m) {
+      return '<a class="rmlink" href="#' + esc(m.anchor) + '" title="' + esc(m.agenda)
+        + '">' + esc(m.agenda) + "</a>";
+    }).join("") + "</div>";
+}
+// What the desk shows when its owner is sitting at it. A desk whose session is
+// parked, crashed or over still shows its last words — clearly labelled as the
+// LAST thing they said, never as work in flight.
+function nowHtml(d) {
+  if (!d.state && !d.activity)
+    return '<div class="dk-now"><div class="dk-state quiet">no session yet — this desk has never been used</div></div>';
+  var flags = (d.staleDay ? ' <span class="badge warn">stale session</span>' : "")
+    + (d.phase === "draining" ? ' <span class="badge warn">handing off</span>' : "");
+  var state = '<div class="dk-state' + (d.live ? "" : " stale") + '">'
+    + (d.live ? "" : "last state · ") + esc(S.human(d.state)) + flags + "</div>";
+  var act = d.activity
+    ? '<div class="dk-act' + (d.live ? "" : " stale") + '" title="' + esc(d.activity) + '">'
+      + (d.live ? "" : "last reported: ") + esc(d.activity) + "</div>"
+    : '<div class="dk-act stale">no activity reported</div>';
+  return '<div class="dk-now">' + state + act + "</div>";
+}
+function deskHtml(d) {
+  var url = "/agent/" + encodeURIComponent(d.role);
+  var body = d.atDesk ? nowHtml(d) : awayHtml(d);
+  return '<section class="desk' + (d.atDesk ? "" : " away") + (d.ringing ? " ringing" : "") + '">'
+    + '<div class="dk-head">' + avatar(d.name, d.liveness)
+    + '<div class="dk-id"><a class="dk-name" href="' + url + '">' + esc(d.name) + "</a>"
+    + '<div class="dk-live"><span class="dot ' + esc(d.liveness) + '"></span>' + esc(livenessText(d)) + "</div></div></div>"
+    + body + phoneHtml(d) + traysHtml(d) + "</section>";
+}
+
+// --- the floor ---------------------------------------------------------------------
+
+function strip(st) {
+  function cell(text, n, cls) {
+    return '<span class="alarm ' + (cls || "") + '"><span class="st"></span>' + text
+      + (n == null ? "" : " <b>" + n + "</b>") + "</span>";
+  }
+  S.setHTML(S.$("#strip"),
+    cell("working at their desks", st.working)
+    + (st.quiet ? cell("desks quiet — parked or offline", st.quiet, "mute") : "")
+    + cell("in a meeting", st.inMeetings)
+    + cell("rooms in use", st.rooms - st.roomsEmpty)
+    + (st.roomsEmpty ? cell("rooms still waiting on someone", st.roomsEmpty, "warn") : "")
+    + (st.owed ? cell("replies owed", st.owed, "warn") : cell("replies owed", 0))
+    + (st.ringing ? cell("desks ringing", st.ringing, "bad") : cell("desks ringing", 0)));
+}
+
+function render(plan) {
+  strip(plan.stats);
+  var st = plan.stats;
+  S.$("#rooms-note").textContent = st.rooms
+    ? st.rooms + (st.rooms === 1 ? " room live" : " rooms live") + " · "
+      + (st.inMeetings + st.guests) + " at the tables"
+    : "all free";
+  S.$("#desks-note").textContent = st.agents
+    ? st.atDesk + " of " + st.agents + " at their desks"
+    : "no desks yet";
+  // `is-empty` drops the grid for the empty state: a room-width track would
+  // otherwise squeeze the "every room is free" panel into one corner.
+  S.$("#rooms").className = plan.rooms.length ? "rooms" : "rooms is-empty";
+  S.$("#desks").className = plan.desks.length ? "desks" : "desks is-empty";
+  S.setHTML(S.$("#rooms"), plan.rooms.length ? plan.rooms.map(roomHtml).join("")
+    : S.empty("No meeting in progress — every room is free.",
+              "deskd meeting call --agenda \"…\" --attendees ROLE,ROLE"));
+  S.setHTML(S.$("#desks"), plan.desks.length ? plan.desks.map(deskHtml).join("")
+    : S.empty("No agents registered yet — the host seeds roles via configure(roles=…), and each one gets a desk here."));
+}
+
+async function load() {
+  // Exactly the two projections the console already serves. The ladder and the
+  // supervisor identity are static config, fetched once and cached.
+  if (!LADDER.length) {
+    try { LADDER = (await S.api("/api/wake")).ladder || []; } catch (e) { LADDER = []; }
+  }
+  try { SUPERVISOR = (await S.meta()).supervisor_role || SUPERVISOR; } catch (e) { /* keep the default */ }
+  var pair = await Promise.all([S.api("/api/board"), S.api("/api/meetings?include_closed=false")]);
+  render(Office.floorPlan(pair[0], pair[1],
+    { supervisorRole: SUPERVISOR, ladder: LADDER, now: Date.now() }));
+  S.$("#foot").textContent = "updated " + new Date(pair[0].generated_at).toLocaleTimeString();
+}
+S.autorefresh(load, 5);
+</script>
+</body>
+</html>

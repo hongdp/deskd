@@ -154,6 +154,7 @@ window.Shell = (function () {
   // --- nav shell ----------------------------------------------------------------
   var NAV = [
     ["board", "/", "Board"],
+    ["office", "/office", "Office floor"],
     ["meetings", "/meetings", "Meetings"],
     ["wake", "/wake", "Wake ladder"],
     ["escalations", "/escalations", "Escalations"],

@@ -167,6 +167,9 @@ a.alarm:hover { text-decoration: none; border-color: var(--accent); }
 .alarm.bad .st { background: var(--bad); }
 .alarm.warn { border-color: var(--warn); background: var(--warn-bg); }
 .alarm.warn .st { background: var(--warn); }
+/* a normal, non-green fact (nobody is in a meeting; a session is parked): a
+   count that is neither good news nor an alarm must not wear either color. */
+.alarm.mute .st { background: var(--muted); }
 
 /* --- chips / badges / dots --------------------------------------------------- */
 
@@ -372,13 +375,180 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
 .rung.human { border-left: 3px solid var(--warn); }
 .rung .right { margin-left: auto; display: flex; gap: 6px; align-items: center; }
 
+/* --- office floor -------------------------------------------------------------------
+ *
+ * A map, not a list: two dashed ZONES (meeting rooms, then the open desk area),
+ * rooms drawn as rooms with a doorway punched through the bottom wall, and
+ * people seated around a table. Everything is a token — the doorway notch is
+ * painted in --page precisely so it stays a hole in the wall in both themes.
+ * Every track is auto-fit/auto-fill with a min: six agents wrap, they never
+ * push the page sideways.
+ */
+
+.zone { border: 1px dashed var(--line); border-radius: 14px; padding: 12px 14px 16px; margin-bottom: 16px; }
+.zone-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.zone-head h2 {
+  font-size: 11px; margin: 0; color: var(--muted); text-transform: uppercase;
+  letter-spacing: 0.09em; font-weight: 650;
+}
+/* Rooms are ROOMS: they pack from the left at a room-sized width instead of
+   stretching one lonely meeting across a 1440px monitor. */
+.rooms { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 440px)); justify-content: start; gap: 14px; }
+.desks { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 12px; }
+/* an empty floor states its case across the whole zone, not inside one track */
+.rooms.is-empty, .desks.is-empty { display: block; }
+
+/* rooms ------------------------------------------------------------------- */
+
+.room {
+  position: relative; min-width: 0; background: var(--surface);
+  border: 2px solid var(--line); border-radius: 12px;
+  padding: 12px 14px 14px; box-shadow: var(--shadow);
+}
+/* the doorway: a gap in the bottom wall, painted in the page color */
+.room::after { content: ""; position: absolute; left: 26px; bottom: -2px; width: 38px; height: 2px; background: var(--page); }
+.room.vacant { border-style: dashed; }
+.room.wrapping { border-color: var(--warn); }
+.rm-head { display: flex; gap: 10px; justify-content: space-between; align-items: flex-start; }
+.rm-head h3 {
+  /* the agenda takes the room's width and the badges keep their own: without
+     the flex the badge column gets squeezed and stacks one per line */
+  flex: 1 1 auto; min-width: 0;
+  font-size: 14px; margin: 0; color: var(--text); text-transform: none;
+  letter-spacing: -0.01em; font-weight: 650; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.rm-head h3 a { color: inherit; }
+.rm-tags { display: flex; flex: 0 0 auto; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.rm-meta { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+.hint-human { color: var(--ok); }
+
+.rm-floor { margin-top: 10px; }
+.seats { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+.rm-table {
+  position: relative; height: 30px; margin: 8px 0; border-radius: 8px;
+  background: var(--surface-2); border: 1px solid var(--line);
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+.rm-burn { position: absolute; top: 0; bottom: 0; left: 0; background: var(--line-soft); }
+.rm-budget { position: relative; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.rm-nobody { text-align: center; font-size: 11.5px; color: var(--muted); }
+
+.seat {
+  /* a chair is a chair: never squeezed by its neighbours (a shrinking seat
+     hyphenates a display name down the middle), it wraps to the next row */
+  display: flex; flex: 0 0 auto; flex-direction: column; align-items: center; gap: 2px;
+  width: 126px; padding: 6px 4px; border-radius: 9px;
+  border: 1px solid transparent; text-align: center;
+}
+.seat .nm { font-size: 11.5px; font-weight: 650; line-height: 1.25; overflow-wrap: anywhere; }
+.seat .sub { font-size: 10.5px; color: var(--muted); }
+.seat .tags { display: flex; gap: 3px; flex-wrap: wrap; justify-content: center; margin-top: 2px; }
+.seat .sla { font-size: 10.5px; color: var(--warn); margin-top: 2px; cursor: help; }
+.seat .sla.over { color: var(--bad); }
+.seat.seated { background: var(--surface-2); border-color: var(--line-soft); }
+.seat.invited { opacity: 0.8; }
+.seat.invited .av { border-style: dashed; background: transparent; color: var(--muted); }
+.seat.left { opacity: 0.55; }
+.seat.human { background: var(--ok-bg); border-color: var(--ok); }
+.seat.owes, .seat.novote { border-color: var(--warn); }
+
+.av {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; min-width: 30px; border-radius: 50%;
+  background: var(--surface-2); border: 2px solid var(--line);
+  font-size: 11px; font-weight: 700; color: var(--text-2);
+}
+.av.lv-online { border-color: var(--ok); color: var(--text); }
+.av.lv-suspect { border-color: var(--warn); }
+.av.lv-dead, .av.lv-offline { border-color: var(--bad); }
+
+.rm-note {
+  font-size: 11.5px; margin-top: 8px; border-radius: 8px; padding: 6px 9px;
+  border: 1px solid var(--line); background: var(--surface-2);
+  color: var(--text-2); overflow-wrap: anywhere;
+}
+.rm-note.warn { border-color: var(--warn); background: var(--warn-bg); }
+.rm-note.bad { border-color: var(--bad); background: var(--bad-bg); }
+.rm-note b { color: var(--text); }
+.rm-left { font-size: 11px; color: var(--muted); margin-top: 7px; overflow-wrap: anywhere; }
+
+/* desks ------------------------------------------------------------------- */
+
+.desk {
+  position: relative; min-width: 0; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 12px 12px; box-shadow: var(--shadow);
+}
+/* the desk's front edge */
+.desk::before { content: ""; position: absolute; left: 12px; right: 12px; top: 0; height: 3px; border-radius: 0 0 4px 4px; background: var(--line-soft); }
+.desk.away { border-style: dashed; background: transparent; box-shadow: none; }
+.desk.ringing { border-color: var(--warn); }
+.dk-head { display: flex; gap: 9px; align-items: center; }
+.dk-id { min-width: 0; }
+.dk-name { font-size: 13.5px; font-weight: 650; color: var(--text); overflow-wrap: anywhere; }
+.dk-live { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 5px; margin-top: 1px; }
+.dk-now { margin-top: 9px; }
+.dk-state { font-size: 12px; font-weight: 600; color: var(--text-2); }
+/* a parked/crashed/ended session: its last words, greyed so they never read as
+   work in flight */
+.dk-state.stale, .dk-act.stale { color: var(--muted); font-weight: 400; }
+.dk-act {
+  font-size: 12px; color: var(--text-2); margin-top: 3px; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.dk-away {
+  margin-top: 9px; font-size: 12px; color: var(--text-2);
+  border: 1px dashed var(--line); border-radius: 8px; padding: 8px 9px;
+  background: var(--surface); overflow-wrap: anywhere;
+}
+.dk-away-h { display: block; color: var(--muted); font-size: 11px; }
+/* one room per line, ellipsized: the full agenda is on the link's title */
+.rmlink { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+.dk-phone {
+  display: flex; align-items: center; gap: 6px; margin-top: 9px; font-size: 11.5px;
+  border: 1px solid var(--warn); color: var(--warn); background: var(--warn-bg);
+  border-radius: 8px; padding: 5px 8px;
+}
+a.dk-phone:hover { text-decoration: none; filter: brightness(1.04); }
+.dk-phone.bad { border-color: var(--bad); color: var(--bad); background: var(--bad-bg); }
+.dk-phone b { font-variant-numeric: tabular-nums; }
+.dk-phone .ico { width: 13px; height: 13px; min-width: 13px; animation: ring 1.6s ease-in-out infinite; }
+@keyframes ring {
+  0%, 62%, 100% { transform: rotate(0deg); }
+  68%, 80% { transform: rotate(-16deg); }
+  74%, 86% { transform: rotate(16deg); }
+}
+.dk-trays { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 9px; }
+.tray {
+  font-size: 10.5px; color: var(--text-2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 1px 6px; background: var(--surface-2); cursor: help;
+}
+.tray b { color: var(--text); font-variant-numeric: tabular-nums; }
+.tray.zero { color: var(--muted); background: transparent; border-color: var(--line-soft); }
+.tray.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-bg); }
+.tray.bad { color: var(--bad); border-color: var(--bad); background: var(--bad-bg); }
+
+@media (prefers-reduced-motion: reduce) {
+  .dk-phone .ico { animation: none; }
+}
+
 @media (max-width: 980px) {
   .mcols { grid-template-columns: 1fr; }
   .mside { position: static; }
   .mlayout { grid-template-columns: 1fr; }
 }
+@media (max-width: 900px) {
+  /* Fewer, wider tracks rather than more, narrower ones: three rooms across a
+     900px screen clipped every agenda to "Deploy freez…". The floor reflows,
+     it never scrolls sideways. */
+  .rooms { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .desks { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+  .zone { padding: 10px 10px 14px; }
+}
 @media (max-width: 620px) {
   .grid { grid-template-columns: 1fr; }
   .people, .row { grid-template-columns: 1fr 1fr; }
   .tb-inner { padding: 8px clamp(10px, 3vw, 28px); }
+  .rooms, .desks { grid-template-columns: minmax(0, 1fr); }
 }
