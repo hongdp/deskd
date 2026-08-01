@@ -842,6 +842,24 @@ def test_every_meetings_read_reports_a_lapsed_deadline_rather_than_open(desk, re
     assert read(thread_id) == "paused", "a lapsed meeting must never read as open"
 
 
+def test_status_projects_the_message_threads_effective_state(desk):
+    """The protocol remains active across an idle retirement, but an operator
+    needs the state that determines whether a message can actually be sent."""
+    thread_id = _start("two layers, one projection", ["alpha", "beta"],
+                       idle_minutes=1)
+    _expire(thread_id)
+
+    meeting = meetings.meeting_status(thread_id)["meeting"]
+
+    assert meeting["state"] == "active", "the recoverable protocol phase is retained"
+    assert meeting["thread_status"] == "paused"
+    assert meeting["effective_state"] == "paused"
+    assert meeting["state_in_sync"] is False
+    assert meeting["thread_stop_reason"] == "idle timeout"
+    assert meeting["thread_stopped_by"] == "system"
+    assert meeting["thread_expires_at"] <= meetings._iso(meetings._now())
+
+
 def test_a_supervisor_resume_gives_the_meeting_a_fresh_idle_window(desk):
     """Retiring a thread on read must not make the supervisor's override
     decorative: a thread paused ON its deadline still carries a lapsed
@@ -856,14 +874,109 @@ def test_a_supervisor_resume_gives_the_meeting_a_fresh_idle_window(desk):
         meetings.send_update(thread_id, role="alpha", kind="evidence",
                              body="talking past the idle deadline")
 
-    meetings.apply_simple_supervisor_action(
+    resumed = meetings.apply_simple_supervisor_action(
         {"action": "resume", "meeting_id": thread_id, "reason": "supervisor resumed"})
 
     assert _thread_row(thread_id)["expires_at"] > dt.datetime.now(
         dt.timezone.utc).isoformat(timespec="seconds"), "resume must re-arm the deadline"
+    assert resumed["woken_roles"] == ["alpha", "beta"]
+    for role in resumed["woken_roles"]:
+        wakes = meetings.wake_requests(role)
+        assert [w["thread_id"] for w in wakes] == [thread_id]
+        with _db() as conn:
+            row = conn.execute(
+                """SELECT status,acknowledged_at FROM meeting_wake_requests
+                   WHERE thread_id=? AND role=?""",
+                (thread_id, role),
+            ).fetchone()
+        assert dict(row) == {"status": "pending", "acknowledged_at": None}
     meetings.send_update(thread_id, role="alpha", kind="evidence",
                          body="talking after a legitimate resume")
-    assert meetings.meeting_status(thread_id)["meeting"]["thread_status"] == "open"
+    projected = meetings.meeting_status(thread_id)["meeting"]
+    assert projected["thread_status"] == "open"
+    assert projected["effective_state"] == "active"
+    assert projected["state_in_sync"] is True
+
+
+def test_a_waiting_idle_meeting_needs_supervisor_resume_before_check_in(desk):
+    """A late invitee must not turn only the lifecycle row active while the
+    mailbox remains paused; resume preserves waiting, wakes both attendees, and
+    then the real check-in establishes quorum."""
+    status = meetings.call_meeting(
+        agenda="late arrival", called_by="alpha", attendees=["alpha", "beta"],
+        idle_minutes=1)
+    thread_id = status["meeting"]["thread_id"]
+    _expire(thread_id)
+
+    with pytest.raises(ValueError, match="message thread is paused.*idle timeout"):
+        meetings.check_in(thread_id, role="beta")
+    assert meetings.meeting_status(thread_id)["meeting"]["state"] == "waiting"
+
+    resumed = meetings.apply_simple_supervisor_action(
+        {"action": "resume", "meeting_id": thread_id})
+    assert resumed["meeting"]["meeting"]["state"] == "waiting"
+    assert resumed["meeting"]["meeting"]["effective_state"] == "waiting"
+    assert resumed["woken_roles"] == ["alpha", "beta"]
+
+    meetings.check_in(thread_id, role="beta")
+    assert meetings.meeting_status(thread_id)["meeting"]["state"] == "active"
+
+
+def test_resume_preserves_a_pending_termination_handshake(desk):
+    from deskd import orchestration
+
+    thread_id = _start(
+        "finish after idle", ["alpha", "beta", "gamma"], idle_minutes=1)
+    proposed = meetings.propose_end(
+        thread_id, role="alpha", resolution="the decision stands")
+    assert meetings.confirm_end(thread_id, role="beta")["closed"] is False
+    _expire(thread_id)
+    assert meetings.meeting_status(thread_id)["meeting"]["effective_state"] == "paused"
+
+    resumed = meetings.apply_simple_supervisor_action(
+        {"action": "resume", "meeting_id": thread_id})
+
+    status = resumed["meeting"]
+    assert status["meeting"]["state"] == "termination_pending"
+    assert status["meeting"]["effective_state"] == "termination_pending"
+    assert status["termination"]["id"] == proposed["proposal_id"]
+    assert {(v["role"], v["vote"]) for v in status["votes"]} == {
+        ("alpha", "confirm"), ("beta", "confirm")}
+    planned = orchestration.plan_wakes()
+    assert any(
+        c["role"] == "gamma" and c["reason_kind"] == "meeting_wake"
+        and c["source_ref"] == thread_id
+        for c in planned["changed"])
+    assert meetings.confirm_end(thread_id, role="gamma")["closed"] is True
+
+
+def test_resume_from_a_spent_budget_starts_a_new_bounded_window(desk):
+    thread_id = _start("continue after bound", ["alpha", "beta", "gamma"],
+                       max_messages=6, consensus_threshold=2)
+    _exhaust_budget(thread_id)
+    assert _thread_row(thread_id)["stop_reason"] == "message budget exhausted"
+
+    resumed = meetings.apply_simple_supervisor_action(
+        {"action": "resume", "meeting_id": thread_id})
+
+    assert resumed["budget_reset"] is True
+    assert resumed["meeting"]["meeting"]["effective_state"] == "active"
+    assert _thread_row(thread_id)["message_count"] == 0
+    meetings.send_update(
+        thread_id, role="alpha", kind="evidence",
+        body="first message in the supervisor-authorized continuation")
+    for i, role in enumerate(("beta", "gamma", "alpha"), start=2):
+        meetings.send_update(
+            thread_id, role=role, kind="evidence",
+            body=f"continuation evidence {i}")
+    meetings.send_update(
+        thread_id, role="beta", kind="decision",
+        body="continuation decision five")
+    meetings.send_update(
+        thread_id, role="gamma", kind="decision",
+        body="continuation decision six")
+    assert _thread_row(thread_id)["status"] == "paused"
+    assert _thread_row(thread_id)["stop_reason"] == "message budget exhausted"
 
 
 # --- 9. integrity: never create both sides ----------------------------------
@@ -1170,6 +1283,9 @@ def test_a_supervisor_message_revives_an_idle_paused_meeting(desk):
         dt.timezone.utc).isoformat(timespec="seconds"), (
         "a revived thread needs a fresh deadline, or the next read retires it "
         "again and the revival is decorative")
+    assert [w["thread_id"] for w in meetings.wake_requests("alpha")] == [thread_id], (
+        "reviving transport must also put the meeting back in front of the "
+        "agent; the original invitation wake was acknowledged at check-in")
 
 
 def test_reviving_an_idle_meeting_is_the_supervisors_alone(desk):
@@ -1287,6 +1403,62 @@ def test_the_supervisor_can_reopen_a_meeting_the_agents_closed(desk):
     # The proof the old resume could not pass: it accepts a message.
     meetings.send_update(thread_id, role="beta", kind="evidence",
                          body="picking the thread back up")
+
+
+def test_reopening_a_force_closed_handshake_starts_fresh(desk):
+    """A force-close rejects the old pending end proposal; reopening must not
+    strand the room in termination_pending with a vote from its prior life."""
+    thread_id = _start("forced during handshake", ["alpha", "beta"])
+    meetings.propose_end(
+        thread_id, role="alpha", resolution="old proposed resolution")
+    meetings.apply_simple_supervisor_action({
+        "action": "force_close", "meeting_id": thread_id,
+        "reason": "supervisor ended the old conversation",
+    })
+
+    reopened = meetings.apply_simple_supervisor_action({
+        "action": "resume", "meeting_id": thread_id,
+        "reason": "new information arrived",
+    })
+
+    assert reopened["meeting"]["meeting"]["state"] == "active"
+    assert reopened["meeting"]["termination"] is None
+    meetings.send_update(
+        thread_id, role="beta", kind="evidence",
+        body="ordinary discussion is legal after the fresh reopen")
+
+
+def test_reopening_a_closed_pre_quorum_meeting_preserves_waiting(desk):
+    status = meetings.call_meeting(
+        agenda="closed before beta arrived", called_by="alpha",
+        attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    meetings.apply_simple_supervisor_action({
+        "action": "force_close", "meeting_id": thread_id,
+        "reason": "pause this attempt",
+    })
+
+    reopened = meetings.apply_simple_supervisor_action({
+        "action": "resume", "meeting_id": thread_id,
+    })
+
+    assert reopened["meeting"]["meeting"]["state"] == "waiting"
+    meetings.check_in(thread_id, role="beta")
+    assert meetings.meeting_status(thread_id)["meeting"]["state"] == "active"
+
+
+def test_redundant_resume_does_not_nudge_an_already_live_meeting(desk):
+    thread_id = _start("already live", ["alpha", "beta"])
+    assert meetings.wake_requests("alpha") == []
+    assert meetings.wake_requests("beta") == []
+
+    resumed = meetings.apply_simple_supervisor_action({
+        "action": "resume", "meeting_id": thread_id,
+    })
+
+    assert resumed["woken_roles"] == []
+    assert meetings.wake_requests("alpha") == []
+    assert meetings.wake_requests("beta") == []
 
 
 # --- 10. history: when a meeting ended, and how the console reads it back ----
@@ -1577,9 +1749,126 @@ def test_supervisor_join_resumes_an_escalated_meeting(desk):
     assert _state(thread_id) == "active"
     assert _thread_row(thread_id)["status"] == "open"
     assert _events(thread_id, "resumed"), "the arrival is recorded as the resume"
+    for role in ("alpha", "beta"):
+        assert [w["thread_id"] for w in meetings.wake_requests(role)] == [
+            thread_id], "resuming for the supervisor must wake every agent attendee"
     sent = meetings.apply_simple_supervisor_action(
         {"action": "send", "meeting_id": thread_id, "body": "ruling: proceed"})
     assert sent["message_id"]
+
+
+def test_supervisor_join_restores_an_escalated_termination_handshake(desk):
+    """Escalation pauses transport, not the proposal it interrupted.
+
+    Flattening this to active hid the pending termination in the UI while the
+    unique pending-proposal row still existed, so neither finishing nor
+    replacing the handshake was discoverable from the console."""
+    thread_id = _start("page during close", ["alpha", "beta", "gamma"])
+    proposal = meetings.propose_end(
+        thread_id, role="alpha", resolution="ship it",
+    )["proposal_id"]
+    meetings.confirm_end(thread_id, role="beta")
+    meetings.escalate_meeting(
+        thread_id, role="alpha", reason="human should see the close",
+        channel="outbox",
+    )
+    assert _state(thread_id) == "escalated"
+
+    meetings.apply_simple_supervisor_action(
+        {"action": "join", "meeting_id": thread_id},
+    )
+
+    status = meetings.meeting_status(thread_id)
+    assert status["meeting"]["state"] == "termination_pending"
+    assert status["meeting"]["thread_status"] == "open"
+    assert status["termination"]["id"] == proposal
+    assert {(v["role"], v["vote"]) for v in status["votes"]} == {
+        ("alpha", "confirm"), ("beta", "confirm"),
+    }
+    assert meetings.confirm_end(thread_id, role="gamma")["closed"] is True
+
+
+def test_supervisor_join_does_not_create_agent_quorum_after_waiting_escalates(desk):
+    """Answering a page opens transport; it does not make a missing agent
+    present or permit the meeting to start without its required quorum."""
+    status = meetings.call_meeting(
+        agenda="still waiting for beta", called_by="alpha",
+        attendees=["alpha", "beta"],
+    )
+    thread_id = status["meeting"]["thread_id"]
+    meetings.escalate_meeting(
+        thread_id, role="alpha", reason="beta has not arrived",
+        channel="outbox",
+    )
+
+    meetings.apply_simple_supervisor_action(
+        {"action": "join", "meeting_id": thread_id},
+    )
+
+    status = meetings.meeting_status(thread_id)
+    assert status["meeting"]["state"] == "waiting"
+    assert status["meeting"]["thread_status"] == "open"
+    meetings.check_in(thread_id, role="beta")
+    assert _state(thread_id) == "active"
+
+
+def test_supervisor_rejoin_restores_consensus_after_a_dm_lost_quorum(desk):
+    """A supervisor leaving can cover consensus with waiting; joining again
+    must restore the budget-derived phase, not grant another active message
+    window that bypasses consensus-kind restrictions."""
+    called = meetings.apply_simple_supervisor_action({
+        "action": "call", "agenda": "consensus survives a rejoin",
+        "attendees": ["alpha"], "max_messages": 4, "consensus_threshold": 3,
+    })
+    thread_id = called["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="alpha")
+    meetings.apply_simple_supervisor_action({
+        "action": "send", "meeting_id": thread_id, "body": "enter consensus",
+    })
+    assert _state(thread_id) == "consensus"
+
+    meetings.apply_simple_supervisor_action({
+        "action": "leave", "meeting_id": thread_id, "reason": "step out",
+    })
+    assert _state(thread_id) == "waiting"
+    meetings.apply_simple_supervisor_action({
+        "action": "join", "meeting_id": thread_id,
+    })
+
+    assert _state(thread_id) == "consensus"
+    with pytest.raises(ValueError, match="consensus mode accepts"):
+        meetings.send_update(
+            thread_id, role="alpha", kind="evidence",
+            body="this kind remains gated",
+        )
+
+
+@pytest.mark.parametrize("stop_kind", ["pause", "escalate"])
+def test_supervisor_resume_does_not_create_quorum_for_a_stopped_waiting_meeting(
+        desk, stop_kind):
+    """Resume reopens transport; it does not replace a missing required
+    attendee, regardless of which stopped state covered the waiting room."""
+    status = meetings.call_meeting(
+        agenda=f"waiting under {stop_kind}", called_by="alpha",
+        attendees=["alpha", "beta"],
+    )
+    thread_id = status["meeting"]["thread_id"]
+    if stop_kind == "pause":
+        meetings.pause_meeting(thread_id, role="alpha", reason="wait here")
+    else:
+        meetings.escalate_meeting(
+            thread_id, role="alpha", reason="still waiting", channel="outbox",
+        )
+
+    meetings.apply_simple_supervisor_action(
+        {"action": "resume", "meeting_id": thread_id},
+    )
+
+    status = meetings.meeting_status(thread_id)
+    assert status["meeting"]["state"] == "waiting"
+    assert status["meeting"]["thread_status"] == "open"
+    meetings.check_in(thread_id, role="beta")
+    assert _state(thread_id) == "active"
 
 
 def test_supervisor_join_still_respects_an_explicit_pause(desk):

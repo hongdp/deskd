@@ -8,7 +8,8 @@ import datetime as dt
 from pathlib import Path
 
 from ..config import CONFIG
-from .store import _in_clause, _known_roles, _meeting, _mode, connect
+from .store import (_in_clause, _known_roles, _meeting, _meeting_projection,
+                    _mode, connect)
 from .sweep import _sweep_timeouts
 from .termination import _pending_termination
 
@@ -18,7 +19,7 @@ def meeting_status(thread_id: str, *, db_path: Path | str | None = None,
     if sweep:
         _sweep_timeouts(db_path)
     with connect(db_path) as conn:
-        meeting = dict(_meeting(conn, thread_id))
+        meeting = _meeting_projection(_meeting(conn, thread_id))
         attendees = [dict(r) for r in conn.execute(
             """SELECT role,required,invited_at,checked_in_at,last_seen_event_id,stopped_at
                FROM meeting_attendees WHERE thread_id=? ORDER BY role""",

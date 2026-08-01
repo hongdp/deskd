@@ -22,8 +22,9 @@ from .messaging import _meeting_updates, _send_update
 from .obligations import _waive_pending_obligations
 from .store import (DEFAULT_CONSENSUS_THRESHOLD, DEFAULT_IDLE_MINUTES,
                     DEFAULT_WAIT_TIMEOUT_SECONDS, _active_roles, _clean,
-                    _event, _meeting, _mode, _supervisor_claim, connect)
-from .termination import (_close_meeting, _propose_end, _vote_end,
+                    _event, _meeting, _mode, _rearm_agent_wakes,
+                    _supervisor_claim, connect)
+from .termination import (_close_meeting, _pending_termination, _propose_end, _vote_end,
                           _waiting_on_after_confirm)
 from .views import meeting_status
 
@@ -69,8 +70,28 @@ def _supervisor_join(conn: sqlite3.Connection, thread_id: str, auth_nonce: str) 
         # Explicit `paused` stays a hard gate above: pausing is a supervisor
         # choice, and joining must not silently undo it.
         now_dt = store._now()
-        next_state = ("consensus" if meeting["messages_remaining"] <=
-                      meeting["consensus_threshold"] else "active")
+        # Escalation is a transport stop layered over the meeting lifecycle.
+        # If it interrupted a termination handshake, the proposal and votes
+        # are still live and must become visible again when the human arrives.
+        # Flattening that state to active hides the termination panel while its
+        # pending row still occupies the one-proposal slot.
+        missing_required = conn.execute(
+            """SELECT COUNT(*) AS n FROM meeting_attendees
+               WHERE thread_id=? AND required=1 AND checked_in_at IS NULL
+                 AND stopped_at IS NULL""",
+            (thread_id,),
+        ).fetchone()["n"]
+        if _pending_termination(conn, thread_id) is not None:
+            next_state = "termination_pending"
+        elif missing_required or len(_active_roles(conn, thread_id)) < 2:
+            # Escalating while still waiting must not let the supervisor's
+            # arrival manufacture agent quorum.
+            next_state = "waiting"
+        else:
+            next_state = (
+                "consensus" if meeting["messages_remaining"] <=
+                meeting["consensus_threshold"] else "active"
+            )
         conn.execute(
             "UPDATE meetings SET state=?,updated_at=? WHERE thread_id=?",
             (next_state, store._iso(now_dt), thread_id),
@@ -82,6 +103,7 @@ def _supervisor_join(conn: sqlite3.Connection, thread_id: str, auth_nonce: str) 
             (store._iso(now_dt), mailbox._deadline(now_dt, thread["idle_minutes"]),
              thread_id),
         )
+        _rearm_agent_wakes(conn, thread_id, now=store._iso(now_dt))
         _event(conn, thread_id, "resumed", supervisor,
                "supervisor arrival resumed an escalated meeting", auth_nonce)
     previous_mode = _mode(conn, thread_id)
@@ -118,7 +140,8 @@ def _supervisor_join(conn: sqlite3.Connection, thread_id: str, auth_nonce: str) 
     if new_mode == "multi" and previous_mode != "multi":
         _waive_pending_obligations(
             conn, thread_id, "supervisor joined; multi-party replies are optional")
-    if meeting["state"] == "waiting" and len(_active_roles(conn, thread_id)) >= 2:
+    if _meeting(conn, thread_id)["state"] == "waiting" and len(
+            _active_roles(conn, thread_id)) >= 2:
         missing = conn.execute(
             """SELECT COUNT(*) AS n FROM meeting_attendees
                WHERE thread_id=? AND required=1 AND checked_in_at IS NULL
@@ -126,9 +149,15 @@ def _supervisor_join(conn: sqlite3.Connection, thread_id: str, auth_nonce: str) 
             (thread_id,),
         ).fetchone()["n"]
         if not missing:
+            refreshed = _meeting(conn, thread_id)
+            next_state = (
+                "consensus"
+                if refreshed["messages_remaining"] <=
+                refreshed["consensus_threshold"] else "active"
+            )
             conn.execute(
-                "UPDATE meetings SET state='active',updated_at=? WHERE thread_id=?",
-                (now, thread_id),
+                "UPDATE meetings SET state=?,updated_at=? WHERE thread_id=?",
+                (next_state, now, thread_id),
             )
     if new_mode != previous_mode:
         _event(conn, thread_id, "mode_changed", "system", new_mode)
@@ -204,8 +233,15 @@ def _apply_supervisor_payload(verified: auth.VerifiedAssertion, *,
                     conn, thread_id, closed)
         elif action == "resume":
             meeting = _meeting(conn, thread_id)
-            now = store._iso()
-            if meeting["state"] == "closed":
+            prior_state = meeting["state"]
+            prior_stop_reason = meeting["thread_stop_reason"]
+            was_stopped = (
+                prior_state in {"paused", "escalated", "closed"}
+                or meeting["thread_status"] != "open"
+            )
+            now_dt = store._now()
+            now = store._iso(now_dt)
+            if prior_state == "closed":
                 # Reopening a CLOSED meeting, not just un-pausing a live one.
                 # _close_meeting stops every attendee and spends the thread, so
                 # the old resume left a meeting that was open and empty: nobody
@@ -221,17 +257,52 @@ def _apply_supervisor_payload(verified: auth.VerifiedAssertion, *,
                     "UPDATE meeting_attendees SET stopped_at=NULL WHERE thread_id=?",
                     (thread_id,),
                 )
-                # Budget resets. It was spent reaching a conclusion that is now
-                # being reopened, and inheriting the remainder would reopen
-                # straight into `consensus` — or into "message budget
-                # exhausted", which is reopening into the closed state again.
+                # Repair force-closed rows written before _close_meeting began
+                # resolving an overtaken handshake. A proposal from the ended
+                # conversation cannot govern the reopened one or occupy the
+                # unique "one pending proposal" slot forever.
+                conn.execute(
+                    """UPDATE meeting_terminations
+                       SET status='rejected',resolved_at=?
+                       WHERE thread_id=? AND status='pending'""",
+                    (now, thread_id),
+                )
+            budget_reset = (
+                prior_state == "closed"
+                or prior_stop_reason == "message budget exhausted"
+            )
+            if budget_reset:
+                # A resume must be usable. Closed meetings and a mailbox parked
+                # on its hard message bound otherwise reopen directly into
+                # "message budget exhausted". This starts a new bounded window;
+                # the transcript remains intact.
                 conn.execute(
                     "UPDATE mailbox_threads SET message_count=0 WHERE id=?",
                     (thread_id,),
                 )
                 meeting = _meeting(conn, thread_id)
-            next_state = ("consensus" if meeting["messages_remaining"] <=
-                          meeting["consensus_threshold"] else "active")
+            pending_termination = conn.execute(
+                """SELECT 1 FROM meeting_terminations
+                   WHERE thread_id=? AND status='pending'""",
+                (thread_id,),
+            ).fetchone()
+            missing = conn.execute(
+                """SELECT COUNT(*) AS n FROM meeting_attendees
+                   WHERE thread_id=? AND required=1
+                     AND checked_in_at IS NULL AND stopped_at IS NULL""",
+                (thread_id,),
+            ).fetchone()["n"]
+            if pending_termination:
+                # Preserve the handshake and its votes across an idle pause.
+                next_state = "termination_pending"
+            elif missing or len(_active_roles(conn, thread_id)) < 2:
+                # Pause/escalate are transport stops that overwrite the visible
+                # lifecycle state. Recompute quorum for every resume source so
+                # reopening a waiting room cannot manufacture an active meeting.
+                next_state = "waiting"
+            else:
+                next_state = ("consensus" if meeting["messages_remaining"] <=
+                              meeting["consensus_threshold"] else "active")
             # closed_at is cleared: a live meeting has not ended, so it cannot
             # carry an end time. Leaving the old one is a row that contradicts
             # itself, and list_meetings ranks the live block by
@@ -251,11 +322,19 @@ def _apply_supervisor_payload(verified: auth.VerifiedAssertion, *,
             conn.execute(
                 """UPDATE mailbox_threads SET status='open',stop_reason=NULL,
                    stopped_by=NULL,updated_at=?,expires_at=? WHERE id=?""",
-                (now, mailbox._deadline(store._now(), thread["idle_minutes"]), thread_id),
+                (now, mailbox._deadline(now_dt, thread["idle_minutes"]), thread_id),
+            )
+            woken_roles = (
+                _rearm_agent_wakes(conn, thread_id, now=now)
+                if was_stopped else []
             )
             _event(conn, thread_id, "resumed", supervisor,
                    payload.get("reason", "supervisor resumed"), nonce)
-            result = {"resumed": True}
+            result = {
+                "resumed": True,
+                "woken_roles": woken_roles,
+                "budget_reset": budget_reset,
+            }
         elif action == "force_close":
             _close_meeting(conn, thread_id, _clean(payload["reason"], "reason"),
                            supervisor, nonce)

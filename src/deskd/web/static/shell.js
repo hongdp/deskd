@@ -160,6 +160,27 @@ window.Shell = (function () {
     ["escalations", "/escalations", "Escalations"],
     ["tasks", "/tasks", "Tasks & hooks"]
   ];
+
+  function navHTML(items, page) {
+    return items.map(function (n) {
+      return '<a href="' + esc(n[1]) + '"' +
+        (n[0] === page ? ' class="active"' : "") + ">" +
+        esc(n[2]) + "</a>";
+    }).join("");
+  }
+
+  function hostNav(metaValue) {
+    return (metaValue.console_links || []).filter(function (link) {
+      return link && typeof link.page === "string" &&
+        typeof link.href === "string" &&
+        link.href.charAt(0) === "/" && link.href.charAt(1) !== "/" &&
+        !/[\\\u0000-\u001f\u007f]/.test(link.href) &&
+        typeof link.label === "string";
+    }).map(function (link) {
+      return [link.page, link.href, link.label];
+    });
+  }
+
   var LOGO = '<svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true">' +
     '<rect width="32" height="32" rx="7" fill="#2a6fd6"/>' +
     '<text x="16" y="23" font-family="system-ui,sans-serif" font-size="19" font-weight="700" text-anchor="middle" fill="#fff">d</text></svg>';
@@ -176,9 +197,7 @@ window.Shell = (function () {
     bar.className = "topbar";
     bar.innerHTML = '<div class="tb-inner">' +
       '<a class="brand" href="/">' + LOGO + '<span id="sh-project">deskd</span><span class="brand-sub">console</span></a>' +
-      '<nav class="topnav">' + NAV.map(function (n) {
-        return '<a href="' + n[1] + '"' + (n[0] === page ? ' class="active"' : "") + ">" + n[2] + "</a>";
-      }).join("") + "</nav>" +
+      '<nav class="topnav" id="sh-nav">' + navHTML(NAV, page) + "</nav>" +
       '<div class="tb-right">' +
       '<span id="sh-refresh" class="tb-btn" hidden></span>' +
       '<span id="sh-auth" class="badge" title="how supervisor actions are authenticated">…</span>' +
@@ -208,6 +227,8 @@ window.Shell = (function () {
     meta().then(function (m) {
       var name = m.project || "deskd";
       $("#sh-project").textContent = name;
+      $("#sh-nav").innerHTML = navHTML(NAV.concat(hostNav(m)), page);
+      publishBarHeight();
       if (title) document.title = title + " · " + name + " console";
       var el = $("#sh-auth"), mode = m.supervisor_auth_mode;
       if (mode === "open") { el.className = "badge bad"; el.textContent = "supervisor auth OFF"; }

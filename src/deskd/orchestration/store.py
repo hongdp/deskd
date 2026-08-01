@@ -152,7 +152,8 @@ CREATE TABLE IF NOT EXISTS wake_attempts (
                           CHECK (outcome IN ('pending','acked','read','timeout','superseded','failed')),
     resolved_at           TEXT,
     latency_seconds       INTEGER,
-    detail                TEXT
+    detail                TEXT,
+    source_generation     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_wake_attempts_open
@@ -428,6 +429,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE agent_sessions ADD COLUMN session_day TEXT")
     if "phase" not in cols:
         conn.execute("ALTER TABLE agent_sessions ADD COLUMN phase TEXT")
+    if "source_generation" not in {r["name"] for r in conn.execute(
+            "PRAGMA table_info(wake_attempts)")}:
+        # A durable demand key may be reused after its previous request was
+        # acknowledged (meeting resume is the canonical case). Without the
+        # request generation, a still-pending old attempt is mistaken for the
+        # new work and its ladder position/SLA are inherited.
+        conn.execute(
+            "ALTER TABLE wake_attempts ADD COLUMN source_generation TEXT")
     # NOTE: only agent_* tables belong here. A migration for a lower layer's
     # table must live in that layer — `meetings.closed_at` was briefly added
     # here, which made it unreachable for a host that uses meetings without

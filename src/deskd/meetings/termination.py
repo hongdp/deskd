@@ -117,7 +117,8 @@ def _propose_end(conn: sqlite3.Connection, thread_id: str, role: str, resolution
                VALUES (?,?,'pending',?)
                ON CONFLICT(thread_id,role) DO UPDATE
                SET status='pending',created_at=excluded.created_at,
-                   acknowledged_at=NULL""",
+                   acknowledged_at=NULL,
+                   generation=meeting_wake_requests.generation+1""",
             (thread_id, voter, now),
         )
     _event(conn, thread_id, "termination_proposed", role,
@@ -139,6 +140,16 @@ def _close_meeting(conn: sqlite3.Connection, thread_id: str, resolution: str,
                    actor: str,
                    auth_nonce: str | None = None) -> None:
     now = store._iso()
+    # A force-close can overtake an in-flight termination handshake. Leaving
+    # that proposal pending makes a later supervisor reopen inherit a vote that
+    # belonged to the already-ended conversation, and the unique pending index
+    # also prevents a fresh proposal. "rejected" records that the proposal did
+    # not close the meeting; the force-close resolution remains the actual end.
+    conn.execute(
+        """UPDATE meeting_terminations SET status='rejected',resolved_at=?
+           WHERE thread_id=? AND status='pending'""",
+        (now, thread_id),
+    )
     # The only place a meeting closes, so the only place closed_at is written.
     conn.execute(
         "UPDATE meetings SET state='closed',updated_at=?,closed_at=? WHERE thread_id=?",

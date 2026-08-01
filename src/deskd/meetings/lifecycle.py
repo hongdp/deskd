@@ -19,8 +19,8 @@ from .store import (BROADCAST, DEFAULT_CONSENSUS_THRESHOLD,
                     MEETING_TYPES, MIN_CONSENSUS_THRESHOLD,
                     MIN_WAIT_TIMEOUT_SECONDS, _active_roles, _agent_role,
                     _attendee, _clean, _event, _has_supervisor, _known_roles,
-                    _meeting, _meeting_roles, _mode, _stamp_notifications,
-                    _supervisor_claim, _thread_last_activity,
+                    _meeting, _meeting_projection, _meeting_roles, _mode,
+                    _stamp_notifications, _supervisor_claim, _thread_last_activity,
                     _visible_message_sql, connect)
 from .sweep import _sweep_timeouts
 from .termination import _finalize_if_unanimous, _pending_termination
@@ -210,6 +210,9 @@ def discover(role: str, *, include_closed: bool = False,
         visible_sql, visible_params = _visible_message_sql(conn, "mm")
         rows = conn.execute(
             f"""SELECT m.*, a.checked_in_at, a.stopped_at, t.status AS thread_status,
+                       t.stop_reason AS thread_stop_reason,
+                       t.stopped_by AS thread_stopped_by,
+                       t.expires_at AS thread_expires_at,
                        t.max_messages-t.message_count AS messages_remaining,
                        (SELECT COUNT(*) FROM mailbox_messages mm
                         LEFT JOIN mailbox_receipts r
@@ -226,7 +229,7 @@ def discover(role: str, *, include_closed: bool = False,
                 ORDER BY (m.priority='urgent') DESC,m.created_at""",
             (role, role, BROADCAST, *visible_params, role),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_meeting_projection(r) for r in rows]
 
 
 # --- check-in / join / leave ------------------------------------------------
@@ -237,6 +240,11 @@ def _check_in(conn: sqlite3.Connection, thread_id: str, role: str,
     meeting = _meeting(conn, thread_id)
     if meeting["state"] in {"closed", "paused", "escalated"}:
         raise ValueError(f"cannot check in while meeting is {meeting['state']}")
+    if meeting["thread_status"] != "open":
+        raise ValueError(
+            "cannot check in while message thread is "
+            f"{meeting['thread_status']}: "
+            f"{meeting['thread_stop_reason'] or 'no reason recorded'}")
     attendee = _attendee(conn, thread_id, role)
     if attendee["checked_in_at"] and not attendee["stopped_at"]:
         return
@@ -264,7 +272,8 @@ def _check_in(conn: sqlite3.Connection, thread_id: str, role: str,
              AND stopped_at IS NULL""",
         (thread_id,),
     ).fetchone()["n"]
-    if not missing and len(_active_roles(conn, thread_id)) >= 2:
+    if (meeting["state"] == "waiting" and not missing
+            and len(_active_roles(conn, thread_id)) >= 2):
         refreshed = _meeting(conn, thread_id)
         next_state = ("consensus" if refreshed["messages_remaining"] <=
                       refreshed["consensus_threshold"] else "active")

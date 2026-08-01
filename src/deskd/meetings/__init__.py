@@ -58,8 +58,9 @@ from .store import (  # noqa: F401
     MEETING_STATES, MEETING_TYPES, MIN_CONSENSUS_THRESHOLD,
     MIN_WAIT_TIMEOUT_SECONDS, UPDATE_KINDS, _active_roles, _agent_role,
     _attendee, _clean, _event, _has_supervisor, _in_clause, _iso,
-    _known_roles, _meeting, _meeting_roles, _migrate, _mode, _now,
-    _parse_time, _stamp_notifications, _supervisor_claim,
+    _known_roles, _meeting, _meeting_projection, _meeting_roles, _migrate,
+    _mode, _now, _parse_time, _rearm_agent_wakes, _stamp_notifications,
+    _supervisor_claim,
     _thread_last_activity, _visible_message_sql, connect,
 )
 from .obligations import (  # noqa: F401

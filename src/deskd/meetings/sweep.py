@@ -118,7 +118,8 @@ def _sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
                    VALUES (?,?,'pending',?)
                    ON CONFLICT(thread_id,role) DO UPDATE
                    SET status='pending',created_at=excluded.created_at,
-                       acknowledged_at=NULL
+                       acknowledged_at=NULL,
+                       generation=meeting_wake_requests.generation+1
                    WHERE meeting_wake_requests.status='acknowledged'
                      AND meeting_wake_requests.acknowledged_at<?""",
                 (row["thread_id"], row["role"], now_iso, row["oldest_unread"]),
@@ -130,6 +131,12 @@ def _sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
         #    would park the meeting for good. Re-arm after the meeting's own
         #    wait timeout, with the same acknowledged-only guard as branch 3:
         #    a request still pending is already being climbed by the ladder.
+        #
+        #    Unlike branch 3 this is not a new generation. The proposal and
+        #    vote are unchanged; bumping generation would restart the live wake
+        #    attempt at hook on every re-arm and let an ack-without-a-vote evade
+        #    the escalation ladder forever. A legacy missing request row needs
+        #    no repair here: collect_wake_demand derives the unpaid vote itself.
         vote_in, vote_params = _in_clause("a.role", sorted(agent_roles))
         parked = conn.execute(
             f"""SELECT a.thread_id, a.role, t.created_at AS proposed_at,
@@ -151,14 +158,12 @@ def _sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
             if _parse_time(row["proposed_at"]) + timeout > now:
                 continue
             conn.execute(
-                """INSERT INTO meeting_wake_requests(thread_id,role,status,created_at)
-                   VALUES (?,?,'pending',?)
-                   ON CONFLICT(thread_id,role) DO UPDATE
-                   SET status='pending',created_at=excluded.created_at,
-                       acknowledged_at=NULL
-                   WHERE meeting_wake_requests.status='acknowledged'
-                     AND meeting_wake_requests.acknowledged_at<?""",
-                (row["thread_id"], row["role"], now_iso, store._iso(now - timeout)),
+                """UPDATE meeting_wake_requests
+                   SET status='pending',created_at=?,acknowledged_at=NULL
+                   WHERE thread_id=? AND role=? AND status='acknowledged'
+                     AND acknowledged_at<?""",
+                (now_iso, row["thread_id"], row["role"],
+                 store._iso(now - timeout)),
             )
     for escalation_id in escalation_ids:
         dispatch_escalation(escalation_id, db_path=db_path)

@@ -20,7 +20,7 @@ from pathlib import Path
 
 PROJECT_NAME = "deskd"
 ENV_PREFIX = "DESKD_"
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -76,6 +76,35 @@ class RoleSpec:
     display_name: str = ""
     capabilities: tuple[str, ...] = ()
     authority: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ConsoleLink:
+    """One host-owned link appended to the shared Web console navigation.
+
+    ``page`` matches the identifier passed to ``Shell.init`` so a host page can
+    highlight itself. Links are deliberately root-relative: the console may
+    surface a host view, but host configuration must not become a script or
+    off-site navigation injection point.
+    """
+
+    page: str
+    href: str
+    label: str
+
+    def __post_init__(self) -> None:
+        page = self.page.replace("-", "").replace("_", "")
+        if not page or not page.isalnum():
+            raise ValueError("console link page must be an alphanumeric slug")
+        if (
+            not self.href.startswith("/")
+            or self.href.startswith("//")
+            or "\\" in self.href
+            or any(ord(char) < 32 or ord(char) == 127 for char in self.href)
+        ):
+            raise ValueError("console link href must be a root-relative path")
+        if not self.label.strip():
+            raise ValueError("console link label is required")
 
 
 # --- wake ladder ------------------------------------------------------------
@@ -205,6 +234,11 @@ class EngineConfig:
 
     #: Coordination DB.
     db_path: Path = field(default_factory=lambda: DB_PATH)
+
+    #: Host-owned pages appended to the shared console nav. Kept last so adding
+    #: this optional seam does not shift any existing positional arguments.
+    #: EMPTY keeps the standalone deskd console domain-neutral.
+    console_links: tuple[ConsoleLink, ...] = ()
 
     def role_names(self) -> tuple[str, ...]:
         return tuple(r.name for r in self.roles)

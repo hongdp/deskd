@@ -152,13 +152,14 @@ def collect_wake_demand(conn: sqlite3.Connection) -> list[dict]:
     # the demand would regenerate every tick with no legal way to satisfy it.
     seen_meeting: set = set()
     for r in conn.execute(
-            """SELECT w.role, w.thread_id, m.agenda, w.created_at
+            """SELECT w.role, w.thread_id, w.generation, m.agenda, w.created_at
                FROM meeting_wake_requests w JOIN meetings m ON m.thread_id=w.thread_id
                WHERE w.status='pending' AND m.state!='closed'"""):
         seen_meeting.add((r["role"], r["thread_id"]))
         demands.append({"role": r["role"], "reason_kind": "meeting_wake",
                         "source_ref": r["thread_id"], "label": r["agenda"],
-                        "since_at": r["created_at"]})
+                        "since_at": r["created_at"],
+                        "generation": f"request:{r['generation']}"})
     # An unpaid vote is demand even when the notification was signed for. The
     # request table records what was SENT; this asks what is OWED, and for a
     # termination vote the ledger can tell the difference. Measured on a live
@@ -173,10 +174,13 @@ def collect_wake_demand(conn: sqlite3.Connection) -> list[dict]:
     # settling on the ack — an agent that acks has the thread in front of it,
     # and a demand that no action can clear would climb forever.
     for r in conn.execute(
-            """SELECT a.role, t.thread_id, m.agenda, t.created_at
+            """SELECT a.role, t.id AS proposal_id, t.thread_id, m.agenda,
+                      t.created_at, w.generation AS wake_generation
                  FROM meeting_terminations t
                  JOIN meetings m ON m.thread_id=t.thread_id
                  JOIN meeting_attendees a ON a.thread_id=t.thread_id
+                 LEFT JOIN meeting_wake_requests w
+                   ON w.thread_id=t.thread_id AND w.role=a.role
                 WHERE t.status='pending' AND m.state='termination_pending'
                   AND a.required=1 AND a.checked_in_at IS NOT NULL
                   AND a.stopped_at IS NULL
@@ -186,10 +190,21 @@ def collect_wake_demand(conn: sqlite3.Connection) -> list[dict]:
             continue
         if r["role"] not in _known_roles(conn):
             continue    # the supervisor votes from the console, not on an SLA
+        # Signing for the proposal-time request does not create new work: the
+        # same vote is still owed. Keep the request's generation so the live
+        # attempt continues climbing instead of restarting from hook on every
+        # pending -> acknowledged -> pending transition. The proposal token is
+        # only a legacy fallback for a missing request row.
+        generation = (
+            f"request:{r['wake_generation']}"
+            if r["wake_generation"] is not None
+            else f"vote:{r['proposal_id']}"
+        )
         demands.append({"role": r["role"], "reason_kind": "meeting_wake",
                         "source_ref": r["thread_id"],
                         "label": f'{r["agenda"]} — your vote closes it',
-                        "since_at": r["created_at"]})
+                        "since_at": r["created_at"],
+                        "generation": generation})
     wake = _wake_keys(conn)
     # A CLOSED thread raises no wake. Its ledger rows still read `overdue` — that
     # is an honest record that the message was never read — but waking an agent
@@ -428,10 +443,11 @@ def _insert_attempt(conn: sqlite3.Connection, d: dict, level: int, now_iso: str,
     channel = ladder[level].channel
     cur = conn.execute(
         """INSERT INTO wake_attempts
-               (role, reason_kind, source_ref, channel, level, attempted_at, outcome, detail)
-           VALUES (?,?,?,?,?,?, 'pending', ?)""",
+               (role, reason_kind, source_ref, channel, level, attempted_at,
+                outcome, detail, source_generation)
+           VALUES (?,?,?,?,?,?, 'pending', ?,?)""",
         (d["role"], d["reason_kind"], d["source_ref"], channel, level, now_iso,
-         d.get("label")),
+         d.get("label"), d.get("generation")),
     )
     return cur.lastrowid
 
@@ -611,6 +627,41 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
             if ceiling < 0:
                 continue
             cur = pend.get((d["role"], d["reason_kind"], d["source_ref"]))
+            fresh_generation = (
+                cur is not None
+                and d["reason_kind"] == "meeting_wake"
+                and d.get("generation") is not None
+                and cur["source_generation"] != d["generation"]
+            )
+            if fresh_generation:
+                # Same durable key, new request. Reusing the old live attempt
+                # inherits its age and rung: a resumed meeting can otherwise
+                # skip hook/resume/spawn and page a human immediately, or wait
+                # out the old rung's SLA before trying at all. Preserve the old
+                # row as superseded evidence and restart this generation from
+                # the role's current machine rung.
+                lvl = min(_start_level(pres.get(d["role"]), ladder), ceiling)
+                if record:
+                    conn.execute(
+                        """UPDATE wake_attempts
+                           SET outcome='superseded',resolved_at=?
+                           WHERE id=?""",
+                        (now_iso, cur["id"]),
+                    )
+                    _insert_attempt(conn, d, lvl, now_iso, ladder)
+                    _log_event(
+                        conn, "orchestrator", "wake_restart", d["source_ref"],
+                        {"role": d["role"], "reason": d["reason_kind"],
+                         "from": cur["level"], "to": lvl,
+                         "channel": ladder[lvl].channel,
+                         "generation": d["generation"]},
+                    )
+                if ladder[lvl].leaves_machine:
+                    esc_ids.append(_queue_wake_escalation(conn, d, lvl, now_iso))
+                changed.append({
+                    **d, "level": lvl, "escalated": False, "restarted": True,
+                })
+                continue
             if cur is None:
                 lvl = min(_start_level(pres.get(d["role"]), ladder), ceiling)
                 if record:
