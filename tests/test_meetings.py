@@ -2162,3 +2162,81 @@ def test_a_consensus_position_obligates_nobody(desk):
     settled = {o["message_id"]: o for o in
                meetings.meeting_status(thread_id)["response_obligations"]}
     assert settled[1]["status"] == "resolved"
+
+
+def test_a_rejection_is_a_demand_on_the_proposer(desk):
+    """The reject settles the rejecter's debt and mints the proposer's.
+
+    Without this, the reason lands only in the event log: the proposer has no
+    unread message (the 300s SLA never fires), no pending proposal (the
+    owed-vote branch never fires), and no wake request — every sweep branch is
+    silent while both sides believe the ball is in the other's court. Watched
+    live 2026-08-01: an EOD review sat half an hour on a one-word amendment
+    because the reject's "please fix the task reference" was invisible to the
+    agent it was addressed to."""
+    thread_id = _start("who owes after a no", ["alpha", "beta"])
+    meetings.propose_end(thread_id, role="alpha", resolution="done, I think")
+    # The propose-time wake asks beta for a vote; beta answers by rejecting.
+    meetings.reject_end(thread_id, role="beta", reason="amend §3 first")
+
+    pend = {w["thread_id"] for w in meetings.wake_requests("alpha")}
+    assert thread_id in pend, "the proposer must be woken to answer the no"
+    # And the rejecter owes nothing more — their vote was the work.
+    assert thread_id not in {w["thread_id"] for w in meetings.wake_requests("beta")}
+
+    # What alpha comes back TO: the status view names the no and its reason.
+    st = meetings.meeting_status(thread_id)
+    rej = st["last_rejection"]
+    assert rej["rejected_by"] == "beta" and rej["reason"] == "amend §3 first"
+    assert rej["proposer"] == "alpha"
+    assert st["termination"] is None, "the rejected proposal is not pending"
+
+    # A fresh proposal supersedes the record's usefulness but not its truth.
+    meetings.propose_end(thread_id, role="alpha", resolution="§3 amended; done")
+    st = meetings.meeting_status(thread_id)
+    assert st["termination"] is not None
+    assert st["last_rejection"]["reason"] == "amend §3 first"
+
+
+def test_a_supervisor_proposal_rejected_mints_no_wake(desk):
+    """The counterweight, same registry guard as the propose-time wake: the
+    supervisor is not an agent, and no ledger row may demand their presence."""
+    thread_id = _start("supervisor proposes", ["alpha", "beta"])
+    with meetings.store.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE meetings SET state='termination_pending', updated_at=? WHERE thread_id=?",
+            (meetings.store._now().isoformat(), thread_id))
+        conn.execute(
+            """INSERT INTO meeting_terminations(thread_id,proposer,resolution,status,created_at)
+               VALUES (?,?,?,'pending',?)""",
+            (thread_id, "supervisor", "close from the console",
+             meetings.store._now().isoformat()))
+    meetings.reject_end(thread_id, role="beta", reason="not yet")
+    with meetings.store.connect() as conn:
+        rows = conn.execute(
+            "SELECT role FROM meeting_wake_requests WHERE thread_id=? AND status='pending'",
+            (thread_id,)).fetchall()
+    assert "supervisor" not in {r["role"] for r in rows}
+
+
+def test_a_rejection_restarts_the_proposers_ladder(desk):
+    """A rejection is new work, so its wake gets a new generation — the ladder
+    restarts at hook instead of inheriting whatever rung the propose-time
+    request had climbed to. Contrast: the sweep's ack-without-a-vote re-arm
+    keeps its generation, because there the SAME vote is still owed."""
+    thread_id = _start("ladder restarts on no", ["alpha", "beta"])
+    # The proposer carries an acknowledged request from earlier in the meeting
+    # (an invite or nudge it already signed for) — the common live shape.
+    with meetings.store.connect(write=True) as conn:
+        conn.execute(
+            """INSERT INTO meeting_wake_requests(thread_id,role,status,created_at,acknowledged_at)
+               VALUES (?,'alpha','acknowledged',?,?)""",
+            (thread_id, meetings.store._iso(), meetings.store._iso()))
+    meetings.propose_end(thread_id, role="alpha", resolution="done, I think")
+    meetings.reject_end(thread_id, role="beta", reason="not yet")
+    with meetings.store.connect() as conn:
+        row = conn.execute(
+            "SELECT status, generation FROM meeting_wake_requests WHERE thread_id=? AND role='alpha'",
+            (thread_id,)).fetchone()
+    assert row["status"] == "pending"
+    assert row["generation"] == 2, "the re-arm must be a NEW generation, not a reuse"

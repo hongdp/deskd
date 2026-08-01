@@ -295,6 +295,31 @@ def _vote_end(conn: sqlite3.Connection, thread_id: str, role: str, vote: str,
                 f"termination proposal #{proposal['id']} rejected near message limit",
                 "auto",
             )
+        # A rejection is a demand on the proposer — the vote above settled the
+        # REJECTER's debt, and this mints the proposer's. Without it the reason
+        # lands only in the event log: the proposer has no unread message (so
+        # the 300s SLA never fires), no pending proposal (so the owed-vote
+        # branch never fires), and no wake request — every sweep branch is
+        # silent while both sides believe the ball is in the other's court.
+        # Watched live 2026-08-01: an EOD review sat 30+ minutes on a one-word
+        # fix because the reject's "please amend the task reference" was
+        # invisible to the agent it was addressed to. Same registry guard as
+        # the propose-time wake: never mint demand against the supervisor.
+        if proposal["proposer"] in _known_roles(conn):
+            # Generation bumps: a rejection is NEW work for the proposer (read
+            # the reason, amend, re-propose), not the propose-time request
+            # coming back — the ladder must restart at hook, exactly like a
+            # fresh proposal's wake and unlike the sweep's ack-without-a-vote
+            # re-arm, which deliberately keeps its generation.
+            conn.execute(
+                """INSERT INTO meeting_wake_requests(thread_id,role,status,created_at)
+                   VALUES (?,?,'pending',?)
+                   ON CONFLICT(thread_id,role) DO UPDATE
+                   SET status='pending',created_at=excluded.created_at,
+                       acknowledged_at=NULL,
+                       generation=meeting_wake_requests.generation+1""",
+                (thread_id, proposal["proposer"], now),
+            )
         return False
     return _finalize_if_unanimous(conn, thread_id, proposal, role, auth_nonce)
 
