@@ -42,6 +42,7 @@ def meeting_status(thread_id: str, *, db_path: Path | str | None = None,
         return {"meeting": meeting, "attendees": attendees,
                 "mode": _mode(conn, thread_id),
                 "termination": dict(proposal) if proposal else None, "votes": votes,
+                "last_rejection": _last_rejection(conn, thread_id),
                 "response_obligations": obligations}
 
 
@@ -176,3 +177,22 @@ def meeting_transcript(thread_id: str, *,
         "events": events,
         "escalations": escalations,
     }
+
+def _last_rejection(conn, thread_id: str) -> dict | None:
+    """The newest rejected end-proposal, with who said no and why.
+
+    The status view only ever showed the PENDING proposal, so the moment an
+    end was rejected the whole exchange vanished: the woken proposer saw
+    "termination: None, votes: []" — no proposal, no verdict, no reason. The
+    reject's wake (termination._vote_end) brings the proposer back; this is
+    what they come back TO."""
+    row = conn.execute(
+        """SELECT t.id, t.proposer, t.resolution, t.resolved_at,
+                  v.role AS rejected_by, v.reason
+             FROM meeting_terminations t
+             JOIN meeting_termination_votes v
+               ON v.proposal_id = t.id AND v.vote='reject'
+            WHERE t.thread_id=? AND t.status='rejected'
+            ORDER BY t.resolved_at DESC, t.id DESC LIMIT 1""",
+        (thread_id,)).fetchone()
+    return dict(row) if row else None
