@@ -47,6 +47,14 @@
 
   function isSeated(a) { return !!a.checked_in_at && !a.stopped_at; }
 
+  function operationalState(m) {
+    if (m.effective_state) return m.effective_state;
+    var stopped = ["paused", "escalated", "closed"];
+    if (stopped.indexOf(m.state) >= 0) return m.state;
+    if (stopped.indexOf(m.thread_status) >= 0) return m.thread_status;
+    return m.state;
+  }
+
   function floorPlan(board, meetingList, opts) {
     opts = opts || {};
     var now = opts.now == null ? Date.now() : opts.now;
@@ -151,7 +159,13 @@
         id: m.thread_id,
         anchor: roomAnchor(m.thread_id),
         agenda: m.agenda || "(no agenda)",
-        state: m.state,
+        state: operationalState(m),
+        lifecycleState: m.state,
+        stateMismatch: (typeof m.state_in_sync === "boolean"
+          ? !m.state_in_sync
+          : (m.thread_status || "open") !==
+            (["paused", "escalated", "closed"].indexOf(m.state) >= 0
+              ? m.state : "open")),
         mode: s.mode || "waiting",
         meetingType: m.meeting_type,
         priority: m.priority,
@@ -167,6 +181,7 @@
         // drawing a working meeting nobody can speak in.
         threadRetired: !!(m.thread_status && m.thread_status !== "open"),
         threadStatus: m.thread_status,
+        threadStopReason: m.thread_stop_reason,
         seated: seated, invited: invited, left: left,
         empty: seated.length === 0,
         // "Nobody has walked in yet" is a claim about history, and it is false

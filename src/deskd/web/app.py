@@ -139,41 +139,47 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
 
     # --- pages --------------------------------------------------------------
 
+    def page(name: str) -> FileResponse:
+        """HTML shell must revalidate too, or it may never load new assets."""
+        response = FileResponse(STATIC / name)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
     @app.get("/", include_in_schema=False)
     def home() -> FileResponse:
-        return FileResponse(STATIC / "board.html")
+        return page("board.html")
 
     @app.get("/board", include_in_schema=False)
     def board_page() -> FileResponse:
-        return FileResponse(STATIC / "board.html")
+        return page("board.html")
 
     @app.get("/office", include_in_schema=False)
     def office_page() -> FileResponse:
         # The floor plan. Pure projection like every other page: it joins
         # /api/board with /api/meetings in the browser and adds no endpoint.
-        return FileResponse(STATIC / "office.html")
+        return page("office.html")
 
     @app.get("/agent/{role}", include_in_schema=False)
     def agent_page(role: str) -> FileResponse:
         # The page reads the role off its own URL and calls /api/agent/{role};
         # an unknown role surfaces as that call's 404, not a missing page.
-        return FileResponse(STATIC / "agent.html")
+        return page("agent.html")
 
     @app.get("/meetings", include_in_schema=False)
     def meetings_page() -> FileResponse:
-        return FileResponse(STATIC / "meetings.html")
+        return page("meetings.html")
 
     @app.get("/wake", include_in_schema=False)
     def wake_page() -> FileResponse:
-        return FileResponse(STATIC / "wake.html")
+        return page("wake.html")
 
     @app.get("/escalations", include_in_schema=False)
     def escalations_page() -> FileResponse:
-        return FileResponse(STATIC / "escalations.html")
+        return page("escalations.html")
 
     @app.get("/tasks", include_in_schema=False)
     def tasks_page() -> FileResponse:
-        return FileResponse(STATIC / "tasks.html")
+        return page("tasks.html")
 
     # --- read-only projections ----------------------------------------------
 
@@ -275,6 +281,14 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
             "roles": [
                 {"role": p["role"], "display_name": p.get("display_name") or p["role"]}
                 for p in orchestration.presence()
+            ],
+            "console_links": [
+                {
+                    "page": link.page,
+                    "href": link.href,
+                    "label": link.label,
+                }
+                for link in cfg.console_links
             ],
             "supervisor_auth_mode": auth_mode,
             "simple_auth_enabled": auth.simple_auth_enabled(),

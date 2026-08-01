@@ -1228,6 +1228,55 @@ def test_a_legacy_db_migrates_the_new_column_and_the_old_check_together(desk):
         assert not orch._has_enum_check(c, "agent_tasks", "source_kind")
 
 
+def test_legacy_wake_rows_gain_generation_without_losing_history(desk):
+    """Both generation columns are additive migrations: existing requests and
+    attempts survive, then a legacy attempt safely restarts once because it
+    cannot prove which request generation it represented."""
+    _busy("beta")
+    status = meetings.call_meeting(
+        agenda="legacy generation", called_by="alpha",
+        attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    orch.plan_wakes()
+    assert len(_attempts()) == 1
+
+    con = sqlite3.connect(CONFIG.db_path)          # bare: orch.connect() migrates
+    try:
+        con.execute("ALTER TABLE meeting_wake_requests DROP COLUMN generation")
+        con.execute("ALTER TABLE wake_attempts DROP COLUMN source_generation")
+        con.commit()
+        assert "generation" not in {
+            r[1] for r in con.execute(
+                "PRAGMA table_info(meeting_wake_requests)")}
+        assert "source_generation" not in {
+            r[1] for r in con.execute("PRAGMA table_info(wake_attempts)")}
+    finally:
+        con.close()
+
+    with orch.connect() as c:  # applies both migrations
+        request_cols = {
+            r["name"] for r in c.execute(
+                "PRAGMA table_info(meeting_wake_requests)")}
+        attempt_cols = {
+            r["name"] for r in c.execute("PRAGMA table_info(wake_attempts)")}
+        assert "generation" in request_cols
+        assert "source_generation" in attempt_cols
+        assert c.execute(
+            "SELECT COUNT(*) FROM meeting_wake_requests WHERE thread_id=?",
+            (thread_id,)).fetchone()[0] == 1
+        assert c.execute(
+            "SELECT COUNT(*) FROM wake_attempts WHERE source_ref=?",
+            (thread_id,)).fetchone()[0] == 1
+
+    meeting_changes = [
+        c for c in orch.plan_wakes()["changed"]
+        if c["reason_kind"] == "meeting_wake" and c["source_ref"] == thread_id
+    ]
+    assert len(meeting_changes) == 1
+    assert meeting_changes[0]["restarted"] is True
+    assert [a["outcome"] for a in _attempts()] == ["superseded", "pending"]
+
+
 # --- 12. the stall breaker: a task nobody moves stops waking anyone ------------
 
 def _stall(role: str = "alpha") -> None:
@@ -1536,6 +1585,76 @@ def test_a_meeting_left_open_after_it_went_quiet_turns_urgent_and_wakes(desk):
     assert woken == {"alpha", "beta"}
 
 
+def test_resuming_a_meeting_starts_a_fresh_wake_generation(desk):
+    """A re-armed request reuses (role, meeting) but is new work. It must not
+    disappear behind, or inherit the human rung from, an unreconciled invite
+    attempt carrying the same durable key."""
+    _busy("alpha")
+    _busy("beta")
+    called = meetings.apply_simple_supervisor_action({
+        "action": "call", "agenda": "waiting for both agents",
+        "attendees": ["alpha", "beta"], "idle_minutes": 1,
+    })
+    thread_id = called["meeting"]["thread_id"]
+
+    first = orch.plan_wakes()
+    assert {
+        c["role"] for c in first["changed"]
+        if c["reason_kind"] == "meeting_wake"
+    } == {"alpha", "beta"}
+
+    # The old invitation attempts have climbed, but have not yet been
+    # reconciled after the request was acknowledged/re-armed.
+    terminal = len(CONFIG.wake_ladder) - 1
+    with orch.connect(write=True) as c:
+        c.execute(
+            """UPDATE wake_attempts SET level=?,channel=?
+               WHERE reason_kind='meeting_wake' AND source_ref=?
+                 AND outcome='pending'""",
+            (terminal, CONFIG.wake_ladder[terminal].channel, thread_id),
+        )
+        c.execute(
+            "UPDATE mailbox_threads SET expires_at=? WHERE id=?",
+            (iso(-3600), thread_id),
+        )
+    assert meetings.meeting_status(thread_id)[
+        "meeting"]["effective_state"] == "paused"
+
+    sent = meetings.apply_simple_supervisor_action({
+        "action": "send", "meeting_id": thread_id,
+        "body": "please join when ready",
+    })
+    assert sent["message_id"]
+    status = meetings.meeting_status(thread_id)
+    assert status["meeting"]["state"] == "waiting"
+    assert status["meeting"]["thread_status"] == "open"
+    assert status["meeting"]["thread_expires_at"] > iso()
+    assert any(
+        m["body"] == "please join when ready"
+        for m in meetings.meeting_transcript(thread_id)["messages"])
+
+    second = orch.plan_wakes()
+    restarted = [
+        c for c in second["changed"]
+        if c["reason_kind"] == "meeting_wake" and c["source_ref"] == thread_id
+    ]
+    assert {c["role"] for c in restarted} == {"alpha", "beta"}
+    assert all(c["restarted"] is True for c in restarted)
+    assert all(c["level"] == _level_of("hook") for c in restarted), (
+        "a new generation restarts from current presence, not the old human rung")
+    delivery = orch.delivery_ledger(thread_id)
+    assert set(delivery[str(sent["message_id"])]) == {"alpha", "beta"}
+    for role in ("alpha", "beta"):
+        history = _rows(
+            """SELECT outcome,source_generation,level FROM wake_attempts
+               WHERE role=? AND reason_kind='meeting_wake' AND source_ref=?
+               ORDER BY id""",
+            (role, thread_id),
+        )
+        assert [r["outcome"] for r in history] == ["superseded", "pending"]
+        assert history[0]["source_generation"] != history[1]["source_generation"]
+
+
 def test_a_dm_with_the_supervisor_never_becomes_a_close_task(desk):
     """The agent is refused if it tries (meetings._propose_end: theirs to end),
     so a task demanding it would be one the agent cannot discharge — pending
@@ -1675,6 +1794,88 @@ def test_acking_a_wake_does_not_settle_an_unpaid_vote(desk):
     with orch.connect() as c:
         assert [d for d in orch.collect_wake_demand(c)
                 if d["reason_kind"] == "meeting_wake" and d["role"] == "beta"] == []
+
+
+def test_rearming_the_same_unpaid_vote_continues_its_wake_ladder(desk):
+    """Acknowledging a vote notification without voting is not new work.
+
+    The fallback demand and the timeout re-arm used to give the same vote three
+    identities (request:g -> vote:id -> request:g+1). Each identity change
+    restarted the wake at hook, so an agent could keep signing without voting
+    and prevent the attempt from ever reaching its next rung."""
+    _busy("beta")
+    status = meetings.call_meeting(
+        agenda="one vote, one ladder", called_by="alpha",
+        attendees=["alpha", "beta"],
+    )
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+
+    first = orch.plan_wakes()
+    initial = next(
+        c for c in first["changed"]
+        if c["reason_kind"] == "meeting_wake" and c["role"] == "beta"
+    )
+    assert initial["level"] == _level_of("hook")
+    generation = next(
+        a["source_generation"] for a in _open_attempts()
+        if a["role"] == "beta" and a["reason_kind"] == "meeting_wake"
+        and a["source_ref"] == thread_id
+    )
+
+    meetings.acknowledge_wake(thread_id, role="beta")
+    with orch.connect() as c:
+        fallback = next(
+            d for d in orch.collect_wake_demand(c)
+            if d["reason_kind"] == "meeting_wake" and d["role"] == "beta"
+        )
+    assert fallback["generation"] == generation
+
+    hook_sla = CONFIG.wake_ladder[_level_of("hook")].sla_seconds
+    with orch.connect(write=True) as c:
+        c.execute(
+            "UPDATE meeting_terminations SET created_at=? WHERE thread_id=?",
+            (iso(-YEAR), thread_id),
+        )
+        c.execute(
+            """UPDATE meeting_wake_requests SET acknowledged_at=?
+               WHERE thread_id=? AND role=?""",
+            (iso(-YEAR), thread_id, "beta"),
+        )
+        c.execute(
+            """UPDATE wake_attempts SET attempted_at=?
+               WHERE role=? AND reason_kind='meeting_wake' AND source_ref=?
+                 AND outcome='pending'""",
+            (iso(-(hook_sla or 0) - 60), "beta", thread_id),
+        )
+
+    meetings.sweep_timeouts()
+    request = _rows(
+        """SELECT status,generation FROM meeting_wake_requests
+           WHERE thread_id=? AND role=?""",
+        (thread_id, "beta"),
+    )[0]
+    assert request == {
+        "status": "pending",
+        "generation": int(generation.removeprefix("request:")),
+    }
+
+    second = orch.plan_wakes()
+    advanced = next(
+        c for c in second["changed"]
+        if c["reason_kind"] == "meeting_wake" and c["role"] == "beta"
+    )
+    assert advanced.get("restarted") is not True
+    assert advanced["level"] == _level_of("resume")
+    history = _rows(
+        """SELECT outcome,source_generation,level FROM wake_attempts
+           WHERE role=? AND reason_kind='meeting_wake' AND source_ref=?
+           ORDER BY id""",
+        ("beta", thread_id),
+    )
+    assert [r["outcome"] for r in history] == ["superseded", "pending"]
+    assert {r["source_generation"] for r in history} == {generation}
 
 
 def test_an_ordinary_meeting_wake_still_settles_on_the_ack(desk):

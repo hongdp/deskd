@@ -29,7 +29,8 @@ fastapi = pytest.importorskip("fastapi", reason="web extra not installed")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from deskd import meetings, orchestration  # noqa: E402
+from deskd import ConsoleLink, meetings, orchestration  # noqa: E402
+from deskd.config import SUPERVISOR_CODE_HEADER  # noqa: E402
 from deskd.web.app import STATIC, create_app  # noqa: E402
 
 from conftest import iso  # noqa: E402
@@ -116,6 +117,40 @@ def test_office_is_in_the_shared_nav(client):
     assert 'S.init("office"' in client.get("/office").text
 
 
+def test_standalone_console_has_no_host_nav_links(client):
+    assert client.get("/api/meeting-meta").json()["console_links"] == []
+
+
+def test_host_pages_can_extend_the_shared_nav(client, desk):
+    """The engine stays generic while a host can expose its adjacent pages."""
+    desk.console_links = (
+        ConsoleLink("runtime", "/runtime", "Runtime"),
+    )
+    meta = client.get("/api/meeting-meta").json()
+    assert meta["console_links"] == [{
+        "page": "runtime",
+        "href": "/runtime",
+        "label": "Runtime",
+    }]
+    js = client.get("/static/shell.js").text
+    assert "console_links" in js
+    assert "NAV.concat(hostNav(m))" in js
+    assert 'id="sh-nav"' in js
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"page": "", "href": "/runtime", "label": "Runtime"},
+    {"page": "runtime", "href": "javascript:alert(1)", "label": "Runtime"},
+    {"page": "runtime", "href": "//elsewhere/runtime", "label": "Runtime"},
+    {"page": "runtime", "href": "/\\elsewhere/runtime", "label": "Runtime"},
+    {"page": "runtime", "href": "/runtime\nnext", "label": "Runtime"},
+    {"page": "runtime", "href": "/runtime", "label": " "},
+])
+def test_host_nav_rejects_unsafe_or_empty_links(kwargs):
+    with pytest.raises(ValueError):
+        ConsoleLink(**kwargs)
+
+
 def test_office_ships_its_model_script(client):
     """The join lives in office.js so it can be unit-tested headlessly; the
     page must actually load it."""
@@ -123,6 +158,23 @@ def test_office_ships_its_model_script(client):
     js = client.get("/static/office.js")
     assert js.status_code == 200
     assert "floorPlan" in js.text
+
+
+def test_meetings_ships_its_operational_state_model(client):
+    body = client.get("/meetings").text
+    assert '/static/meetings.js' in body
+    assert "Resume & wake agents" in body
+    assert "Thread paused after inactivity" in body
+    assert "V.effectiveState(m)" in body
+    assert "V.canSend(m, pendingTermination)" in body
+    assert "This escalation interrupted a pending termination" in body
+    assert "if (V.canResume(m))" in body
+    assert "m.thread_stop_reason" in body
+    assert "!META.simple_auth_enabled" in body
+    assert "off-host signed assertion" in body
+    js = client.get("/static/meetings.js")
+    assert js.status_code == 200
+    assert "effectiveState" in js.text
 
 
 def test_office_page_carries_its_empty_states(client):
@@ -301,6 +353,86 @@ def _floor_plan(tmp_path, board, meeting_list, opts=None):
     return json.loads(run.stdout)
 
 
+def _meeting_ui_state(meeting, *, has_termination=False):
+    """Evaluate the shipped meetings model, not a Python copy of its rules."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed — meetings.js unit tests need it")
+    script = (
+        "const fs=require('fs'),vm=require('vm'),ctx={};"
+        "vm.createContext(ctx);"
+        f"vm.runInContext(fs.readFileSync({json.dumps(str(STATIC / 'meetings.js'))},"
+        "'utf8'),ctx);"
+        "const m=JSON.parse(process.argv[1]),t=process.argv[2]==='true',V=ctx.MeetingView;"
+        "process.stdout.write(JSON.stringify({"
+        "effective:V.effectiveState(m),mismatch:V.stateMismatch(m),"
+        "send:V.canSend(m,t),auto:V.autoResumesOnSend(m),"
+        "join:V.resumesOnJoin(m),resume:V.canResume(m),"
+        "payable:V.obligationsPayable(m)}));"
+    )
+    run = subprocess.run(
+        [node, "-e", script, json.dumps(meeting), str(has_termination).lower()],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+def test_meeting_ui_uses_the_message_threads_operational_state():
+    open_state = _meeting_ui_state({
+        "state": "active", "thread_status": "open",
+        "effective_state": "active", "state_in_sync": True,
+    })
+    assert open_state == {
+        "effective": "active", "mismatch": False, "send": True,
+        "auto": False, "join": False, "resume": False, "payable": True,
+    }
+
+    idle = _meeting_ui_state({
+        "state": "active", "thread_status": "paused",
+        "thread_stop_reason": "idle timeout",
+        "effective_state": "paused", "state_in_sync": False,
+    })
+    assert idle == {
+        "effective": "paused", "mismatch": True, "send": True,
+        "auto": True, "join": False, "resume": True, "payable": False,
+    }
+
+    bounded = _meeting_ui_state({
+        "state": "consensus", "thread_status": "paused",
+        "thread_stop_reason": "message budget exhausted",
+        "effective_state": "paused", "state_in_sync": False,
+    })
+    assert bounded == {
+        "effective": "paused", "mismatch": True, "send": False,
+        "auto": False, "join": False, "resume": True, "payable": False,
+    }
+
+    escalated = _meeting_ui_state({
+        "state": "escalated", "thread_status": "escalated",
+        "effective_state": "escalated", "state_in_sync": True,
+    })
+    assert escalated == {
+        "effective": "escalated", "mismatch": False, "send": True,
+        "auto": False, "join": True, "resume": True, "payable": False,
+    }
+    escalated_termination = _meeting_ui_state({
+        "state": "escalated", "thread_status": "escalated",
+        "effective_state": "escalated", "state_in_sync": True,
+    }, has_termination=True)
+    assert escalated_termination == {
+        "effective": "escalated", "mismatch": False, "send": False,
+        "auto": False, "join": True, "resume": True, "payable": False,
+    }
+
+    termination = {
+        "state": "termination_pending", "thread_status": "paused",
+        "thread_stop_reason": "idle timeout",
+        "effective_state": "paused", "state_in_sync": False,
+    }
+    assert _meeting_ui_state(termination)["send"] is False
+
+
 def _plan_from(client, tmp_path, opts=None):
     """The model built from the LIVE payloads, exactly as the page builds it."""
     return _floor_plan(tmp_path,
@@ -365,6 +497,43 @@ def test_floor_separates_who_is_at_the_table_from_who_is_still_invited(client, t
     assert room["empty"] is False
     desks = {d["role"]: d for d in plan["desks"]}
     assert desks["alpha"]["atDesk"] is False and desks["beta"]["atDesk"] is True
+
+
+def test_floor_marks_an_active_lifecycle_with_a_retired_thread_as_paused(tmp_path):
+    board = {"generated_at": iso(), "agents": [
+        {"role": "alpha", "display_name": "Alpha", "liveness": "idle"},
+        {"role": "beta", "display_name": "Beta", "liveness": "idle"},
+    ]}
+    meeting_list = [{
+        "meeting": {
+            "thread_id": "m-paused", "agenda": "quiet room",
+            "state": "active", "effective_state": "paused",
+            "state_in_sync": False, "thread_status": "paused",
+            "thread_stop_reason": "idle timeout",
+            "meeting_type": "ad-hoc", "called_by": "alpha",
+            "priority": "normal", "message_count": 1, "max_messages": 20,
+            "messages_remaining": 19, "created_at": iso(-3600),
+            "updated_at": iso(-300),
+        },
+        "attendees": [
+            {"role": role, "required": 1, "invited_at": iso(-3600),
+             "checked_in_at": iso(-3500), "stopped_at": None}
+            for role in ("alpha", "beta")
+        ],
+        "mode": "one_to_one", "termination": None, "votes": [],
+        "response_obligations": [{
+            "status": "pending", "owed_by": "beta", "message_id": 1,
+            "sender": "alpha", "kind": "question", "due_at": iso(-60),
+        }],
+    }]
+
+    room = _floor_plan(tmp_path, board, meeting_list)["rooms"][0]
+
+    assert room["state"] == "paused"
+    assert room["lifecycleState"] == "active"
+    assert room["stateMismatch"] is True
+    assert room["threadStopReason"] == "idle timeout"
+    assert room["nextOwed"] is None, "a paused thread cannot pay a reply debt"
 
 
 def test_floor_shows_a_room_nobody_has_walked_into(tmp_path):
@@ -490,6 +659,62 @@ def test_floor_model_survives_a_never_seen_agent_and_a_long_activity(tmp_path):
 
 # --- the trust boundary is unchanged -----------------------------------------------
 
+def test_authenticated_ui_resume_reopens_and_rearms_the_thread(desk, monkeypatch):
+    """The button's real HTTP path must do more than repaint the page: it opens
+    transport, refreshes the projection, and queues agent wake demand."""
+    monkeypatch.setenv("DESKD_SUPERVISOR_AUTH_MODE", "simple")
+    monkeypatch.setenv("DESKD_SUPERVISOR_ACCESS_CODE", "test-only-code")
+    thread_id = meetings.call_meeting(
+        agenda="resume from console", called_by="alpha",
+        attendees=["alpha", "beta"], idle_minutes=1,
+    )["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    with meetings.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE mailbox_threads SET expires_at=? WHERE id=?",
+            (iso(-3600), thread_id),
+        )
+
+    web = TestClient(create_app(desk))
+    before = web.get(f"/api/meetings/{thread_id}").json()
+    assert before["status"]["meeting"]["effective_state"] == "paused"
+
+    def wake_rows():
+        with meetings.connect() as conn:
+            return [tuple(r) for r in conn.execute(
+                """SELECT role,status,created_at,acknowledged_at,generation
+                   FROM meeting_wake_requests WHERE thread_id=? ORDER BY role""",
+                (thread_id,)).fetchall()]
+
+    before_wakes = wake_rows()
+    for headers in ({}, {SUPERVISOR_CODE_HEADER: "wrong-code"}):
+        denied = web.post(
+            "/api/meetings/supervisor-action", headers=headers,
+            json={"payload": {"action": "resume", "meeting_id": thread_id}},
+        )
+        assert denied.status_code == 401
+        assert web.get(f"/api/meetings/{thread_id}").json()[
+            "status"]["meeting"]["effective_state"] == "paused"
+        assert wake_rows() == before_wakes, "failed auth cannot re-arm wake demand"
+
+    resumed = web.post(
+        "/api/meetings/supervisor-action",
+        headers={SUPERVISOR_CODE_HEADER: "test-only-code"},
+        json={"payload": {"action": "resume", "meeting_id": thread_id}},
+    )
+    assert resumed.status_code == 200
+    body = resumed.json()
+    assert body["woken_roles"] == ["alpha", "beta"]
+    assert body["meeting"]["meeting"]["thread_status"] == "open"
+    assert body["meeting"]["meeting"]["thread_stop_reason"] is None
+    assert body["meeting"]["meeting"]["thread_expires_at"] > iso()
+    assert body["meeting"]["meeting"]["effective_state"] == "active"
+    assert all(
+        thread_id in [w["thread_id"] for w in meetings.wake_requests(role)]
+        for role in body["woken_roles"]
+    )
+
+
 def test_supervisor_adapter_still_fails_closed(client):
     """New read surface must not have loosened the only write path."""
     r = client.post("/api/meetings/supervisor-action",
@@ -518,7 +743,7 @@ def test_an_away_desk_draws_the_desk_not_the_person(client):
     assert "dk-elsewhere" in page
     assert "Sitting in:" in page
 
-def test_the_console_assets_must_be_revalidated_not_reused(client):
+def test_the_console_pages_and_assets_must_be_revalidated_not_reused(client):
     """The nav lives in shell.js, so a browser holding an old copy silently
     hides every view added since — the page is there, the link is not, and
     nothing looks broken. Starlette sends ETag and Last-Modified but no
@@ -527,13 +752,18 @@ def test_the_console_assets_must_be_revalidated_not_reused(client):
     Observed on a live desk the day the office view shipped: the page 200'd and
     the operator could not find it.
 
-    `no-cache` still stores and still answers 304 — it only forbids using the
-    copy without asking."""
-    for asset in ("/static/shell.js", "/static/deskd.css"):
+    `no-cache` still permits storage; it forbids using the copy without asking.
+    Static assets additionally support a cheap 304. Page FileResponses may
+    answer that revalidation with 200, but can no longer be reused unseen."""
+    for asset in ("/static/shell.js", "/static/deskd.css",
+                  "/static/meetings.js", "/static/office.js"):
         r = client.get(asset)
         assert r.status_code == 200, asset
         assert "no-cache" in r.headers.get("cache-control", ""), asset
         assert r.headers.get("etag"), asset + " must still support a cheap 304"
+    for page in PAGES:
+        r = client.get(page)
+        assert "no-cache" in r.headers.get("cache-control", ""), page
 
     # And the revalidation is genuinely cheap: a conditional request is a 304
     # with no body, not a re-download.

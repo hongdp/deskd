@@ -64,7 +64,7 @@ Describe your desk in a module that defines `configure_deskd()`:
 
 ```python
 # myapp/desk.py
-from deskd.config import RoleSpec, PromptBuilder, configure
+from deskd import ConsoleLink, PromptBuilder, RoleSpec, configure
 
 class MyPrompts(PromptBuilder):
     def bootstrap(self, role: str) -> str:
@@ -76,6 +76,8 @@ def configure_deskd():                        # deskd calls this at startup
             RoleSpec("researcher", "Researcher", ("research", "review")),
             RoleSpec("operator",   "Operator",   ("execution",), {"can_execute": True}),
         ),
+        # Optional host pages appended to every console view's shared nav.
+        console_links=(ConsoleLink("reports", "/reports", "Reports"),),
         timezone="America/New_York",
         inbox_sources=("alert", "signal", "system", "meeting", "supervisor"),
         probe_allowlist=("myapp.watchers",),   # empty = no probes may run

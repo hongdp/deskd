@@ -17,8 +17,9 @@ from .escalations import _queue_escalation, dispatch_escalation
 from .obligations import _discharge_obligations
 from .store import (BROADCAST, MAX_WAIT_SECONDS, UPDATE_KINDS, _active_roles,
                     _agent_role, _attendee, _clean, _event, _has_supervisor,
-                    _meeting, _meeting_roles, _mode, _supervisor_claim,
-                    _visible_message_sql, connect)
+                    _meeting, _meeting_projection, _meeting_roles, _mode,
+                    _rearm_agent_wakes, _supervisor_claim, _visible_message_sql,
+                    connect)
 from .sweep import _sweep_timeouts
 
 # --- reading ----------------------------------------------------------------
@@ -69,7 +70,7 @@ def _meeting_updates(thread_id: str, *, role: str, mark_read: bool = False,
                 (max_event, thread_id, role),
             )
         return {
-            "meeting": dict(_meeting(conn, thread_id)),
+            "meeting": _meeting_projection(_meeting(conn, thread_id)),
             "messages": [dict(m) for m in messages],
             "events": [dict(e) for e in events],
         }
@@ -140,6 +141,7 @@ def _revive_idle_thread(conn: sqlite3.Connection, thread_id: str) -> bool:
            updated_at=?,expires_at=? WHERE id=?""",
         (store._iso(now), mailbox._deadline(now, thread["idle_minutes"]), thread_id),
     )
+    _rearm_agent_wakes(conn, thread_id, now=store._iso(now))
     _event(conn, thread_id, "resumed", CONFIG.supervisor_role,
            "supervisor wrote to an idle-paused meeting")
     return True

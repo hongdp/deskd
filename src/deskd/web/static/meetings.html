@@ -6,6 +6,7 @@
 <title>Meetings · deskd console</title>
 <link rel="stylesheet" href="/static/deskd.css">
 <script src="/static/shell.js"></script>
+<script src="/static/meetings.js"></script>
 </head>
 <body>
 <!-- Same shell as every other view: .wrap gutters, a pagehead that names the
@@ -86,7 +87,7 @@
 
 <script>
 "use strict";
-var S = Shell, $ = S.$, esc = S.esc, rel = S.rel;
+var S = Shell, V = MeetingView, $ = S.$, esc = S.esc, rel = S.rel;
 S.init("meetings", "Meetings");
 
 var meetings = [], selected = null, detail = null, delivery = {}, days = [];
@@ -130,6 +131,7 @@ async function meta() {
   $("#sla-quiet").textContent = (META.wait_timeout_seconds || 300) + "s response SLA";
   renderCallRoles();
   $("#auth-box").hidden = !META.access_code_required;
+  $("#open-call").disabled = !META.simple_auth_enabled;
   var n = $("#security");
   if (META.supervisor_auth_mode === "open") {
     n.className = "security bad";
@@ -176,10 +178,14 @@ function renderList() {
     return;
   }
   var html = meetings.map(function (s) {
-    var m = s.meeting;
+    var m = s.meeting, state = V.effectiveState(m);
+    var mismatch = V.stateMismatch(m)
+      ? " · lifecycle " + esc(S.human(m.state))
+      : "";
     return '<button class="meeting ' + (m.thread_id === selected ? "active" : "") + '" data-id="' + esc(m.thread_id) + '">'
-      + '<div class="line"><span class="agenda">' + esc(m.agenda) + '</span><span class="mdot ' + esc(m.state) + '"></span></div>'
-      + '<div class="meta">' + esc(s.mode) + " · " + activePeople(s).length + " active · " + m.messages_remaining + " msgs left</div></button>";
+      + '<div class="line"><span class="agenda">' + esc(m.agenda) + '</span><span class="mdot ' + esc(state) + '"></span></div>'
+      + '<div class="meta">' + esc(S.human(state)) + mismatch + " · " + esc(s.mode)
+      + " · " + activePeople(s).length + " present · " + m.messages_remaining + " msgs left</div></button>";
   }).join("");
   if (S.setHTML(n, html)) {
     n.querySelectorAll("[data-id]").forEach(function (el) {
@@ -202,11 +208,19 @@ async function loadOne() {
   renderOne();
 }
 function renderOne() {
-  var s = detail.status, m = s.meeting;
+  var s = detail.status, m = s.meeting, state = V.effectiveState(m);
   $("#title").textContent = m.agenda;
   $("#subtitle").innerHTML = esc(m.meeting_type) + " · called by " + esc(m.called_by) + " · " + rel(m.created_at);
   $("#updated").innerHTML = "updated " + rel(m.updated_at);
-  S.setHTML($("#status"), stateChip(m.state) + '<span class="chip">' + esc(s.mode) + "</span>"
+  var stateDetail = V.stateMismatch(m)
+    ? '<span class="chip bad">message thread ' + esc(S.human(m.thread_status))
+      + " · lifecycle " + esc(S.human(m.state)) + "</span>"
+    : "";
+  var stopReason = m.thread_status !== "open" && m.thread_stop_reason
+    ? '<span class="chip warn">' + esc(m.thread_stop_reason) + "</span>"
+    : "";
+  S.setHTML($("#status"), stateChip(state) + stateDetail + stopReason
+    + '<span class="chip">' + esc(s.mode) + "</span>"
     + '<span class="chip">' + m.messages_remaining + " messages left</span>"
     + '<span class="chip">' + m.wait_timeout_seconds + "s SLA</span>");
   renderTermination(s);
@@ -300,10 +314,13 @@ function timeline() {
 }
 function obligations() {
   var p = detail.status.response_obligations.filter(function (o) { return o.status === "pending"; });
+  var payable = V.obligationsPayable(detail.status.meeting);
   S.setHTML($("#obligations"), p.length ? p.map(function (o) {
     var sec = Math.floor((new Date(o.due_at) - Date.now()) / 1000);
-    var sla = sec < 0 ? "overdue by " + S.dur(Math.abs(sec)) : S.dur(sec) + " left";
-    return '<div class="obligation"><span class="mdot waiting"></span><div><b>' + esc(o.owed_by) + "</b> must answer #" + o.message_id
+    var sla = payable
+      ? (sec < 0 ? "overdue by " + S.dur(Math.abs(sec)) : S.dur(sec) + " left")
+      : "tracked · resumes when the message thread reopens";
+    return '<div class="obligation"><span class="mdot ' + (payable ? "waiting" : "paused") + '"></span><div><b>' + esc(o.owed_by) + "</b> must answer #" + o.message_id
       + '<div class="quiet">' + esc(o.sender) + " · " + esc(o.kind) + ' · <span class="sla">' + sla + "</span></div></div></div>";
   }).join("") : S.empty("No mandatory responses pending."));
 }
@@ -335,32 +352,61 @@ function updateComposer() {
   if (!selected || !detail) { button.disabled = true; hint.className = "composer-hint"; hint.textContent = "Select a meeting"; return; }
   var s = detail.status, m = s.meeting;
   var missing = s.attendees.filter(function (a) { return a.required && !a.checked_in_at && !a.stopped_at; }).map(function (a) { return a.role; });
-  var allowed = ["active", "consensus", "escalated", "waiting"].includes(m.state);
+  var reply = owedReplyId();
+  var pendingTermination = !!s.termination;
+  var allowed = !!META.simple_auth_enabled && V.canSend(m, pendingTermination);
+  var autoResume = V.autoResumesOnSend(m);
+  var joinResume = V.resumesOnJoin(m);
   var o = allowed ? turnObligation() : null;
   button.disabled = !allowed;
   hint.className = "composer-hint" + (allowed ? "" : " bad");
-  hint.textContent = (o && o.owed_by === META.supervisor_role)
+  hint.textContent = !META.simple_auth_enabled
+    ? "Signed-only mode: use /api/meetings/supervisor-apply with an off-host signed assertion."
+    : autoResume
+    ? "Thread paused after inactivity. Sending will resume it and queue fresh agent wakes"
+      + (reply !== null ? " as your reply to #" + reply + "." : ".")
+    : joinResume && pendingTermination
+      ? "This escalation interrupted a pending termination. Use “Resume & wake agents” to restore its proposal and vote panel before sending."
+    : joinResume
+      ? "Sending will join this escalated meeting, resume it, and deliver your response."
+    : (o && o.owed_by === META.supervisor_role)
     ? "Will be sent as your reply to #" + o.message_id + " (one-to-one turn obligation)."
     : m.state === "waiting"
       ? "Meeting has not started (waiting for " + (missing.join(", ") || "attendees") + " to check in) — your message is kept as an opening remark and is readable once they arrive."
       : allowed ? "Sent as " + META.supervisor_role + "; you are joined automatically if needed."
-                : "State is " + S.human(m.state) + "; messages cannot be sent right now.";
+                : V.canResume(m)
+                  ? "Message thread is " + S.human(V.effectiveState(m))
+                    + "; use “Resume & wake agents” before sending."
+                  : "State is " + S.human(V.effectiveState(m)) + "; messages cannot be sent right now.";
 }
 async function joinIfNeeded() {
   var me = detail.status.attendees.find(function (a) { return a.role === META.supervisor_role && !a.stopped_at; });
-  if (!me) await supervisor({ action: "join", meeting_id: selected });
+  if (!me || V.resumesOnJoin(detail.status.meeting)) {
+    var joined = await supervisor({ action: "join", meeting_id: selected });
+    // Keep the local state truthful even if the following action fails. The
+    // join may have restored waiting or termination_pending rather than active.
+    if (joined && joined.meeting) detail.status = joined.meeting;
+    return joined;
+  }
+  return null;
 }
 async function sendMessage() {
   var body = $("#message-body").value.trim();
   if (!selected) throw new Error("select a meeting");
   if (!body) throw new Error("enter a message");
+  if (!V.canSend(detail.status.meeting, !!detail.status.termination)) {
+    throw new Error("resume this meeting before sending");
+  }
+  var autoResume = V.autoResumesOnSend(detail.status.meeting);
   await joinIfNeeded();
   var p = { action: "send", meeting_id: selected, body: body, kind: "decision" };
   var r = owedReplyId();
   if (r !== null) p.reply_to = r;
   await supervisor(p);
   $("#message-body").value = "";
-  setResult("Message sent.", false);
+  setResult(autoResume
+    ? "Message sent; the idle thread was resumed and agent wakes were queued."
+    : "Message sent.", false);
   await load(true);
 }
 async function runAction(payload, needJoin) {
@@ -375,6 +421,11 @@ async function runAction(payload, needJoin) {
     if (res && res.closed === false && Array.isArray(res.waiting_on) && res.waiting_on.length) {
       setResult("Confirm recorded — still waiting on: " + res.waiting_on.join(", ")
         + " (they are woken to vote; use Force close to end it now)", false);
+    } else if (res && res.resumed) {
+      var roles = Array.isArray(res.woken_roles) ? res.woken_roles : [];
+      setResult((payload.action === "resume" ? "Meeting resumed" : "Meeting updated")
+        + (roles.length ? "; wake queued for: " + roles.join(", ") : "; no active agent attendees to wake")
+        + (res.budget_reset ? " (new message-budget window)" : "") + ".", false);
     } else {
       setResult("Done.", false);
     }
@@ -384,9 +435,16 @@ async function runAction(payload, needJoin) {
 function renderActions() {
   var n = $("#sup-actions");
   if (!selected || !detail) { S.setHTML(n, S.empty("Select a meeting.")); return; }
+  if (!META.simple_auth_enabled) {
+    S.setHTML(n, S.empty(
+      "Signed-only mode: controls require an off-host signed assertion."));
+    return;
+  }
   var m = detail.status.meeting, t = detail.status.termination, html = "";
+  var state = V.effectiveState(m);
   if (t && m.state === "termination_pending") html += '<button class="btn primary" id="act-confirm">Confirm end</button><button class="btn" id="act-reject">Reject end</button>';
-  if (["paused", "escalated"].includes(m.state)) html += '<button class="btn" id="act-resume">Resume</button>';
+  if (V.canResume(m)) html += '<button class="btn" id="act-resume">'
+    + (state === "closed" ? "Reopen & wake agents" : "Resume & wake agents") + "</button>";
   if (m.state !== "closed") html += '<button class="btn danger" id="act-close">Force close</button>';
   if (!S.setHTML(n, html || S.empty("Meeting is closed."))) return;
   var b;

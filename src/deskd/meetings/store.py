@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS meeting_wake_requests (
     status                TEXT NOT NULL CHECK (status IN ('pending', 'acknowledged')),
     created_at            TEXT NOT NULL,
     acknowledged_at       TEXT,
+    generation            INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (thread_id, role)
 );
 
@@ -241,6 +242,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # closing was in fact the last write. New rows get the real thing.
         conn.execute("UPDATE meetings SET closed_at=updated_at "
                      "WHERE state='closed' AND closed_at IS NULL")
+    if "generation" not in {r["name"] for r in conn.execute(
+            "PRAGMA table_info(meeting_wake_requests)")}:
+        # A request can be acknowledged and later re-armed for the same
+        # (meeting, role). The wake attempt key is also (meeting, role), so
+        # without a generation the planner cannot distinguish the new request
+        # from an old attempt that has not yet been reconciled.
+        conn.execute(
+            "ALTER TABLE meeting_wake_requests "
+            "ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
 
 
 # --- roles ------------------------------------------------------------------
@@ -385,6 +395,9 @@ def _meeting(conn: sqlite3.Connection, thread_id: str) -> sqlite3.Row:
         raise ValueError(f"unknown meeting: {thread_id}") from None
     row = conn.execute(
         """SELECT m.*, t.status AS thread_status, t.phase AS review_phase,
+                  t.stop_reason AS thread_stop_reason,
+                  t.stopped_by AS thread_stopped_by,
+                  t.expires_at AS thread_expires_at,
                   t.max_messages, t.message_count,
                   (t.max_messages-t.message_count) AS messages_remaining
            FROM meetings m JOIN mailbox_threads t ON t.id=m.thread_id
@@ -394,6 +407,67 @@ def _meeting(conn: sqlite3.Connection, thread_id: str) -> sqlite3.Row:
     if not row:
         raise ValueError(f"unknown meeting: {thread_id}")
     return row
+
+
+def _meeting_projection(row: sqlite3.Row | dict) -> dict:
+    """Add the operational state without rewriting the protocol state.
+
+    ``meetings.state`` says where the meeting protocol should continue when its
+    mailbox is available. ``mailbox_threads.status`` says whether anybody can
+    actually speak right now. Idle retirement intentionally changes only the
+    latter, so the two may legitimately read ``active`` / ``paused``.
+
+    Keep the raw ``state`` for existing consumers and expose the thread-led
+    ``effective_state`` for operator surfaces. A lifecycle stop remains
+    authoritative if a damaged/legacy row has an open thread, while a retired
+    thread overrides any otherwise-live lifecycle state.
+    """
+    out = dict(row)
+    lifecycle = out["state"]
+    thread = out.get("thread_status") or "open"
+    stopped = {"paused", "escalated", "closed"}
+    if lifecycle in stopped:
+        effective = lifecycle
+    elif thread in stopped:
+        effective = thread
+    else:
+        effective = lifecycle
+    expected_thread = lifecycle if lifecycle in stopped else "open"
+    out["effective_state"] = effective
+    out["state_in_sync"] = thread == expected_thread
+    return out
+
+
+def _rearm_agent_wakes(conn: sqlite3.Connection, thread_id: str, *,
+                       now: str | None = None) -> list[str]:
+    """Queue a fresh wake for every enabled, non-departed agent attendee.
+
+    A supervisor resume is an explicit request to put the room back in front
+    of its participants. Merely opening the mailbox is insufficient when the
+    previous invitation was already acknowledged and no reply obligation is
+    outstanding: the agents remain idle forever. This ledger is owned by the
+    meetings layer, so re-arming it here preserves the mailbox -> meetings ->
+    orchestration dependency direction; the orchestrator will pull the demand.
+    """
+    known = sorted(_known_roles(conn))
+    role_in, role_params = _in_clause("role", known)
+    roles = [r["role"] for r in conn.execute(
+        f"""SELECT role FROM meeting_attendees
+            WHERE thread_id=? AND stopped_at IS NULL AND {role_in}
+            ORDER BY role""",
+        (thread_id, *role_params),
+    ).fetchall()]
+    created_at = now or _iso()
+    conn.executemany(
+        """INSERT INTO meeting_wake_requests(thread_id,role,status,created_at)
+           VALUES (?,?,'pending',?)
+           ON CONFLICT(thread_id,role) DO UPDATE
+           SET status='pending',created_at=excluded.created_at,
+               acknowledged_at=NULL,
+               generation=meeting_wake_requests.generation+1""",
+        [(thread_id, role, created_at) for role in roles],
+    )
+    return roles
 
 
 def _attendee(conn: sqlite3.Connection, thread_id: str, role: str, *,

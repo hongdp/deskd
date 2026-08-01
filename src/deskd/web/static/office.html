@@ -128,10 +128,9 @@ function tableHtml(room) {
 function roomNotes(room) {
   var out = "";
   if (room.threadRetired)
-    // The status is a fact; WHY it was retired (idle deadline? spent budget?
-    // stopped by hand?) is not in this payload, and naming a cause we cannot
-    // see is how a map starts lying.
     out += '<div class="rm-note bad">Thread ' + esc(S.human(room.threadStatus))
+      + (room.threadStopReason ? " · " + esc(room.threadStopReason) : "")
+      + (room.stateMismatch ? " · lifecycle " + esc(S.human(room.lifecycleState)) : "")
       + " — nobody can speak in this room until it is resumed.</div>";
   if (room.neverArrived) {
     var waiting = room.invited.map(function (p) { return p.name; });
@@ -165,6 +164,9 @@ function roomNotes(room) {
 
 function roomHtml(room) {
   var badges = '<span class="badge ' + S.stateClass(room.state) + '">' + esc(S.human(room.state)) + "</span>"
+    + (room.stateMismatch
+       ? '<span class="badge bad">lifecycle ' + esc(S.human(room.lifecycleState)) + "</span>"
+       : "")
     + (room.priority === "urgent" ? '<span class="badge bad">urgent</span>' : "")
     + (S.human(room.mode) === S.human(room.state) ? ""
        : '<span class="badge" title="' + esc(MODE_HELP[room.mode] || "discussion mode")
