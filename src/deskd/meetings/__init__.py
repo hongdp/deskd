@@ -67,7 +67,9 @@ from .obligations import (  # noqa: F401
     _discharge_obligations, _resolve_obligations, _waive_pending_obligations,
 )
 from .escalations import (  # noqa: F401
-    _queue_escalation, dispatch_escalation, list_escalations,
+    _queue_escalation, _resolve_engine_escalations, _resolve_escalation,
+    dispatch_escalation,
+    list_escalations, resolve_escalation,
 )
 from .sweep import (  # noqa: F401
     _sweep_timeouts, acknowledge_wake, sweep_timeouts, wake_requests,

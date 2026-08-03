@@ -213,7 +213,8 @@ def test_wake_projection_mirrors_the_configured_ladder(client, desk):
 
 def test_escalations_projection_shape_empty(client):
     d = client.get("/api/escalations").json()
-    assert set(d) == {"wake", "meetings", "unroutable", "channels", "human_reachable"}
+    assert set(d) == {"wake", "needs_you", "meetings", "unroutable", "channels",
+                      "human_reachable"}
     assert d["wake"] == [] and d["meetings"] == [] and d["unroutable"] == []
     assert d["human_reachable"] is False
     # The outbox is always listed: with nothing registered it IS the delivery.
@@ -772,3 +773,39 @@ def test_the_console_pages_and_assets_must_be_revalidated_not_reused(client):
                        headers={"If-None-Match": first.headers["etag"]})
     assert again.status_code == 304
     assert not again.content
+
+
+def test_the_supervisor_can_record_that_a_question_was_answered(client, monkeypatch):
+    """The verb the console's "Mark answered" button calls.
+
+    Authenticated like every other supervisor action, and for the same reason:
+    "this has been dealt with" is precisely the claim that must not be
+    forgeable by the party who raised it."""
+    from deskd import auth, meetings
+    from deskd.config import SUPERVISOR_CODE_HEADER
+    monkeypatch.setattr(auth, "simple_auth_enabled", lambda: True)
+    monkeypatch.setattr(auth, "verify_access_code", lambda code: code == "open-sesame")
+
+    status = meetings.call_meeting(agenda="needs a ruling", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    meetings.escalate_meeting(thread_id, role="alpha", reason="approve this?",
+                              pause=False)
+    esc_id = meetings.list_escalations(thread_id)[0]["id"]
+
+    assert len(client.get("/api/escalations").json()["needs_you"]) == 1
+
+    body = {"payload": {"action": "resolve_escalation", "meeting_id": thread_id,
+                        "escalation_id": esc_id, "note": "approved, see a1b2c3d"}}
+    denied = client.post("/api/meetings/supervisor-action", json=body,
+                         headers={SUPERVISOR_CODE_HEADER: "guess"})
+    assert denied.status_code == 401, "an unauthenticated caller cannot close a question"
+
+    ok = client.post("/api/meetings/supervisor-action", json=body,
+                     headers={SUPERVISOR_CODE_HEADER: "open-sesame"})
+    assert ok.status_code == 200
+    assert ok.json()["escalation"]["resolution"] == "approved, see a1b2c3d"
+
+    after = client.get("/api/escalations").json()
+    assert after["needs_you"] == [], "answered questions leave the waiting list"
+    assert len(after["meetings"]) == 1, "and stay in the ledger"

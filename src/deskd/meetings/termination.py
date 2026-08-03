@@ -11,7 +11,8 @@ from pathlib import Path
 from ..channels import OUTBOX_CHANNEL, registered_channels
 from ..config import CONFIG
 from . import store
-from .escalations import _queue_escalation, dispatch_escalation
+from .escalations import (_queue_escalation, _resolve_engine_escalations,
+                          dispatch_escalation)
 from .obligations import _waive_pending_obligations
 from .store import (_active_roles, _agent_role, _attendee, _clean, _event,
                     _has_supervisor, _known_roles, _meeting, _supervisor_claim,
@@ -140,6 +141,12 @@ def _close_meeting(conn: sqlite3.Connection, thread_id: str, resolution: str,
                    actor: str,
                    auth_nonce: str | None = None) -> None:
     now = store._iso()
+    # The engine's own notes about this conversation die with it — an
+    # attendance timeout for a meeting that has ended cannot need anything
+    # from anyone. Agent questions survive on purpose: they were addressed to
+    # a person, not to the meeting, and the meeting ending does not answer
+    # them.
+    _resolve_engine_escalations(conn, thread_id, "meeting closed")
     # A force-close can overtake an in-flight termination handshake. Leaving
     # that proposal pending makes a later supervisor reopen inherit a vote that
     # belonged to the already-ended conversation, and the unique pending index
@@ -293,7 +300,7 @@ def _vote_end(conn: sqlite3.Connection, thread_id: str, role: str, vote: str,
             _queue_escalation(
                 conn, thread_id, "system",
                 f"termination proposal #{proposal['id']} rejected near message limit",
-                "auto",
+                "auto", origin="engine",
             )
         # A rejection is a demand on the proposer — the vote above settled the
         # REJECTER's debt, and this mints the proposer's. Without it the reason

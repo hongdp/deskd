@@ -154,7 +154,15 @@ CREATE TABLE IF NOT EXISTS meeting_escalations (
     status                TEXT NOT NULL,
     details               TEXT,
     created_at            TEXT NOT NULL,
-    sent_at               TEXT
+    sent_at               TEXT,
+    -- `status` is DELIVERY (did the channel take it). These are DISPOSITION
+    -- (did a human deal with it). Two axes, deliberately not merged: a page
+    -- that sent successfully and a question nobody answered are different
+    -- states, and the queue had only the first for its whole life.
+    origin                TEXT NOT NULL DEFAULT 'agent',
+    resolved_at           TEXT,
+    resolved_by           TEXT,
+    resolution            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS meeting_wake_requests (
@@ -251,6 +259,51 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE meeting_wake_requests "
             "ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+    escalation_columns = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(meeting_escalations)")}
+    if "origin" not in escalation_columns:
+        # The queue was write-only: rows were created and delivered, never
+        # closed. Everything ever raised still read as outstanding, so the
+        # handful that genuinely needed a human sat in a list of dozens that
+        # did not. Two columns fix two different confusions — what KIND of
+        # thing this is, and whether it is DONE.
+        conn.execute("ALTER TABLE meeting_escalations "
+                     "ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'")
+        for column in ("resolved_at", "resolved_by", "resolution"):
+            conn.execute(
+                f"ALTER TABLE meeting_escalations ADD COLUMN {column} TEXT")
+        # Backfill by reason, because the historical rows carry no other
+        # signal: `requested_by` names whoever CALLED the meeting, not who
+        # asked for the human, so an auto-escalation on an urgent meeting is
+        # filed under the caller — including the supervisor themselves.
+        # Taken from the wordings actually present in a two-week-old desk,
+        # not from the current call sites: two of these phrasings predate a
+        # rename ("five-minute X" became "X after 300s"), and matching only
+        # today's text left the older rows filed as questions nobody had
+        # answered. Match on the stable middle of each sentence.
+        for phrase in ("attendance timeout",
+                       "urgent meeting requires off-hours wake",
+                       "meeting entered consensus mode with the supervisor absent",
+                       "rejected near message limit",
+                       "stale attendee:",
+                       "one-to-one response timeout"):
+            conn.execute(
+                "UPDATE meeting_escalations SET origin='engine' "
+                "WHERE reason LIKE ?", (f"%{phrase}%",))
+        # Engine notes about a conversation that has ended cannot need anything
+        # from anyone. Agent questions are NOT swept: one outlived its meeting
+        # by four days and was still the live question when it was answered.
+        conn.execute(
+            """UPDATE meeting_escalations
+                  SET resolved_at=COALESCE(
+                          (SELECT closed_at FROM meetings m
+                            WHERE m.thread_id=meeting_escalations.thread_id),
+                          created_at),
+                      resolved_by='migration',
+                      resolution='engine note about a meeting that has closed'
+                WHERE origin='engine' AND resolved_at IS NULL
+                  AND thread_id IN (SELECT thread_id FROM meetings
+                                     WHERE state='closed')""")
 
 
 # --- roles ------------------------------------------------------------------

@@ -345,6 +345,7 @@ def _send_update(conn: sqlite3.Connection, thread_id: str, role: str, body: str,
             escalation_id = _queue_escalation(
                 conn, thread_id, "system",
                 "meeting entered consensus mode with the supervisor absent", "auto",
+                origin="engine",
             )
             conn.execute(
                 "UPDATE meetings SET auto_escalated_at=? WHERE thread_id=?",

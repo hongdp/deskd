@@ -57,7 +57,7 @@ def _sweep_timeouts(db_path: Path | str | None = None) -> list[int]:
                 conn, meeting["thread_id"], "system",
                 f"attendance timeout after {meeting['wait_timeout_seconds']}s; "
                 f"missing: {', '.join(missing) or 'active counterpart'}",
-                "auto",
+                "auto", origin="engine",
             ))
             conn.execute(
                 "UPDATE meetings SET waiting_escalated_at=? WHERE thread_id=?",

@@ -1892,3 +1892,30 @@ def test_an_ordinary_meeting_wake_still_settles_on_the_ack(desk):
     with orch.connect() as c:
         assert [d for d in orch.collect_wake_demand(c)
                 if d["reason_kind"] == "meeting_wake" and d["role"] == "beta"] == []
+
+
+def test_the_board_counts_questions_not_conversations(desk):
+    """The escalation gauge asks "does a person owe an answer", so a closed
+    meeting must not clear an unanswered question.
+
+    Counting every row pinned the gauge above zero forever (35 of one desk's
+    39 were engine notes). Narrowing it to open threads was the first fix and
+    it failed in the more dangerous direction: an agent's question outlives
+    its meeting — one sat unanswered for four days after its thread closed,
+    invisible to this gauge the whole time. Lives in test_wake because the
+    meetings layer may not import orchestration."""
+    status = meetings.call_meeting(agenda="gauge", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    meetings.escalate_meeting(thread_id, role="alpha", reason="please rule",
+                              pause=False)
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+    meetings.confirm_end(thread_id, role="beta")
+
+    assert orch.board()["health"]["unsent_escalations"] == 1, (
+        "a closed meeting does not answer the question raised inside it")
+    meetings.resolve_escalation(
+        meetings.list_escalations(thread_id)[0]["id"],
+        by="supervisor", note="ruled")
+    assert orch.board()["health"]["unsent_escalations"] == 0

@@ -240,6 +240,13 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
         capped = min(limit, 1000)
         return {
             "wake": orchestration.wake_escalations_recent(capped),
+            # Split, because these were never one kind of thing: `needs_you`
+            # is an agent waiting on an answer, `meetings` is the whole
+            # ledger including the engine's own notes about odd hours and
+            # missed check-ins. Fourteen of the former hid inside fifty-eight
+            # of the latter until they were told apart.
+            "needs_you": meetings.list_escalations(origin="agent",
+                                                   unresolved_only=True)[:capped],
             "meetings": meetings.list_escalations()[:capped],
             "unroutable": orchestration.unroutable_list(include_routed=True,
                                                         limit=capped),

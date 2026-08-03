@@ -18,6 +18,7 @@ from .. import auth, mailbox
 from ..config import CONFIG
 from . import store
 from .lifecycle import _call_meeting, _check_in, _leave
+from .escalations import _resolve_escalation
 from .messaging import _meeting_updates, _send_update
 from .obligations import _waive_pending_obligations
 from .store import (DEFAULT_CONSENSUS_THRESHOLD, DEFAULT_IDLE_MINUTES,
@@ -48,6 +49,7 @@ REQUIRED_SIGNED_FIELDS: dict[str, tuple[str, ...]] = {
     "reject_end": ("meeting_id",),
     "resume": ("meeting_id",),
     "force_close": ("meeting_id", "reason"),
+    "resolve_escalation": ("meeting_id", "escalation_id", "note"),
 }
 
 #: Meeting actions a verified supervisor assertion may carry. Derived from the
@@ -339,6 +341,14 @@ def _apply_supervisor_payload(verified: auth.VerifiedAssertion, *,
             _close_meeting(conn, thread_id, _clean(payload["reason"], "reason"),
                            supervisor, nonce)
             result = {"closed": True}
+        elif action == "resolve_escalation":
+            # Signed like every other supervisor verb, because "this question
+            # has been answered" is exactly the kind of claim that must not be
+            # forgeable by the party who asked it.
+            resolved = _resolve_escalation(
+                conn, int(payload["escalation_id"]), by=supervisor,
+                note=_clean(payload["note"], "note"))
+            result = {"escalation": resolved}
         else:
             raise ValueError(f"unimplemented supervisor action: {action}")
     result["meeting"] = meeting_status(thread_id, db_path=db_path)
