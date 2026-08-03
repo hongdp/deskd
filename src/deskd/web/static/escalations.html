@@ -18,7 +18,11 @@
     <div id="wake-led"><div class="loading">Loading…</div></div>
   </div>
   <div class="card">
-    <div class="card-head"><h3>Meeting escalations</h3><a class="quiet" href="/meetings">meeting console →</a></div>
+    <div class="card-head"><h3>Waiting on you</h3><span class="quiet">an agent asked a question and is holding for the answer</span></div>
+    <div id="asks"></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Meeting escalation ledger</h3><span class="quiet">every row ever raised, engine notes included — history, not a queue</span><a class="quiet" href="/meetings">meeting console →</a></div>
     <div id="mtg-led"></div>
   </div>
   <div class="card">
@@ -69,16 +73,75 @@ function wakeLedger(rows) {
     }).join("") + "</tbody></table></div>");
 }
 
+// Two cards because these were never one kind of thing. An agent's question
+// waits on a person; the engine's note that it woke someone at 3am is a fact
+// about the past. Fourteen of the first hid inside fifty-eight of the second
+// until the ledger learned to tell them apart.
+function asks(rows) {
+  if (!rows.length) {
+    S.setHTML(S.$("#asks"), S.empty("Nothing is waiting on you — every question an agent raised has an answer on the record."));
+    return;
+  }
+  S.setHTML(S.$("#asks"),
+    '<div class="tblwrap"><table><thead><tr><th>Asked</th><th>By</th><th>Meeting</th><th>What they need</th><th></th></tr></thead><tbody>'
+    + rows.map(function (e) {
+      return '<tr class="ask"><td>' + rel(e.created_at) + "</td><td><b>" + esc(e.requested_by) + "</b></td>"
+        + '<td class="quiet">' + esc(e.thread_id) + "</td>"
+        + '<td class="askbody">' + esc(e.reason) + "</td>"
+        + '<td><button class="btn" data-esc="' + e.id + '" data-mtg="' + esc(e.thread_id) + '">Mark answered…</button></td></tr>';
+    }).join("") + "</tbody></table></div>");
+  Array.prototype.forEach.call(document.querySelectorAll("#asks button[data-esc]"), function (b) {
+    b.addEventListener("click", function () { resolveAsk(b.dataset.esc, b.dataset.mtg); });
+  });
+}
+
+// Resolving is a supervisor verb, authenticated like every other one: "this
+// has been answered" is exactly the claim that must not be forgeable by the
+// party who asked. The header NAME comes from /api/meeting-meta and the code
+// is typed per action and stored nowhere — a literal default here would be
+// the credential, published to every reader of this page's source.
+async function resolveAsk(id, meetingId) {
+  var note = window.prompt("How was it answered? (recorded on the row, permanently)");
+  if (note === null || !note.trim()) { return; }
+  var headers = {"Content-Type": "application/json"};
+  try {
+    var meta = await S.meta();
+    if (meta.access_code_required) {
+      if (!meta.code_header) { throw new Error("access-code header name not loaded — refresh the page"); }
+      var code = window.prompt("Supervisor access code");
+      if (code === null || !code.trim()) { return; }
+      headers[meta.code_header] = code.trim();
+    }
+    await S.api("/api/meetings/supervisor-action", {
+      method: "POST", headers: headers,
+      body: JSON.stringify({payload: {
+        action: "resolve_escalation", meeting_id: meetingId,
+        escalation_id: Number(id), note: note.trim(),
+      }}),
+    });
+    load();
+  } catch (err) {
+    window.alert("Not recorded: " + (err && err.message ? err.message : err));
+  }
+}
+
 function meetingLedger(rows) {
   if (!rows.length) {
     S.setHTML(S.$("#mtg-led"), S.empty("No meeting escalations — attendance and reply SLAs have held."));
     return;
   }
   S.setHTML(S.$("#mtg-led"),
-    '<div class="tblwrap"><table><thead><tr><th>Status</th><th>Meeting</th><th>Requested by</th><th>Reason</th><th>Channel</th><th>Created</th></tr></thead><tbody>'
+    '<div class="tblwrap"><table><thead><tr><th>Kind</th><th>Disposition</th><th>Meeting</th><th>Requested by</th><th>Reason</th><th>Created</th></tr></thead><tbody>'
     + rows.map(function (e) {
-      return "<tr><td>" + S.stateBadge(e.status) + "</td><td>" + esc(e.thread_id) + "</td><td>" + esc(e.requested_by)
-        + "</td><td>" + esc(e.reason) + "</td><td>" + esc(S.human(e.channel)) + "</td><td>" + rel(e.created_at) + "</td></tr>";
+      var kind = e.origin === "engine"
+        ? '<span class="badge quiet" title="the engine noting it had to do something unusual — not addressed to anyone">engine note</span>'
+        : '<span class="badge">agent asked</span>';
+      var done = e.resolved_at
+        ? '<span class="badge ok" title="' + esc(e.resolution || "") + " · " + esc(e.resolved_by || "") + '">answered ' + rel(e.resolved_at) + "</span>"
+        : (e.origin === "engine" ? '<span class="quiet">—</span>'
+                                 : '<span class="badge bad">waiting</span>');
+      return '<tr class="' + (e.resolved_at ? "done" : "") + '"><td>' + kind + "</td><td>" + done + "</td><td>" + esc(e.thread_id)
+        + "</td><td>" + esc(e.requested_by) + "</td><td>" + esc(e.reason) + "</td><td>" + rel(e.created_at) + "</td></tr>";
     }).join("") + "</tbody></table></div>");
 }
 
@@ -112,6 +175,7 @@ async function load() {
   var d = await S.api("/api/escalations");
   chanStrip(d);
   wakeLedger(d.wake || []);
+  asks(d.needs_you || []);
   meetingLedger(d.meetings || []);
   unroutable(d.unroutable || []);
   channels(d);

@@ -2240,3 +2240,65 @@ def test_a_rejection_restarts_the_proposers_ladder(desk):
             (thread_id,)).fetchone()
     assert row["status"] == "pending"
     assert row["generation"] == 2, "the re-arm must be a NEW generation, not a reuse"
+
+
+def test_an_escalation_can_finally_be_answered(desk):
+    """The queue was write-only: rows were created and delivered, never closed.
+
+    A supervisor who acted on one — completed the broker form, ruled on the
+    proposal — left it looking exactly as it had before they helped, so the
+    next reader could not tell the answered from the unanswered. On one live
+    desk that produced fifty outstanding escalations, every one of them about
+    a meeting that had already closed."""
+    thread_id = _start("needs a human", ["alpha", "beta"])
+    meetings.escalate_meeting(thread_id, role="alpha",
+                              reason="approve the config change?")
+    open_asks = meetings.list_escalations(origin="agent", unresolved_only=True)
+    assert len(open_asks) == 1
+    esc = open_asks[0]
+
+    done = meetings.resolve_escalation(esc["id"], by="supervisor",
+                                       note="approved, landed in a1b2c3d")
+    assert done["resolved_by"] == "supervisor"
+    assert done["resolution"] == "approved, landed in a1b2c3d"
+    assert meetings.list_escalations(origin="agent", unresolved_only=True) == []
+    # The row itself survives — this is a ledger, not a to-do list.
+    assert len(meetings.list_escalations(thread_id)) == 1
+
+
+def test_resolving_twice_keeps_the_first_answer(desk):
+    """Idempotent, and specifically NOT last-write-wins: the first disposition
+    is the true one, and a second click should not rewrite who answered."""
+    thread_id = _start("double click", ["alpha", "beta"])
+    meetings.escalate_meeting(thread_id, role="alpha", reason="ruling please")
+    esc_id = meetings.list_escalations(thread_id)[0]["id"]
+    first = meetings.resolve_escalation(esc_id, by="supervisor", note="yes")
+    second = meetings.resolve_escalation(esc_id, by="someone-else", note="no")
+    assert second["resolved_by"] == "supervisor" == first["resolved_by"]
+    assert second["resolution"] == "yes"
+
+
+def test_closing_a_meeting_retires_the_engines_notes_but_not_the_questions(desk):
+    """The asymmetry is the whole point.
+
+    An attendance timeout is about a conversation; when the conversation ends
+    there is nothing left for anyone to do about it. A question was addressed
+    to a person, and the meeting ending does not answer it — one outlived its
+    thread by four days and was still the live question on the day it was
+    finally ruled on."""
+    thread_id = _start("mixed bag", ["alpha", "beta"])
+    with meetings.store.connect(write=True) as conn:
+        meetings._queue_escalation(conn, thread_id, "system",
+                                   "attendance timeout after 300s",
+                                   "auto", origin="engine")
+    meetings.escalate_meeting(thread_id, role="alpha", reason="rule on this",
+                              pause=False)
+
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+    meetings.confirm_end(thread_id, role="beta")
+
+    rows = {r["origin"]: r for r in meetings.list_escalations(thread_id)}
+    assert rows["engine"]["resolved_at"] is not None
+    assert rows["engine"]["resolved_by"] == "engine"
+    assert rows["agent"]["resolved_at"] is None, (
+        "a question survives the meeting it was raised in")

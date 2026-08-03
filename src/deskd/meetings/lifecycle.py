@@ -148,6 +148,7 @@ def _call_meeting(*, agenda: str, called_by: str, attendees: list[str],
                 escalation_id = _queue_escalation(
                     conn, thread["id"], called_by,
                     "urgent meeting requires off-hours wake", "auto",
+                    origin="engine",
                 )
             missing = conn.execute(
                 """SELECT COUNT(*) AS n FROM meeting_attendees

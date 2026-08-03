@@ -105,15 +105,21 @@ def _delivery_health(conn: sqlite3.Connection, now_iso: str) -> dict:
         elif st == "escalated":
             escalated += 1
     # Same rule as the rows above, for the same reason: a closed thread's failed
-    # escalation is history, not a call to action. Nobody can rejoin the
-    # conversation to answer it, so counting it pins this gauge above zero
-    # forever — 35 of one desk's 39 were exactly that, which is how the number
-    # became scenery and the 4 that were about a live, unanswered meeting hid
-    # inside it. The rows stay; only the alarm narrows.
+    # escalation is history, not a call to action. Counting every row pinned
+    # this gauge above zero forever — 35 of one desk's 39 were exactly that,
+    # which is how the number became scenery and the few about a live question
+    # hid inside it.
+    #
+    # Open-thread was the first cut at narrowing it, and it was wrong in the
+    # more dangerous direction: an agent's QUESTION outlives its meeting. One
+    # sat unanswered for four days after its thread closed, invisible to this
+    # gauge the whole time. The escalation ledger now records what a row IS
+    # (`origin`) and whether anyone dealt with it (`resolved_at`), so the
+    # honest predicate is available and needs no proxy: a person owes an
+    # answer to an agent's unresolved question, and to nothing else.
     unsent = conn.execute(
-        """SELECT COUNT(*) FROM meeting_escalations e
-           JOIN mailbox_threads t ON t.id=e.thread_id
-           WHERE e.status!='sent' AND t.status != 'closed'""").fetchone()[0]
+        """SELECT COUNT(*) FROM meeting_escalations
+            WHERE origin='agent' AND resolved_at IS NULL""").fetchone()[0]
     age = None
     if oldest_unread:
         age = int((store._now() - dt.datetime.fromisoformat(oldest_unread)).total_seconds())
