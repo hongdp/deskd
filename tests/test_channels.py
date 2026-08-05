@@ -174,6 +174,22 @@ def test_human_rung_arrival_dispatches_for_a_non_meeting_reason(desk,
         assert scalar(conn, "SELECT status FROM wake_escalations") == "sent"
 
 
+def test_the_page_names_its_durable_ref(desk, recording_channel):
+    """The page's `reason` is a human label; `source_ref` is the only pointer
+    that outlives the demand. A demand that self-heals after the page leaves
+    nothing on the default board view (closed meetings are hidden), so a page
+    without the ref dead-ends at "check the board" for exactly the pages that
+    resolved themselves — measured live 2026-08-04, a 39-minute gap between
+    page and close."""
+    o.inbox_enqueue("alpha", "alert", "act now", priority="urgent")
+    _age_attempt("alpha", "inbox", "inbox:alpha", 2)
+
+    o.plan_wakes(record=True)
+
+    (_, text), = recording_channel
+    assert "Ref: inbox:alpha" in text
+
+
 def test_outbox_only_is_durable_and_counted_red(desk):
     """No channel registered: the row still exists (queued — the ledger IS the
     delivery of last resort) and the board says so out loud."""
