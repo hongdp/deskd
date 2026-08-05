@@ -821,6 +821,75 @@ def test_a_stopped_meetings_owed_reply_stops_waking_anyone(desk):
     )
 
 
+# --- an unpaid vote demand must say what it wants ----------------------------
+
+def _vote_owed_setup() -> str:
+    """A meeting alpha proposed to end; beta owes the vote that closes it."""
+    status = meetings.call_meeting(agenda="wrap up", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+    meetings.check_in(thread_id, role="beta")
+    meetings.propose_end(thread_id, role="alpha", resolution="done")
+    return thread_id
+
+
+def test_a_wake_request_for_an_unpaid_vote_says_so(desk):
+    """propose_end arms a wake request for every missing voter, so the
+    wake-request branch — not the vote branch, which seen_meeting dedups away —
+    carries the common case, and its label used to be the agenda alone. The
+    label is all the wake prompt and the human-rung page ever see: measured
+    live 2026-08-04, the voter was resumed for exactly this demand, did
+    adjacent meeting work, idled without voting, and the ladder paged a human
+    eleven minutes later."""
+    thread_id = _vote_owed_setup()
+
+    with orch.connect() as c:
+        demand = [d for d in orch.collect_wake_demand(c)
+                  if d["reason_kind"] == "meeting_wake" and d["role"] == "beta"]
+    assert len(demand) == 1 and demand[0]["source_ref"] == thread_id
+    assert "your vote closes it" in demand[0]["label"]
+    assert demand[0]["generation"].startswith("request:"), (
+        "the demand must still ride the wake request's generation — labeling "
+        "it is not a licence to fork a second demand for the same debt")
+
+
+def test_an_ordinary_meeting_wake_is_not_labelled_a_vote(desk):
+    """The label tracks the vote LEDGER, not the meeting: before anyone
+    proposes an end nobody owes a vote, and a label that cried vote anyway
+    would teach agents to ignore the one that means it."""
+    status = meetings.call_meeting(agenda="just talk", called_by="alpha",
+                                   attendees=["alpha", "beta"])
+    thread_id = status["meeting"]["thread_id"]
+
+    with orch.connect() as c:
+        demand = [d for d in orch.collect_wake_demand(c)
+                  if d["reason_kind"] == "meeting_wake" and d["role"] == "beta"]
+    assert len(demand) == 1 and demand[0]["source_ref"] == thread_id
+    assert "your vote closes it" not in demand[0]["label"]
+
+
+def test_wake_sources_lists_the_votes_a_role_owes(desk):
+    """'Sources first' is the woken agent's opening ritual, so the vote has to
+    be IN sources — and not only while the wake request is pending: an
+    acknowledged wake with an unpaid vote (the 2026-07-27 parked state) is
+    exactly when the agent most needs telling the debt still stands, because
+    every other section of the answer has gone quiet."""
+    thread_id = _vote_owed_setup()
+
+    owed = orch.wake_sources("beta")["votes_owed"]
+    assert [v["thread_id"] for v in owed] == [thread_id]
+    assert orch.wake_sources("alpha")["votes_owed"] == [], (
+        "the proposer implicitly confirmed; it owes nothing")
+
+    meetings.acknowledge_wake(thread_id, role="beta")
+    owed = orch.wake_sources("beta")["votes_owed"]
+    assert [v["thread_id"] for v in owed] == [thread_id], (
+        "the ack signed for the notification; the vote is still owed")
+
+    meetings.confirm_end(thread_id, role="beta")
+    assert orch.wake_sources("beta")["votes_owed"] == []
+
+
 # --- 11. an idle agent is woken for its own queue ----------------------------
 
 def _idle_attempts() -> list[dict]:
