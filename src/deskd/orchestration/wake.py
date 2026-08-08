@@ -29,6 +29,26 @@ from .tasks import _URGENT_TASK_WHERE, _queued_tasks, \
 WAKE_REASONS = {"meeting_wake", "stuck_delivery", "urgent_task", "owed_reply",
                 "inbox", "idle_task"}
 
+#: Who currently owes a termination vote — one row per (voter, meeting). ONE
+#: definition on purpose: collect_wake_demand raises and labels demand from it,
+#: wake_sources answers "what does the engine want from me" from it, and
+#: _demand_resolved mirrors its predicate. The trailing `{extra}` slot exists
+#: so wake_sources can scope it to one role without a second copy of the WHERE
+#: clause drifting from this one.
+_OWED_VOTE_SQL = """\
+    SELECT a.role, t.id AS proposal_id, t.thread_id, m.agenda,
+           t.created_at, w.generation AS wake_generation
+      FROM meeting_terminations t
+      JOIN meetings m ON m.thread_id=t.thread_id
+      JOIN meeting_attendees a ON a.thread_id=t.thread_id
+      LEFT JOIN meeting_wake_requests w
+        ON w.thread_id=t.thread_id AND w.role=a.role
+     WHERE t.status='pending' AND m.state='termination_pending'
+       AND a.required=1 AND a.checked_in_at IS NOT NULL
+       AND a.stopped_at IS NULL
+       AND NOT EXISTS (SELECT 1 FROM meeting_termination_votes v
+                        WHERE v.proposal_id=t.id AND v.role=a.role){extra}"""
+
 
 def _ladder() -> tuple[WakeRung, ...]:
     """The escalation ladder in effect (CONFIG.wake_ladder)."""
@@ -146,46 +166,49 @@ def collect_wake_demand(conn: sqlite3.Connection) -> list[dict]:
     now = store._now()
     now_iso = _iso(now)
     demands = []
+    # The unpaid-vote ledger, read ONCE and used twice below. An unpaid vote is
+    # demand even when the notification was signed for. The request table
+    # records what was SENT; this asks what is OWED, and for a termination vote
+    # the ledger can tell the difference. Measured on a live desk 2026-07-27:
+    # proposal at 07:38:31, the voter acked within 30s while mid-turn on other
+    # work, never read the thread, and the demand vanished with the ack — four
+    # planner ticks passed with a meeting that could not close and nothing
+    # asking anyone to close it, until the sweep's timeout re-arm five minutes
+    # later. A safety net was doing a first-order job.
+    #
+    # Deliberately narrow: only the vote, because only the vote has a ledger
+    # row that says whether the work happened. Ordinary meeting wakes keep
+    # settling on the ack — an agent that acks has the thread in front of it,
+    # and a demand that no action can clear would climb forever.
+    vote_rows = conn.execute(_OWED_VOTE_SQL.format(extra="")).fetchall()
+    owed_votes = {(r["role"], r["thread_id"]) for r in vote_rows}
     # `m.state!='closed'`: _close_meeting settles pending wake requests, but
     # rows that predate that rule (or arrive through a future path it misses)
     # must not wake anyone — a closed meeting cannot even be checked in to, so
     # the demand would regenerate every tick with no legal way to satisfy it.
+    #
+    # A wake request whose meeting is really waiting on this role's VOTE must
+    # say so: propose_end arms a request for every missing voter, so this
+    # branch — not the vote branch below, which seen_meeting dedups away —
+    # carries the common case, and an agenda-only label hides the one action
+    # that settles the demand. Measured live 2026-08-04: the analyst was
+    # resumed for exactly this, did adjacent meeting work, idled without
+    # voting, and the ladder paged a human eleven minutes later. The label is
+    # all the wake prompt and the human-rung page ever see.
     seen_meeting: set = set()
     for r in conn.execute(
             """SELECT w.role, w.thread_id, w.generation, m.agenda, w.created_at
                FROM meeting_wake_requests w JOIN meetings m ON m.thread_id=w.thread_id
                WHERE w.status='pending' AND m.state!='closed'"""):
         seen_meeting.add((r["role"], r["thread_id"]))
+        label = r["agenda"]
+        if (r["role"], r["thread_id"]) in owed_votes:
+            label = f"{label} — your vote closes it"
         demands.append({"role": r["role"], "reason_kind": "meeting_wake",
-                        "source_ref": r["thread_id"], "label": r["agenda"],
+                        "source_ref": r["thread_id"], "label": label,
                         "since_at": r["created_at"],
                         "generation": f"request:{r['generation']}"})
-    # An unpaid vote is demand even when the notification was signed for. The
-    # request table records what was SENT; this asks what is OWED, and for a
-    # termination vote the ledger can tell the difference. Measured on a live
-    # desk 2026-07-27: proposal at 07:38:31, the voter acked within 30s while
-    # mid-turn on other work, never read the thread, and the demand vanished
-    # with the ack — four planner ticks passed with a meeting that could not
-    # close and nothing asking anyone to close it, until the sweep's timeout
-    # re-arm five minutes later. A safety net was doing a first-order job.
-    #
-    # Deliberately narrow: only the vote, because only the vote has a ledger
-    # row that says whether the work happened. Ordinary meeting wakes keep
-    # settling on the ack — an agent that acks has the thread in front of it,
-    # and a demand that no action can clear would climb forever.
-    for r in conn.execute(
-            """SELECT a.role, t.id AS proposal_id, t.thread_id, m.agenda,
-                      t.created_at, w.generation AS wake_generation
-                 FROM meeting_terminations t
-                 JOIN meetings m ON m.thread_id=t.thread_id
-                 JOIN meeting_attendees a ON a.thread_id=t.thread_id
-                 LEFT JOIN meeting_wake_requests w
-                   ON w.thread_id=t.thread_id AND w.role=a.role
-                WHERE t.status='pending' AND m.state='termination_pending'
-                  AND a.required=1 AND a.checked_in_at IS NOT NULL
-                  AND a.stopped_at IS NULL
-                  AND NOT EXISTS (SELECT 1 FROM meeting_termination_votes v
-                                   WHERE v.proposal_id=t.id AND v.role=a.role)"""):
+    for r in vote_rows:
         if (r["role"], r["thread_id"]) in seen_meeting:
             continue
         if r["role"] not in _known_roles(conn):
@@ -480,9 +503,16 @@ def _dispatch_wake_escalation(escalation_id: int,
     if row is None:
         return {"id": escalation_id, "status": "missing"}
     subject = f"{PROJECT_NAME} wake escalation: {row['role']}"
+    # `reason` is the human label; `source_ref` is the only DURABLE pointer.
+    # A demand that self-heals after the page leaves nothing on the default
+    # board view (closed meetings are hidden), so without the ref in the text
+    # "check the board" dead-ends for exactly the pages that resolved
+    # themselves — measured live 2026-08-04, a 39-minute gap between page and
+    # close. Both lines, always: the label says why, the ref says where.
     text = (f"{PROJECT_NAME} wake escalation\n"
             f"Role: {row['role']}\n"
             f"Reason: {row['reason_kind']} ({row['reason'] or row['source_ref']})\n"
+            f"Ref: {row['source_ref']}\n"
             f"The wake ladder climbed past the machine — check the board.")
     results = channels.deliver(subject, text, row["channel"])
     status = channels.summarize(results)
@@ -865,8 +895,9 @@ def wake_escalations_recent(limit: int = 100,
 def wake_sources(role: str, db_path: Path | str | None = None) -> dict:
     """One-shot answer to 'what can currently wake/remind me, and can I change
     it?' — the role's own registered hooks (self-managed via `hook add/cancel`),
-    pending meeting wakes, queued inbox notifications, urgent tasks, its open
-    queue, and any in-flight wake attempts.
+    pending meeting wakes, termination votes it owes, queued inbox
+    notifications, urgent tasks, its open queue, and any in-flight wake
+    attempts.
 
     The role's OWN QUEUE belongs in this answer and was missing from it, which is
     how an agent could ask this question, be told about hooks and meetings and
@@ -890,6 +921,16 @@ def wake_sources(role: str, db_path: Path | str | None = None) -> dict:
             "SELECT w.thread_id, m.agenda, w.created_at FROM meeting_wake_requests w "
             "JOIN meetings m ON m.thread_id=w.thread_id "
             "WHERE w.role=? AND w.status='pending'", (role,)).fetchall()]
+        # The votes this role owes RIGHT NOW — same ledger the demand collector
+        # reads, scoped to the asker. Listed separately from meeting_wakes
+        # because the two disagree in exactly the cases that page humans: a
+        # vote can be owed with the wake request already acknowledged (the
+        # 2026-07-27 parked vote), and a wake request can stand for a meeting
+        # whose real ask is the vote (the 2026-08-04 page). The wake prompt
+        # says "sources first"; this is where sources says "vote first" —
+        # confirm-end or reject-end both settle it, going idle settles nothing.
+        votes_owed = [dict(r) for r in conn.execute(
+            _OWED_VOTE_SQL.format(extra=" AND a.role=?"), (role,)).fetchall()]
         inbox = [dict(r) for r in conn.execute(
             "SELECT id, source_kind, priority, title, delivered_at, enqueued_at "
             "FROM agent_inbox WHERE target_role=? AND acked_at IS NULL", (role,)).fetchall()]
@@ -905,6 +946,11 @@ def wake_sources(role: str, db_path: Path | str | None = None) -> dict:
         "role": role, "as_of": now_iso,
         "self_hooks": hooks_,                # yours — hook add/cancel to change
         "meeting_wakes": meeting_wakes,      # a meeting needs you (wake-ack/check-in)
+        # Termination votes you owe. THE priority item: the meeting cannot
+        # close, the ladder is climbing towards a person, and only your
+        # confirm-end / reject-end settles it — rejecting IS a legal answer,
+        # going idle to "wait for the other side" is not.
+        "votes_owed": votes_owed,
         "inbox_queued": [i for i in inbox if not i["delivered_at"]],
         "inbox_delivered_unacked": [i for i in inbox if i["delivered_at"]],
         "urgent_tasks": urgent_tasks,        # wake you whatever you are doing
