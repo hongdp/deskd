@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import NoReturn
 
 from .config import CONFIG, PROJECT_NAME, __version__, env, load_host_config
@@ -200,6 +201,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="what can currently wake THIS role (hooks/meetings/inbox/tasks) "
              "+ how to change it")
     _add_role(wk_s, "--role")
+
+    # --- runtime / agent (the provider seam) --------------------------------
+    p_rt = sub.add_parser(
+        "runtime",
+        help="per-role provider/model/reasoning for the NEXT new session")
+    rt = p_rt.add_subparsers(dest="runtime_cmd", required=True)
+    rt.add_parser("show", help="resolved runtime tuning for every role")
+    for _key in ("provider", "model", "reasoning"):
+        _rp = rt.add_parser(
+            f"set-{_key}",
+            help=f"pin {_key} for ONE role; the literal value 'default' clears")
+        _rp.add_argument("value")
+        _add_role(_rp, "--role")
+
+    p_ag = sub.add_parser(
+        "agent",
+        help="launch one agent turn via the registered provider (driver arm)")
+    ag = p_ag.add_subparsers(dest="agent_cmd", required=True)
+    for _name, _hint in (("run", "execute the launch"),
+                         ("command", "print argv + env overrides; execute nothing")):
+        _ap = ag.add_parser(_name, help=_hint)
+        _add_role(_ap, "--role")
+        _ap.add_argument("--mode", choices=["spawn", "resume"], required=True)
+        _ap.add_argument("--session-id", required=True)
+        _prompt = _ap.add_mutually_exclusive_group(required=True)
+        _prompt.add_argument("--prompt")
+        _prompt.add_argument("--prompt-file",
+                             help="read the prompt from a file ('-' = stdin)")
+        _ap.add_argument("--allowed-tools-default", default=None,
+                         help="comma list applied when the role's registry "
+                              "declares no allowed_tools")
+        if _name == "run":
+            _ap.add_argument("--timeout", type=int, default=None)
+            _ap.add_argument("--harness", default="deskd-agent")
+    ag_sp = ag.add_parser("session-provider",
+                          help="which provider owns the recorded session")
+    _add_role(ag_sp, "--role")
+    ag_sp.add_argument("--session-id", required=True)
 
     # --- hook ---------------------------------------------------------------
     p_hk = sub.add_parser("hook",
@@ -601,7 +640,48 @@ def _cmd_serve(args: argparse.Namespace) -> None:
                 host=args.host, port=args.port, reload=args.reload)
 
 
+def _cmd_runtime(args: argparse.Namespace) -> None:
+    from .orchestration import runtime as rt
+    if args.runtime_cmd == "show":
+        _emit(rt.runtime_overview())
+        return
+    key = args.runtime_cmd.removeprefix("set-")
+    value = None if args.value.strip().lower() == "default" else args.value
+    _emit(rt.set_role_runtime(args.role, key, value, actor="operator_cli"))
+
+
+def _agent_prompt(args: argparse.Namespace) -> str:
+    if args.prompt is not None:
+        return args.prompt
+    if args.prompt_file == "-":
+        return sys.stdin.read()
+    return Path(args.prompt_file).read_text(encoding="utf-8")
+
+
+def _cmd_agent(args: argparse.Namespace) -> None:
+    from .orchestration import agent_run
+    if args.agent_cmd == "session-provider":
+        print(agent_run.session_provider(args.role, args.session_id))
+        return
+    prompt = _agent_prompt(args)
+    default_tools = (tuple(t for t in args.allowed_tools_default.split(",") if t)
+                     if args.allowed_tools_default else None)
+    if args.agent_cmd == "command":
+        command, env, provider = agent_run.build_launch(
+            args.role, args.mode, args.session_id, prompt,
+            default_allowed_tools=default_tools)
+        _emit({"provider": provider, "command": command, "env": env})
+        return
+    code = agent_run.run_agent(
+        args.role, args.mode, args.session_id, prompt,
+        harness_base=args.harness, timeout=args.timeout,
+        default_allowed_tools=default_tools)
+    raise SystemExit(code)
+
+
 _DISPATCH = {
+    "runtime": _cmd_runtime,
+    "agent": _cmd_agent,
     "status": _cmd_status,
     "task": _cmd_task,
     "inbox": _cmd_inbox,

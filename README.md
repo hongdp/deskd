@@ -99,6 +99,50 @@ deskd inbox enqueue --for operator --source alert --title "threshold crossed" --
 deskd wake sources --role operator            # what can wake me, and how to change it
 ```
 
+### Providers: which harness runs your agents
+
+deskd ships **Claude Code as the built-in default** — a fresh clone launches
+sessions with zero provider configuration. Any other CLI harness plugs in
+without forking:
+
+```python
+from deskd import configure
+from deskd.providers import CommandProvider
+
+configure(providers=(
+    # Any CLI as a provider: an argv template with placeholders. An element
+    # whose value is unset is dropped whole ("--model", "{model}" vanishes
+    # cleanly), and env values take the same placeholders.
+    CommandProvider(
+        name="mycli",
+        template=("mycli", "run", "--session", "{session_id}",
+                  "--model", "{model}", "{prompt}"),
+        resume_template=("mycli", "continue", "{session_id}", "{prompt}"),
+        env={"MYCLI_EFFORT": "{reasoning}"},
+    ),
+))
+```
+
+Subclass `deskd.providers.Provider` for full control (custom preflight,
+sandboxes); registering a provider named `claude` replaces the built-in.
+
+**Per-role model and thinking power are engine state**, stored on the
+registry row and applied at the role's next new session:
+
+```bash
+deskd runtime show
+deskd runtime set-provider mycli --role operator
+deskd runtime set-model claude-opus-5 --role researcher
+deskd runtime set-reasoning high --role researcher   # low|medium|high|max; 'default' clears
+```
+
+Each provider maps the shared tier vocabulary onto its own knob (the claude
+provider: a thinking-token budget in the child env). The reference driver
+launches through this seam via `deskd agent run`, which also enforces the
+two invariants every driver must keep: a session never resumes under a
+provider that did not create it, and a role with no declared tool grant
+gets the driver's fail-closed default rather than the harness's widest one.
+
 Wake the desk from cron (the driver is the **only** thing that spawns sessions):
 
 ```cron
