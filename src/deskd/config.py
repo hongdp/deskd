@@ -240,6 +240,15 @@ class EngineConfig:
     #: EMPTY keeps the standalone deskd console domain-neutral.
     console_links: tuple[ConsoleLink, ...] = ()
 
+    #: Host-registered agent providers (see deskd.providers). Merged over the
+    #: built-ins by NAME, host wins — replacing the default claude provider
+    #: (different binary path, different thinking budgets) is a registration,
+    #: not a fork. Appended after console_links for the same
+    #: positional-stability reason as it.
+    providers: tuple = ()
+    #: Provider a role launches with when its registry row pins none.
+    default_provider: str = "claude"
+
     def role_names(self) -> tuple[str, ...]:
         return tuple(r.name for r in self.roles)
 

@@ -149,18 +149,37 @@ for a in p.get("actions", []):
         # role flocks this same file, so at most one session per role ever runs.
         exec 8>"$(role_lock "$role")"
         flock -n 8 || { echo "[$(ts)] role=$role has an active session (lock held); skip $channel" >>"$LOG"; exit 0; }
-        if [ "$channel" = "resume" ] && [ -n "$session" ]; then
-          echo "[$(ts)] resume role=$role session=$session" >>"$LOG"
-          DESKD_ROLE="$role" timeout "$TIMEOUT" "$AGENT" -p "$prompt" \
-            --resume "$session" --allowedTools "$ROLE_ALLOWED" >>"$LOG" 2>&1 || true
+        if [ -n "${DESKD_AGENT_CMD:-}" ]; then
+          # LEGACY path (deprecated): a raw harness command via DESKD_AGENT_CMD.
+          # Prefer the provider seam below — register a CommandProvider instead;
+          # it gets per-role model/reasoning and the cross-provider resume guard.
+          if [ "$channel" = "resume" ] && [ -n "$session" ]; then
+            echo "[$(ts)] resume(legacy) role=$role session=$session" >>"$LOG"
+            DESKD_ROLE="$role" timeout "$TIMEOUT" "$AGENT" -p "$prompt" \
+              --resume "$session" --allowedTools "$ROLE_ALLOWED" >>"$LOG" 2>&1 || true
+          else
+            SID=$(uuidgen 2>/dev/null || "$PY" -c 'import uuid; print(uuid.uuid4())')
+            echo "[$(ts)] spawn(legacy) role=$role session=$SID" >>"$LOG"
+            DESKD_ROLE="$role" DESKD_SESSION_ID="$SID" timeout "$TIMEOUT" "$AGENT" -p "$prompt" \
+              --model "$MODEL" --session-id "$SID" --allowedTools "$ROLE_ALLOWED" >>"$LOG" 2>&1 || true
+            deskd status end --role "$role" >/dev/null 2>&1 || true
+          fi
         else
-          SID=$(uuidgen 2>/dev/null || "$PY" -c 'import uuid; print(uuid.uuid4())')
-          deskd status set --role "$role" --state booting \
-            --session-id "$SID" --harness "wake-$role" >/dev/null 2>&1 || true
-          echo "[$(ts)] spawn role=$role session=$SID" >>"$LOG"
-          DESKD_ROLE="$role" DESKD_SESSION_ID="$SID" timeout "$TIMEOUT" "$AGENT" -p "$prompt" \
-            --model "$MODEL" --session-id "$SID" --allowedTools "$ROLE_ALLOWED" >>"$LOG" 2>&1 || true
-          deskd status end --role "$role" >/dev/null 2>&1 || true
+          # Provider seam: `deskd agent run` resolves the role's registered
+          # provider/model/reasoning (deskd runtime set-*), refuses cross-
+          # provider resumes, and PARKS the session afterwards (rollover
+          # retires it) instead of ending it.
+          if [ "$channel" = "resume" ] && [ -n "$session" ]; then
+            MODE=resume; SID="$session"
+          else
+            MODE=spawn
+            SID=$(uuidgen 2>/dev/null || "$PY" -c 'import uuid; print(uuid.uuid4())')
+          fi
+          echo "[$(ts)] $MODE role=$role session=$SID (provider seam)" >>"$LOG"
+          DESKD_ROLE="$role" DESKD_SESSION_ID="$SID" timeout "$TIMEOUT" \
+            deskd agent run --role "$role" --mode "$MODE" --session-id "$SID" \
+            --prompt "$prompt" --harness "wake-$role" \
+            --allowed-tools-default "$ROLE_ALLOWED" >>"$LOG" 2>&1 || true
         fi
       ) &
       ;;
