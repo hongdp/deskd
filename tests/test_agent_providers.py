@@ -196,3 +196,55 @@ def test_run_agent_executes_parks_and_reports_preflight(desk, tmp_path):
     rt.set_role_runtime("alpha", "provider", "ghost")
     assert agent_run.run_agent("alpha", "spawn", "s-10", "p") == 75, \
         "a failed preflight is infrastructure (75), not a served wake"
+
+
+# --- the console's runtime view ----------------------------------------------
+
+def test_runtime_console_view_and_supervisor_gate(desk, monkeypatch):
+    """The seventh console view: GET is open telemetry (tuning + preflights +
+    session owners), POST is a supervisor write like any other — and the page
+    itself ships in the nav."""
+    from fastapi.testclient import TestClient
+
+    from deskd.web.app import create_app
+
+    monkeypatch.setenv("DESKD_SUPERVISOR_AUTH_MODE", "simple")
+    monkeypatch.setenv("DESKD_SUPERVISOR_ACCESS_CODE", "test-only-code")
+    client = TestClient(create_app())
+
+    page = client.get("/runtime")
+    assert page.status_code == 200 and "Tune a role" in page.text
+    assert '"/runtime", "Runtime"' in client.get("/static/shell.js").text
+
+    orch.set_status("alpha", state="idle_standby", session_id="s-1",
+                    harness="wake-alpha#claude")
+    got = client.get("/api/runtime").json()
+    assert {r["role"] for r in got["roles"]} >= {"alpha", "beta"}
+    assert "claude" in got["providers"]
+    assert got["sessions"]["alpha"]["session_provider"] == "claude"
+
+    denied = client.post("/api/runtime",
+                         json={"role": "alpha", "reasoning": "high"})
+    assert denied.status_code == 401
+
+    hdr = {"X-Deskd-Supervisor-Code": "test-only-code"}
+    empty = client.post("/api/runtime", json={"role": "alpha"}, headers=hdr)
+    assert empty.status_code == 422
+
+    bad = client.post("/api/runtime",
+                      json={"role": "alpha", "reasoning": "ultra"}, headers=hdr)
+    assert bad.status_code == 400
+
+    ok = client.post("/api/runtime",
+                     json={"role": "alpha", "model": "claude-opus-5",
+                           "reasoning": "high"}, headers=hdr)
+    assert ok.status_code == 200
+    effects = {c["key"]: c["takes_effect"] for c in ok.json()["changed"]}
+    assert effects == {"model": "next turn", "reasoning": "next turn"}
+    row = {r["role"]: r for r in ok.json()["roles"]}["alpha"]
+    assert (row["model"], row["reasoning"]) == ("claude-opus-5", "high")
+
+    cleared = client.post("/api/runtime",
+                          json={"role": "alpha", "model": "default"},
+                          headers=hdr)
+    assert {r["role"]: r for r in cleared.json()["roles"]}["alpha"]["model"] is None

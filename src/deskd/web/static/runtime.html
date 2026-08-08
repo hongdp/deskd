@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runtime · deskd console</title>
+<link rel="stylesheet" href="/static/deskd.css">
+<script src="/static/shell.js"></script>
+<style>
+  .rt-controls { display: flex; align-items: end; gap: 10px; flex-wrap: wrap; }
+  .rt-controls label { display: grid; gap: 4px; color: var(--text-2); font-size: 12px; }
+  .rt-controls select, .rt-controls input { min-width: 150px; }
+  .rt-auth { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .rt-auth[hidden] { display: none !important; }
+  .rt-auth label { display: grid; gap: 4px; color: var(--text-2); font-size: 12px; }
+  .rt-auth input { width: 240px; }
+  .rt-note { margin-top: 10px; }
+  @media (max-width: 620px) {
+    .rt-controls > label, .rt-controls select, .rt-controls input,
+    .rt-auth > label, .rt-auth input { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <div class="pagehead">
+    <div>
+      <h1>Runtime</h1>
+      <div class="sub">Which harness, model, and thinking power each role runs with</div>
+    </div>
+  </div>
+
+  <div class="security" id="rt-providers">Checking providers…</div>
+
+  <section class="card">
+    <div class="card-head">
+      <h3>Tune a role</h3>
+      <span class="quiet">model &amp; thinking apply on the role's next turn; provider on its next new session</span>
+    </div>
+    <div class="rt-controls">
+      <label>Role
+        <select id="rt-role"></select>
+      </label>
+      <label>Provider
+        <select id="rt-provider">
+          <option value="">(leave unchanged)</option>
+        </select>
+      </label>
+      <label>Model
+        <input id="rt-model" type="text" list="rt-model-hints"
+               placeholder="provider default">
+        <datalist id="rt-model-hints"></datalist>
+      </label>
+      <label>Thinking
+        <select id="rt-reasoning">
+          <option value="">(leave unchanged)</option>
+        </select>
+      </label>
+      <button class="btn primary" id="rt-apply">Apply</button>
+    </div>
+    <div class="rt-auth" id="rt-auth" hidden>
+      <label>Supervisor access code
+        <input id="rt-code" type="password" autocomplete="current-password"
+               placeholder="printed by the server at startup">
+      </label>
+      <button class="btn" id="rt-remember">Keep for session</button>
+    </div>
+    <div class="result" id="rt-result" role="status" aria-live="polite"></div>
+    <div class="quiet rt-note">
+      Model suggestions follow the selected provider and are hints, not
+      validation — any model the harness supports can be typed. "default"
+      clears a setting back to the provider's own default. A running session
+      always resumes under the provider that created it.
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h3>Per-role runtime</h3>
+      <button class="btn" id="rt-refresh">Refresh</button>
+    </div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Role</th><th>Provider</th><th>Model</th><th>Thinking</th>
+            <th>Session</th><th>Provider health</th>
+          </tr>
+        </thead>
+        <tbody id="rt-rows">
+          <tr><td colspan="6" class="loading">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<footer class="foot" id="foot"></footer>
+
+<script>
+"use strict";
+var S = Shell, $ = S.$, esc = S.esc;
+S.init("runtime", "Runtime");
+
+var META = null;      // /api/meeting-meta — auth + roles, the console's config
+var DATA = null;      // /api/runtime
+
+function badge(value, cls) {
+  if (!value || value === "default") return '<span class="badge">default</span>';
+  return '<span class="badge ' + (cls || "ok") + '">' + esc(value) + "</span>";
+}
+
+function setResult(text, bad) {
+  var n = $("#rt-result");
+  n.textContent = text;
+  n.className = "result" + (bad ? " bad" : "");
+}
+
+function providerHealthBadge(name) {
+  var p = (DATA.providers || {})[name];
+  if (!p) return '<span class="badge">unknown</span>';
+  if (p.ok) return '<span class="badge ok">ready</span>';
+  return '<span class="badge bad" title="' + esc(p.message || "") + '">' +
+    esc(p.code || "unavailable") + "</span>";
+}
+
+function renderProvidersStrip() {
+  var names = Object.keys(DATA.providers || {});
+  var bad = names.filter(function (n) { return !DATA.providers[n].ok; });
+  var n = $("#rt-providers");
+  if (!bad.length) {
+    n.className = "security";
+    n.textContent = "Providers ready: " + names.join(", ") + ".";
+    return;
+  }
+  n.className = "security bad";
+  // The provider's own message carries the way out (install link /
+  // set-provider route) — surface it verbatim, it was written for this spot.
+  n.textContent = bad.map(function (name) {
+    return DATA.providers[name].message || (name + " unavailable");
+  }).join(" — ");
+}
+
+function syncPickers() {
+  var roleSel = $("#rt-role");
+  if (!roleSel.options.length) {
+    roleSel.innerHTML = (DATA.roles || []).map(function (r) {
+      return '<option value="' + esc(r.role) + '">' + esc(r.role) + "</option>";
+    }).join("");
+  }
+  var provSel = $("#rt-provider");
+  var names = Object.keys(DATA.providers || {});
+  provSel.innerHTML = '<option value="">(leave unchanged)</option>' +
+    '<option value="default">default</option>' +
+    names.map(function (n) {
+      return '<option value="' + esc(n) + '">' + esc(n) + "</option>";
+    }).join("");
+  var tierSel = $("#rt-reasoning");
+  tierSel.innerHTML = '<option value="">(leave unchanged)</option>' +
+    '<option value="default">default</option>' +
+    (DATA.reasoning_tiers || []).map(function (t) {
+      return '<option value="' + esc(t) + '">' + esc(t) + "</option>";
+    }).join("");
+  syncModelHints();
+}
+
+function roleRow(role) {
+  return (DATA.roles || []).filter(function (r) { return r.role === role; })[0] || {};
+}
+
+function syncModelHints() {
+  var role = $("#rt-role").value;
+  var chosen = $("#rt-provider").value;
+  var provider = (chosen && chosen !== "default") ? chosen
+    : (roleRow(role).provider || "");
+  var meta = (DATA.providers || {})[provider] || {};
+  $("#rt-model-hints").innerHTML = ["default"].concat(meta.models || [])
+    .map(function (m) { return '<option value="' + esc(m) + '"></option>'; })
+    .join("");
+  $("#rt-model").placeholder = (meta.models || []).length
+    ? "provider default (suggestions for " + provider + ")"
+    : "provider default (type any model " + (provider || "the harness") + " supports)";
+}
+
+function renderRows() {
+  var sessions = DATA.sessions || {};
+  $("#rt-rows").innerHTML = (DATA.roles || []).map(function (r) {
+    var s = sessions[r.role] || {};
+    var session = s.session_provider
+      ? esc(s.session_provider) + " · " + esc(s.state || "?")
+      : '<span class="badge">none</span>';
+    return "<tr><td><b>" + esc(r.role) + "</b></td><td>" +
+      badge(r.provider) + "</td><td>" + badge(r.model) + "</td><td>" +
+      badge(r.reasoning) + "</td><td>" + session + "</td><td>" +
+      providerHealthBadge(r.provider) + "</td></tr>";
+  }).join("") || '<tr><td colspan="6">No roles registered.</td></tr>';
+}
+
+function renderAuth() {
+  $("#rt-auth").hidden = !META.access_code_required;
+  $("#rt-apply").disabled = !META.simple_auth_enabled;
+  var input = $("#rt-code");
+  if (!input.value) {
+    try { input.value = sessionStorage.getItem("deskdSupervisorCode") || ""; }
+    catch (e) { /* private mode */ }
+  }
+}
+
+async function load() {
+  try {
+    META = await S.meta();
+    DATA = await S.api("/api/runtime");
+    renderProvidersStrip();
+    syncPickers();
+    renderRows();
+    renderAuth();
+    $("#foot").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    setResult(e.message, true);
+  }
+}
+
+async function apply() {
+  var role = $("#rt-role").value;
+  var body = { role: role };
+  if ($("#rt-provider").value) body.provider = $("#rt-provider").value;
+  if ($("#rt-model").value.trim()) body.model = $("#rt-model").value.trim();
+  if ($("#rt-reasoning").value) body.reasoning = $("#rt-reasoning").value;
+  if (!body.provider && !body.model && !body.reasoning) {
+    setResult("Choose a provider, model, or thinking tier to change.", true);
+    return;
+  }
+  var headers = { "Content-Type": "application/json" };
+  if (META.access_code_required) {
+    var code = $("#rt-code").value;
+    if (!code) { setResult("Enter the supervisor access code.", true); return; }
+    headers[META.code_header] = code;
+  }
+  var button = $("#rt-apply");
+  button.disabled = true;
+  try {
+    var payload = await S.api("/api/runtime", {
+      method: "POST", headers: headers, body: JSON.stringify(body)
+    });
+    var parts = (payload.changed || []).map(function (c) {
+      return c.key + "=" + (c.value === null ? "default" : c.value) +
+        " (" + c.takes_effect + ")";
+    }).join(", ");
+    setResult("Saved for " + role + ": " + parts, false);
+    DATA = payload;
+    renderProvidersStrip();
+    renderRows();
+    syncModelHints();
+  } catch (e) {
+    setResult(e.message, true);
+  } finally {
+    button.disabled = !META.simple_auth_enabled;
+  }
+}
+
+$("#rt-apply").onclick = apply;
+$("#rt-refresh").onclick = load;
+$("#rt-role").onchange = syncModelHints;
+$("#rt-provider").onchange = syncModelHints;
+$("#rt-remember").onclick = function () {
+  try {
+    sessionStorage.setItem("deskdSupervisorCode", $("#rt-code").value);
+    setResult("Access code kept for this browser session only.", false);
+  } catch (e) {
+    setResult("This browser does not allow session storage.", true);
+  }
+};
+
+load();
+</script>
+</body>
+</html>
