@@ -101,9 +101,47 @@ def test_runtime_round_trip_validation_and_overview(desk):
     rt.set_role_runtime("alpha", "model", None)
     assert rt.role_runtime("alpha")["model"] is None
 
-    rows = {r["role"]: r for r in rt.runtime_overview()}
+    overview = rt.runtime_overview()
+    rows = {r["role"]: r for r in overview["roles"]}
     assert rows["alpha"]["reasoning"] == "max"
     assert rows["beta"]["provider"] == "claude"
+    claude_meta = overview["providers"]["claude"]
+    assert claude_meta["models"], \
+        "providers publish model hints for consoles to sync from"
+    assert overview["reasoning_tiers"] == ["low", "medium", "high", "max"]
+
+
+def test_model_and_reasoning_take_effect_next_turn_not_next_session(desk):
+    """Sessions are turn-per-process: a resume relaunches the harness, so a
+    pinned model/tier rides the very next wake of the EXISTING session. Only
+    provider waits for a new session (the cross-provider guard)."""
+    assert rt.set_role_runtime("alpha", "model",
+                               "claude-opus-5")["takes_effect"] == "next turn"
+    assert rt.set_role_runtime("alpha", "reasoning",
+                               "high")["takes_effect"] == "next turn"
+    assert rt.set_role_runtime("alpha", "provider",
+                               "claude")["takes_effect"] == "next new session"
+
+    orch.set_status("alpha", state="idle_standby", session_id="s-old",
+                    harness="wake-alpha#claude")
+    cmd, env, _ = agent_run.build_launch("alpha", "resume", "s-old", "p")
+    assert ["--model", "claude-opus-5"] == cmd[3:5], \
+        "the pinned model applies on RESUME of the existing session"
+    assert env == {"MAX_THINKING_TOKENS": "24576"}
+
+
+def test_missing_claude_binary_tells_the_user_what_to_do(desk, monkeypatch):
+    """The first wall a fresh clone without Claude Code hits: the message
+    must carry the way out (install link + the alternative-provider route),
+    and it must be visible in `deskd runtime show`, not only in driver logs."""
+    import shutil as _shutil
+
+    from deskd import providers as providers_mod
+    monkeypatch.setattr(providers_mod.shutil, "which", lambda _: None)
+    health = rt.runtime_overview()["providers"]["claude"]
+    assert health["ok"] is False
+    assert "claude.com/claude-code" in health["message"]
+    assert "set-provider" in health["message"]
 
 
 # --- the driver arm ----------------------------------------------------------

@@ -101,9 +101,12 @@ deskd wake sources --role operator            # what can wake me, and how to cha
 
 ### Providers: which harness runs your agents
 
-deskd ships **Claude Code as the built-in default** — a fresh clone launches
-sessions with zero provider configuration. Any other CLI harness plugs in
-without forking:
+deskd ships **Claude Code as the built-in default** — if the [Claude Code
+CLI](https://claude.com/claude-code) is installed and logged in, sessions
+launch with zero provider configuration. **Don't have Claude Code?** Nothing
+above requires it (the demo and the whole engine are LLM-free); to launch
+real agents, register a provider for whatever harness you do have — any CLI
+plugs in without forking:
 
 ```python
 from deskd import configure
@@ -130,14 +133,20 @@ sandboxes); registering a provider named `claude` replaces the built-in.
 registry row and applied at the role's next new session:
 
 ```bash
-deskd runtime show
+deskd runtime show      # per-role tuning AND provider preflight health —
+                        # run this first; a missing harness binary is
+                        # reported here with the way out
 deskd runtime set-provider mycli --role operator
 deskd runtime set-model claude-opus-5 --role researcher
 deskd runtime set-reasoning high --role researcher   # low|medium|high|max; 'default' clears
 ```
 
-Each provider maps the shared tier vocabulary onto its own knob (the claude
-provider: a thinking-token budget in the child env). The reference driver
+Model and reasoning apply on the role's **next turn** — sessions are
+turn-per-process, so a resume already carries the new values; only
+`provider` waits for the next new session (a conversation belongs to the
+engine that started it). Each provider maps the shared tier vocabulary onto
+its own knob (the claude provider: a thinking-token budget in the child
+env) and publishes a `models` hint list that consoles can sync from. The reference driver
 launches through this seam via `deskd agent run`, which also enforces the
 two invariants every driver must keep: a session never resumes under a
 provider that did not create it, and a role with no declared tool grant

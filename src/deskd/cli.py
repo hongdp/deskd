@@ -205,7 +205,8 @@ def build_parser() -> argparse.ArgumentParser:
     # --- runtime / agent (the provider seam) --------------------------------
     p_rt = sub.add_parser(
         "runtime",
-        help="per-role provider/model/reasoning for the NEXT new session")
+        help="per-role provider/model/reasoning (model & reasoning apply on "
+             "the role's next turn; provider on its next new session)")
     rt = p_rt.add_subparsers(dest="runtime_cmd", required=True)
     rt.add_parser("show", help="resolved runtime tuning for every role")
     for _key in ("provider", "model", "reasoning"):

@@ -9,6 +9,13 @@ Everything here is per-role on purpose: differing per role is the feature,
 so there is no "all" fan-out for model/reasoning (provider keeps one for
 migration convenience).
 
+Effect timing differs by key, because sessions are turn-per-process: every
+wake launches a fresh harness process that resumes the conversation, so
+``model`` and ``reasoning`` apply on the role's NEXT TURN — no new session
+needed. Only ``provider`` waits for the next new session, held back by the
+cross-provider resume guard (a conversation belongs to the engine that
+started it).
+
 The engine stores and surfaces; the driver (deskd agent run, or a host's
 own) reads :func:`role_runtime` and hands the values to the provider. A
 session that already exists always resumes under the provider that created
@@ -87,17 +94,28 @@ def set_role_runtime(role: str, key: str, value: str | None, *,
             authority[key] = value
         conn.execute("UPDATE agent_registry SET authority=? WHERE role=?",
                      (json.dumps(authority), role))
+        takes_effect = ("next new session" if key == "provider"
+                        else "next turn")
         _log_event(conn, actor, f"runtime_{key}_set", role,
                    {"previous": previous, "value": value,
-                    "takes_effect": "next new session"})
-    return {"role": role, "key": key, "previous": previous, "value": value}
+                    "takes_effect": takes_effect})
+    return {"role": role, "key": key, "previous": previous, "value": value,
+            "takes_effect": takes_effect}
 
 
-def runtime_overview(db_path: Path | str | None = None) -> list[dict]:
-    """Every role's resolved runtime tuning, for `deskd runtime show`."""
+def runtime_overview(db_path: Path | str | None = None) -> dict:
+    """Roles' resolved tuning + every registered provider's preflight, for
+    `deskd runtime show` — ONE command answers "what would launch, and can
+    it": a fresh clone without Claude Code sees the install hint here, not
+    at 3am in a driver log."""
     from ..config import CONFIG
-    out = []
+    from ..providers import registry as provider_registry
+    roles = []
     for name in CONFIG.role_names():
         rt = role_runtime(name, db_path=db_path)
-        out.append({"role": name, **{k: rt[k] for k in RUNTIME_KEYS}})
-    return out
+        roles.append({"role": name, **{k: rt[k] for k in RUNTIME_KEYS}})
+    return {"roles": roles,
+            "reasoning_tiers": list(REASONING_TIERS),
+            "providers": {name: {**provider.preflight(),
+                                 "models": list(provider.models)}
+                          for name, provider in provider_registry().items()}}
