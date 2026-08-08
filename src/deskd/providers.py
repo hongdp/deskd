@@ -54,6 +54,10 @@ class LaunchSpec:
 class Provider:
     """Base provider. Subclass, set ``name``, implement :meth:`command`.
 
+    ``models`` is DISCOVERY metadata: the model names this provider suggests
+    to consoles and CLIs (hints for humans, never validation — a model the
+    vendor shipped yesterday must not be rejected by a stale list here).
+
     ``environment`` returns ENV OVERRIDES (merged over the driver's child
     env), not a full environment — a provider should never need to copy
     os.environ. ``preflight`` runs before every launch; return ``ok=False``
@@ -62,6 +66,7 @@ class Provider:
     """
 
     name: str = ""
+    models: tuple[str, ...] = ()
 
     def command(self, spec: LaunchSpec) -> list[str]:
         raise NotImplementedError
@@ -83,6 +88,11 @@ class ClaudeCodeProvider(Provider):
     """
     binary: str = "claude"
     default_model: str | None = None
+    #: Suggestion list for consoles (aliases resolve to the CLI's current
+    #: mapping). Hosts override via registration; a stale list only makes
+    #: worse hints, never a rejected launch.
+    models: tuple[str, ...] = ("claude-fable-5", "claude-opus-5",
+                               "claude-sonnet-5", "claude-haiku-4-5-20251001")
     thinking_budgets: dict = field(default_factory=lambda: {
         "low": 4096, "medium": 12288, "high": 24576, "max": 49152})
     name: str = "claude"
@@ -108,9 +118,16 @@ class ClaudeCodeProvider(Provider):
     def preflight(self) -> dict:
         if shutil.which(self.binary):
             return {"ok": True, "provider": self.name}
+        # The first thing a fresh clone without Claude Code hits — so the
+        # message must say what to DO, not only what is missing.
         return {"ok": False, "provider": self.name,
                 "code": "binary_missing",
-                "message": f"{self.binary!r} not found on PATH"}
+                "message": (
+                    f"{self.binary!r} (Claude Code CLI) is not on PATH. "
+                    "Install it from https://claude.com/claude-code and log "
+                    "in, or use a different harness: register a "
+                    "CommandProvider for your CLI (README § Providers) "
+                    "and `deskd runtime set-provider <name> --role <role>`.")}
 
 
 @dataclass(frozen=True)
@@ -138,6 +155,7 @@ class CommandProvider(Provider):
     resume_template: tuple[str, ...] | None = None
     env: dict = field(default_factory=dict)
     name: str = "command"
+    models: tuple[str, ...] = ()
 
     def _values(self, spec: LaunchSpec) -> dict[str, str | None]:
         return {
@@ -197,7 +215,9 @@ class CommandProvider(Provider):
             return {"ok": True, "provider": self.name}
         return {"ok": False, "provider": self.name,
                 "code": "binary_missing",
-                "message": f"{binary!r} not found on PATH"}
+                "message": (f"{binary!r} is not on PATH — install the "
+                            f"harness behind provider {self.name!r}, or "
+                            "point its template at the right binary")}
 
 
 def registry() -> dict[str, Provider]:

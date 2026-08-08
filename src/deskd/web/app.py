@@ -66,6 +66,19 @@ class SupervisorActionRequest(BaseModel):
     payload: dict
 
 
+class RuntimeTuningRequest(BaseModel):
+    """Per-role runtime tuning; each field optional, 'default' clears it.
+
+    Model and reasoning apply on the role's next turn; provider on its next
+    new session. Supervisor writes: which engine does a role's thinking is
+    an operator decision, gated like every other supervisor action."""
+
+    role: str
+    provider: str | None = None
+    model: str | None = None
+    reasoning: str | None = None
+
+
 def _install_config(config: EngineConfig | None) -> EngineConfig:
     """Adopt `config` as the process-wide engine config.
 
@@ -180,6 +193,10 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     @app.get("/tasks", include_in_schema=False)
     def tasks_page() -> FileResponse:
         return page("tasks.html")
+
+    @app.get("/runtime", include_in_schema=False)
+    def runtime_page() -> FileResponse:
+        return page("runtime.html")
 
     # --- read-only projections ----------------------------------------------
 
@@ -317,6 +334,49 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
 
     # Declared before /api/meetings/{meeting_id} for readability; Starlette
     # method-matches anyway, so the GET wildcard never shadows these POSTs.
+    @app.get("/api/runtime")
+    def api_runtime() -> dict:
+        """Per-role tuning + provider preflights + who owns each live session."""
+        overview = orchestration.runtime_overview()
+        sessions: dict = {}
+        for row in orchestration.presence():
+            if not row.get("session_id"):
+                continue
+            harness = row.get("harness") or ""
+            provider = (harness.rsplit("#", 1)[1] if "#" in harness
+                        else cfg_provider_default())
+            sessions[row["role"]] = {"session_provider": provider,
+                                     "state": row.get("state")}
+        return {**overview, "sessions": sessions}
+
+    def cfg_provider_default() -> str:
+        from ..config import CONFIG
+        return CONFIG.default_provider
+
+    @app.post("/api/runtime")
+    def api_set_runtime(
+        req: RuntimeTuningRequest,
+        code: str = Header(default="", alias=config_mod.SUPERVISOR_CODE_HEADER),
+    ) -> dict:
+        if not auth.simple_auth_enabled():
+            raise HTTPException(
+                403, "runtime tuning requires simple supervisor authentication")
+        if not auth.verify_access_code(code):
+            raise HTTPException(401, "invalid supervisor access code")
+        fields = {k: getattr(req, k) for k in ("provider", "model", "reasoning")
+                  if getattr(req, k) is not None}
+        if not fields:
+            raise HTTPException(422, "provide provider, model, and/or reasoning")
+        changed = []
+        try:
+            for key, raw in fields.items():
+                value = None if raw.strip().lower() == "default" else raw.strip()
+                changed.append(orchestration.set_role_runtime(
+                    req.role, key, value, actor="supervisor_web"))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"changed": changed, **api_runtime()}
+
     @app.post("/api/meetings/supervisor-apply")
     def api_supervisor_apply(req: SupervisorAssertionRequest) -> dict:
         """Signed mode: verify Ed25519 assertion + burn nonce, then apply."""

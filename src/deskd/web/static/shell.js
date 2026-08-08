@@ -158,7 +158,8 @@ window.Shell = (function () {
     ["meetings", "/meetings", "Meetings"],
     ["wake", "/wake", "Wake ladder"],
     ["escalations", "/escalations", "Escalations"],
-    ["tasks", "/tasks", "Tasks & hooks"]
+    ["tasks", "/tasks", "Tasks & hooks"],
+    ["runtime", "/runtime", "Runtime"]
   ];
 
   function navHTML(items, page) {
