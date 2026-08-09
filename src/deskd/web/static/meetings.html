@@ -300,7 +300,7 @@ function timeline() {
     if (i.type === "m") return '<div class="msg ' + (x.sender === META.supervisor_role ? "sup" : "") + '">'
       + '<div class="msg-head"><span>#' + x.id + " · " + esc(x.sender) + " → " + esc(x.recipient) + " · " + esc(x.kind)
       + (x.reply_to ? " · reply to #" + x.reply_to : "") + "</span><span>" + rel(x.created_at) + "</span></div>"
-      + '<div class="msg-body">' + esc(x.body) + "</div>" + readPills(x) + "</div>";
+      + '<div class="msg-body">' + S.md(x.body) + "</div>" + readPills(x) + "</div>";
     return '<div class="event"><b>' + esc(x.actor) + "</b> · " + esc(S.human(x.event)) + " · " + esc(x.detail) + " · " + rel(x.created_at) + "</div>";
   }).join("") : S.empty("No messages yet — attendees check in and speak here.");
   var el = $("#timeline");
