@@ -151,6 +151,56 @@ window.Shell = (function () {
     return metaPromise;
   }
 
+  // --- message markdown (escape-FIRST, then a small trusted transform) -----
+  // Agent meeting prose is dense markdown — bold runs, inline code, tables,
+  // lists — and rendering it as literal asterisks made transcripts unreadable.
+  // This is deliberately a SUBSET: everything is esc()'d before any tag is
+  // introduced, and the only tags ever produced are b/code/br/table bits/li.
+  function mdInline(t) {
+    return t
+      .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>");
+  }
+  function md(raw) {
+    var lines = esc(raw || "").split("\n");
+    var out = [], para = [], table = [], list = [];
+    function flushPara() {
+      if (para.length) out.push("<p>" + mdInline(para.join("<br>")) + "</p>");
+      para = [];
+    }
+    function flushTable() {
+      if (!table.length) return;
+      var rows = table.filter(function (r) { return !/^[|\s:-]+$/.test(r); });
+      out.push("<table>" + rows.map(function (r, i) {
+        var cells = r.replace(/^\||\|$/g, "").split("|");
+        var tag = i === 0 ? "th" : "td";
+        return "<tr>" + cells.map(function (c) {
+          return "<" + tag + ">" + mdInline(c.trim()) + "</" + tag + ">";
+        }).join("") + "</tr>";
+      }).join("") + "</table>");
+      table = [];
+    }
+    function flushList() {
+      if (!list.length) return;
+      out.push("<ul>" + list.map(function (li) {
+        return "<li>" + mdInline(li) + "</li>";
+      }).join("") + "</ul>");
+      list = [];
+    }
+    lines.forEach(function (line) {
+      var t = line.trim();
+      if (/^\|.*\|$/.test(t)) { flushPara(); flushList(); table.push(t); return; }
+      flushTable();
+      var m = t.match(/^(?:[-*]|\d+[.)])\s+(.*)$/);
+      if (m) { flushPara(); list.push(m[1]); return; }
+      flushList();
+      if (!t) { flushPara(); return; }
+      para.push(t);
+    });
+    flushPara(); flushTable(); flushList();
+    return out.join("");
+  }
+
   // --- nav shell ----------------------------------------------------------------
   var NAV = [
     ["board", "/", "Board"],
@@ -280,7 +330,7 @@ window.Shell = (function () {
   }
 
   return {
-    $: $, esc: esc, setHTML: setHTML,
+    $: $, esc: esc, md: md, setHTML: setHTML,
     ago: ago, dur: dur, rel: rel, exact: exact,
     stateClass: stateClass, stateBadge: stateBadge, human: human,
     empty: empty, payloadChips: payloadChips,

@@ -338,7 +338,14 @@ input[type="checkbox"] { width: auto; }
 .msg { border-left: 3px solid var(--info); background: var(--surface-2); border-radius: 3px 8px 8px 3px; padding: 8px 11px; }
 .msg.sup { border-left-color: var(--ok); }
 .msg-head { display: flex; justify-content: space-between; gap: 10px; font-size: 11px; color: var(--muted); flex-wrap: wrap; }
-.msg-body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; font-size: 13px; }
+.msg-body { overflow-wrap: anywhere; margin-top: 4px; font-size: 13px; line-height: 1.55; }
+.msg-body p { margin: 0 0 8px; }
+.msg-body p:last-child { margin-bottom: 0; }
+.msg-body ul { margin: 0 0 8px; padding-left: 20px; }
+.msg-body li { margin: 2px 0; }
+.msg-body table { margin: 6px 0 10px; font-size: 12px; }
+.msg-body code { background: var(--bg-2, rgba(128,128,128,.15)); padding: 0 4px; border-radius: 4px; font-size: 12px; }
+.msg-body b { font-weight: 650; }
 .receipts { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 7px; }
 .rpill { font-size: 10px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--text-2); cursor: help; }
 .rpill.ok { color: var(--ok); border-color: var(--ok); }

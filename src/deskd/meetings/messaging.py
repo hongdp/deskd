@@ -373,6 +373,25 @@ def send_update(thread_id: str, *, role: str, body: str, kind: str = "evidence",
         dispatch_escalation(escalation_id, db_path=db_path)
     status = views.meeting_status(thread_id, db_path=db_path)
     out = {"message_id": message_id, "meeting": status}
+    # Say, at the moment of speaking, which debts this message did NOT pay.
+    # Measured live 2026-08-09: a reply that answered a question in substance
+    # but carried no reply_to left the obligation pending, and the ladder
+    # paged a human twice about an already-written answer. The ledger's
+    # strictness is right (an answer must NAME what it answers); what was
+    # missing is this mirror — the sender learning about the unpaid debt in
+    # the send RESPONSE, not from tomorrow's escalation.
+    with connect(db_path) as conn:
+        leftover = [dict(r) for r in conn.execute(
+            """SELECT message_id, due_at FROM meeting_response_obligations
+               WHERE thread_id=? AND owed_by=? AND status='pending'
+               ORDER BY message_id""", (thread_id, role))]
+    if leftover:
+        ids = ", ".join(f"#{r['message_id']}" for r in leftover)
+        out["unsettled_obligations"] = leftover
+        out["warning"] = (
+            f"you still owe replies to {ids} in this thread and THIS message "
+            f"settled none of them — answer with --reply-to <id> (or "
+            f"--resolves), or the ladder will keep climbing toward a human")
     if status["meeting"]["state"] in {"active", "consensus"}:
         out["next"] = (
             f"meeting still open: run `{PROJECT_NAME} meeting updates ... "
