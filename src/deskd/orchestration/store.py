@@ -429,6 +429,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE agent_sessions ADD COLUMN session_day TEXT")
     if "phase" not in cols:
         conn.execute("ALTER TABLE agent_sessions ADD COLUMN phase TEXT")
+    if "last_tool" not in cols:
+        # Live tool trace (2026-08-09): the board's answer to "what is it
+        # doing RIGHT NOW" between the coarse, agent-authored activity lines.
+        conn.execute("ALTER TABLE agent_sessions ADD COLUMN last_tool TEXT")
+        conn.execute("ALTER TABLE agent_sessions ADD COLUMN last_tool_at TEXT")
     if "source_generation" not in {r["name"] for r in conn.execute(
             "PRAGMA table_info(wake_attempts)")}:
         # A durable demand key may be reused after its previous request was

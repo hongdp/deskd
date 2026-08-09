@@ -71,6 +71,26 @@ def set_status(role: str, *, state: str | None = None, activity: str | None = No
         return _presence_row(dict(row), store._now())
 
 
+#: A tool line older than this is HIDDEN, not shown stale: "last seen doing
+#: X" minutes ago reads as "doing X now" on a dashboard, and a misleading
+#: live-trace is worse than none.
+TOOL_TRACE_FRESH_SECONDS = 120
+
+
+def tool_trace(role: str, text: str, *,
+               db_path: Path | str | None = None) -> None:
+    """Record the session's current tool action (UPDATE-only, best-effort).
+
+    The in-session hook calls this on every tool use, so it must stay cheap
+    and must never create rows or break the calling session: no registration,
+    no event log, silently a no-op when the role has no live session."""
+    with connect(db_path, write=True) as conn:
+        conn.execute(
+            "UPDATE agent_sessions SET last_tool=?, last_tool_at=? "
+            "WHERE role=? AND ended_at IS NULL",
+            (text[:200], _iso(), role))
+
+
 def end_session(role: str, *, db_path: Path | str | None = None) -> None:
     now = _iso()
     with connect(db_path, write=True) as conn:
@@ -117,12 +137,21 @@ def _presence_row(row: dict, now: dt.datetime) -> dict:
             liveness = "idle"
         else:
             liveness = "dead"
+    tool, tool_at = row.get("last_tool"), row.get("last_tool_at")
+    tool_age = None
+    if tool and tool_at:
+        tool_age = (now - dt.datetime.fromisoformat(tool_at)).total_seconds()
+        if tool_age >= TOOL_TRACE_FRESH_SECONDS:
+            tool = None                    # hidden, not shown stale
     return {
         "role": row["role"],
         "session_id": row.get("session_id"),
         "harness": row.get("harness"),
         "state": row.get("state"),
         "activity": row.get("activity"),
+        "last_tool": tool,
+        "last_tool_age_seconds": (None if tool is None or tool_age is None
+                                  else int(tool_age)),
         "started_at": row.get("started_at"),
         "last_heartbeat_at": hb,
         "ended_at": row.get("ended_at"),
