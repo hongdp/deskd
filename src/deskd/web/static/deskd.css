@@ -603,3 +603,8 @@ a.dk-phone:hover { text-decoration: none; filter: brightness(1.04); }
 .dk-elsewhere { margin-top: 8px; padding-top: 7px; border-top: 1px dashed var(--line); opacity: .72; font-size: 11.5px; }
 .dk-elsewhere .dk-state { font-weight: 500; color: var(--muted); }
 .dk-elsewhere .dk-state::before { content: "still reporting · "; }
+
+/* Session narration: many short lines, read top to bottom. Wraps rather than
+   truncating — a half sentence is worse than a tall card. */
+.feed-line { padding: 3px 0; border-bottom: 1px solid var(--line); white-space: pre-wrap; word-break: break-word; }
+.feed-line:last-child { border-bottom: 0; }

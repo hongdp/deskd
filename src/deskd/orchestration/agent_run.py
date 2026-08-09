@@ -22,12 +22,14 @@ Two invariants every driver must keep, so they live here and not in scripts:
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from ..providers import LaunchSpec, get_provider
-from .presence import set_status
+from .presence import feed_append, set_status
 from .runtime import role_runtime
 from .store import connect
 
@@ -79,6 +81,69 @@ def build_launch(role: str, mode: str, session_id: str, prompt: str, *,
     return provider.command(spec), provider.environment(spec), provider_name
 
 
+def _feed_lines(event: dict):
+    """The feed rows one stream event implies, as (kind, text) pairs.
+
+    Pure, so the event vocabulary can be tested without launching anything.
+    Unknown shapes yield nothing: a harness that grows a new event type must
+    never be able to break a turn, and inventing a row from a shape we do not
+    understand would be worse than silence.
+    """
+    kind = event.get("type")
+    if kind == "assistant":
+        message = event.get("message")
+        if isinstance(message, dict):
+            for block in message.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = (block.get("text") or "").strip()
+                    if text:
+                        yield "narration", text
+    elif kind == "stream_event":
+        inner = event.get("event") or {}
+        if not isinstance(inner, dict):
+            return
+        block = inner.get("content_block") or {}
+        # Only the START of a thinking block. The deltas arrive empty (the
+        # harness redacts the content), so one marker per block says exactly
+        # what is known — "it is thinking now" — while a row per delta would
+        # dress five empty payloads up as five events worth reading.
+        if (inner.get("type") == "content_block_start"
+                and isinstance(block, dict)
+                and block.get("type") == "thinking"):
+            yield "thinking", ""
+
+
+def _run_streaming(command, env, timeout, role, session_id, db_path) -> int:
+    """Run the child, forward its stdout verbatim, and file what it narrates.
+
+    Forwarding first is the compatibility contract: whoever reads this
+    process's stdout today — a human tailing the cron log, the wake driver's
+    capture — must see exactly what they saw before capture existed. Parsing
+    is strictly additional, and every parse failure is ignored.
+    """
+    proc = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                            text=True, bufsize=1)
+    try:
+        for line in proc.stdout:            # type: ignore[union-attr]
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                continue                    # not ours; already forwarded
+            if not isinstance(event, dict):
+                continue
+            for kind, text in _feed_lines(event):
+                feed_append(role, session_id, kind, text, db_path=db_path)
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+
+
 def run_agent(role: str, mode: str, session_id: str, prompt: str, *,
               harness_base: str = "deskd-agent",
               timeout: int | None = None,
@@ -100,8 +165,12 @@ def run_agent(role: str, mode: str, session_id: str, prompt: str, *,
     env = dict(os.environ)
     env.update(env_overrides)
     try:
-        proc = subprocess.run(command, env=env, timeout=timeout)
-        code = proc.returncode
+        if get_provider(provider_name).streams:
+            code = _run_streaming(command, env, timeout, role, session_id,
+                                  db_path)
+        else:
+            proc = subprocess.run(command, env=env, timeout=timeout)
+            code = proc.returncode
     except subprocess.TimeoutExpired:
         code = 124
     finally:

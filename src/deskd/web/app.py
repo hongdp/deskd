@@ -214,6 +214,27 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
         console's day picker instead of a blank date box."""
         return meetings.meeting_days()
 
+    @app.get("/api/agent/{role}/feed")
+    def api_agent_feed(role: str, after_seq: int = 0, limit: int = 100) -> dict:
+        """What this agent's live session has been saying, oldest first.
+
+        `after_seq` makes tailing cheap: the page sends the highest seq it
+        holds and gets back only what is new. A role with no live session
+        returns an empty feed rather than 404 — "nothing is running" is an
+        answer, not an error, and a console that 404s on an idle agent teaches
+        people to ignore its errors.
+        """
+        try:
+            detail = orchestration.agent_detail(role)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        session_id = (detail.get("presence") or {}).get("session_id")
+        if not session_id:
+            return {"role": role, "session_id": None, "lines": []}
+        return {"role": role, "session_id": session_id,
+                "lines": orchestration.session_feed(
+                    session_id, after_seq=after_seq, limit=limit)}
+
     @app.get("/api/agent/{role}/wake-sources")
     def api_agent_wake_sources(role: str) -> dict:
         """'What can currently wake this agent' — the engine's own answer."""
