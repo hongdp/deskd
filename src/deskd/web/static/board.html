@@ -165,6 +165,13 @@ function nowHtml(a) {
   var body = t.inprog.length
     ? t.inprog.map(function (c) { return '<div class="now-item">' + esc(c) + "</div>"; }).join("")
     : (a.activity ? '<div class="now-item">' + esc(a.activity) + "</div>" : '<span class="quiet">Idle / standing by</span>');
+  // The live tool trace: what the session touched in the last two minutes.
+  // The engine hides it once stale, so rendering it is always honest.
+  if (a.last_tool) {
+    body += '<div class="meta">⚙ ' + esc(a.last_tool) +
+      (a.last_tool_age_seconds != null ? " · " + a.last_tool_age_seconds + "s ago" : "") +
+      "</div>";
+  }
   var meta = '<div class="meta">' + esc(a.state || "—") + (a.harness ? " · " + esc(a.harness) : "")
     + (a.started_at ? " · started " + rel(a.started_at) : "")
     + (a.session_todos && a.session_todos.updated_at ? " · todo " + rel(a.session_todos.updated_at) : "") + "</div>";
