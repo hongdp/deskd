@@ -52,6 +52,7 @@ from .inbox import (  # noqa: F401
 )
 from .presence import (  # noqa: F401
     _is_busy, _presence_list, _presence_row, _role_presence, end_session,
+    tool_trace,
     heartbeat, presence, record_todos, set_status,
 )
 from .store import (  # noqa: F401
