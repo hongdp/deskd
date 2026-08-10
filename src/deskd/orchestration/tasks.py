@@ -9,7 +9,7 @@ from pathlib import Path
 
 from ..config import CONFIG
 from .store import (TASK_OPEN_STATUSES, TASK_PRIORITIES, TASK_STATUSES,
-                    _agent_role, _clean, _iso, _log_event,
+                    _agent_role, _clean, _clean_prose, _iso, _log_event,
                     _normalize_due, _task_sources, connect)
 
 _PRIO_RANK = {"urgent": 0, "normal": 1, "low": 2}
@@ -61,7 +61,7 @@ def task_add(title: str, *, assignee_role: str, detail: str | None = None,
                    (title, detail, assignee_role, status, priority, source_kind,
                     source_ref, due_at, created_by, created_at, updated_at)
                VALUES (?,?,?,'pending',?,?,?,?,?,?,?)""",
-            (title, _clean(detail, "detail", required=False), assignee_role,
+            (title, _clean_prose(detail, "detail", required=False), assignee_role,
              priority, source_kind, source_ref, due_at, created_by, now, now),
         )
         task_id = cur.lastrowid
@@ -160,6 +160,17 @@ def task_update(task_id: int, *, actor: str | None = None,
         raise ValueError(f"invalid priority: {updates['priority']}")
     if "due_at" in updates:
         updates["due_at"] = _normalize_due(updates["due_at"])
+    # Text arrived here raw while task_add cleaned the same columns, so a
+    # field's shape depended on which verb wrote it: a detail written at
+    # creation lost its paragraphs, the identical text written by a later
+    # --detail kept them, and two rows of one list disagreed about whether a
+    # newline was even possible. Both paths now apply the same rule per field:
+    # prose keeps its lines, a title stays inline.
+    for field, cleaner in (("title", _clean), ("detail", _clean_prose),
+                           ("result_note", _clean_prose)):
+        if field in updates:
+            updates[field] = cleaner(updates[field], field,
+                                     required=(field == "title"))
     now = _iso()
     with connect(db_path, write=True) as conn:
         if "assignee_role" in updates:

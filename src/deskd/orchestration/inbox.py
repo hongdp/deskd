@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from ..config import CONFIG
-from .store import (TASK_PRIORITIES, _agent_role, _clean, _iso,
+from .store import (TASK_PRIORITIES, _agent_role, _clean, _clean_prose, _iso,
                     _load_json, _log_event, connect)
 
 # --- unified agent inbox ----------------------------------------------------
@@ -33,7 +33,7 @@ def _inbox_insert(conn: sqlite3.Connection, target_role: str, source_kind: str,
                 dedup_key, enqueued_at, expires_at)
            VALUES (?,?,?,?,?,?,?,?,?)""",
         (target_role, source_kind, ref, priority, title,
-         _clean(body, "body", required=False), dedup_key, _iso(), expires_at),
+         _clean_prose(body, "body", required=False), dedup_key, _iso(), expires_at),
     )
     if cur.rowcount:
         _log_event(conn, source_kind, "inbox_enqueue", ref,
@@ -131,7 +131,7 @@ def inbox_route(require_capability: str, source_kind: str, title: str, *,
                     dedup_key, enqueued_at, expires_at)
                VALUES (?,?,?,?,?,?,?,?,?)""",
             (require_capability, source_kind, ref, priority, title,
-             _clean(body, "body", required=False), dedup_key, _iso(), expires_at))
+             _clean_prose(body, "body", required=False), dedup_key, _iso(), expires_at))
         if not cur.rowcount:
             return {"deduped": True, "unroutable": True}
         _log_event(conn, source_kind, "unroutable_demand", ref,

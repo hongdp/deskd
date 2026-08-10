@@ -15,7 +15,7 @@ from typing import Any
 from . import store
 from ..config import CONFIG
 from .inbox import _inbox_insert
-from .store import (TASK_PRIORITIES, _agent_role, _clean, _iso,
+from .store import (TASK_PRIORITIES, _agent_role, _clean, _clean_prose, _iso,
                     _load_json, _log_event, _normalize_due, connect)
 
 # --- agent wake hooks (self-service wake API) --------------------------------
@@ -177,7 +177,7 @@ def hook_add(owner_role: str, title: str, *, at: str | None = None,
             """INSERT INTO wake_hooks (owner_role, kind, title, body, priority,
                                        spec, status, next_fire_at, created_at, updated_at)
                VALUES (?,?,?,?,?,?, 'active', ?,?,?)""",
-            (owner_role, kind, title, _clean(body, "body", required=False),
+            (owner_role, kind, title, _clean_prose(body, "body", required=False),
              priority, json.dumps(spec), next_fire, now_iso, now_iso))
         _log_event(conn, owner_role, "hook_add", str(cur.lastrowid),
                    {"kind": kind, "title": title, "spec": spec})

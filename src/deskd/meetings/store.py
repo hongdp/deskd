@@ -19,6 +19,7 @@ from typing import Sequence
 
 from .. import auth, mailbox
 from ..config import CONFIG
+from ..text import clean_prose
 
 MEETING_TYPES = {"live", "review", "ad-hoc"}
 MEETING_STATES = {
@@ -213,22 +214,14 @@ def _clean(value: str, label: str) -> str:
 
 
 def _clean_prose(value: str, label: str) -> str:
-    # Message bodies and resolutions are prose: agents write paragraphs,
-    # lists, and tables, and the console renders that structure. Flattening
-    # them through _clean destroyed it at ingest, so no renderer downstream
-    # could ever get it back. Line structure survives here; only horizontal
-    # whitespace inside a line is normalized, and blank runs collapse to one.
-    lines = [" ".join(line.split()) for line in (value or "").splitlines()]
-    kept: list[str] = []
-    for line in lines:
-        if not line and (not kept or not kept[-1]):
-            continue
-        kept.append(line)
-    while kept and not kept[-1]:
-        kept.pop()
-    out = "\n".join(kept)
-    if not out:
-        raise ValueError(f"{label} is required")
+    """A message body / resolution: prose, so its lines are content.
+
+    The rule itself lives in ``deskd.text`` because the orchestration store
+    needs the identical one for task details and notification bodies, and two
+    copies of "how text is stored" is precisely the drift this fixes.
+    """
+    out = clean_prose(value, label)
+    assert out is not None      # required=True never returns None
     return out
 
 
