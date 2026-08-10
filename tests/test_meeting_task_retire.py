@@ -68,11 +68,33 @@ class TestOwnRowsOnly:
 
     def test_a_ref_with_a_message_suffix_is_also_left_alone(self, desk):
         """One of the four was `<thread>:473` — a meeting id plus the message
-        that prompted the task, which resolves to no meeting at all."""
+        that prompted the task.
+
+        `task_add` now reduces that spelling to the thread id, so the ref this
+        case is named for no longer reaches the ledger by this route. Both
+        facts are asserted rather than one quietly replacing the other: the
+        normalization happened, AND ownership — not resolvability — is still
+        what keeps an agent's own work off the retire pass.
+        """
         thread_id = _live_meeting()
         tid = orch.task_add("engineer: fix the notification timing",
                             assignee_role="beta", source_kind="meeting",
                             source_ref=f"{thread_id}:473", created_by="alpha")
+        assert _task(tid)["source_ref"] == thread_id
+        _close(thread_id)
+        _sync()
+        assert _task(tid)["status"] == "pending"
+
+    def test_a_ref_that_still_resolves_to_nothing_is_left_alone(self, desk):
+        """Normalization is not a promise that every ref resolves. `esc67` was
+        typed on this desk too, and rows written before this change keep
+        whatever they already carry. The fail-open branch has to hold for
+        those, so it needs a case that actually reaches it."""
+        thread_id = _live_meeting()
+        tid = orch.task_add("chase the escalation", assignee_role="beta",
+                            source_kind="meeting", source_ref="esc67",
+                            created_by="alpha")
+        assert _task(tid)["source_ref"] == "esc67"
         _close(thread_id)
         _sync()
         assert _task(tid)["status"] == "pending"
