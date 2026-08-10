@@ -484,6 +484,21 @@ _WAKE_HOOKS_DDL = """
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing DB up to the current schema. Idempotent."""
+    # agent_inbox_reads first shipped keyed on a timestamp and settled on an id
+    # watermark instead. CREATE TABLE IF NOT EXISTS is silent about a table that
+    # already exists with the older shape, so only a database that had already
+    # run the first version sees this — every test builds a fresh one and is
+    # green either way. Found by exercising the live desk rather than the suite.
+    reads = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(agent_inbox_reads)")}
+    if reads and "last_id" not in reads:
+        # No backfill worth inventing: the column means "the highest inbox id
+        # this role had already seen", and the old row cannot say. 0 is the
+        # honest value — it claims nothing was seen, so the worst case is one
+        # extra wake, never a notice acked that nobody read.
+        conn.execute(
+            "ALTER TABLE agent_inbox_reads ADD COLUMN last_id INTEGER NOT NULL "
+            "DEFAULT 0")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_sessions)")}
     if "session_day" not in cols:
         conn.execute("ALTER TABLE agent_sessions ADD COLUMN session_day TEXT")

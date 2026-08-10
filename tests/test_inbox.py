@@ -198,3 +198,31 @@ def test_a_read_by_one_role_does_not_settle_anothers_queue(desk):
 
     assert o.inbox_ack("beta") == 0
     assert len(o.inbox_pending("beta")) == 1
+
+
+def test_an_older_reads_table_is_migrated_rather_than_ignored(tmp_path):
+    """CREATE TABLE IF NOT EXISTS says nothing about a table that already
+    exists in an older shape, and every other test here builds a fresh
+    database — so the suite was green while the live desk raised
+    'no column named last_id' on the first call. A migration is only tested by
+    starting from the old shape.
+    """
+    import sqlite3
+    from deskd.orchestration import store
+
+    db = tmp_path / "old.db"
+    raw = sqlite3.connect(db)
+    raw.execute("CREATE TABLE agent_inbox_reads (role TEXT PRIMARY KEY, "
+                "listed_at TEXT NOT NULL)")
+    raw.execute("INSERT INTO agent_inbox_reads VALUES ('alpha', '2026-01-01T00:00:00+00:00')")
+    raw.commit()
+    raw.close()
+
+    with store.connect(db, write=True) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_inbox_reads)")}
+        assert "last_id" in cols
+        row = conn.execute(
+            "SELECT last_id FROM agent_inbox_reads WHERE role='alpha'").fetchone()
+        assert row["last_id"] == 0, (
+            "the old row cannot say what had been seen; 0 claims nothing was, "
+            "which costs an extra wake and never acks an unread notice")
