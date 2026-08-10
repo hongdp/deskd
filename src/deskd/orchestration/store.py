@@ -193,6 +193,29 @@ ON agent_inbox(target_role, dedup_key) WHERE dedup_key IS NOT NULL AND acked_at 
 CREATE INDEX IF NOT EXISTS idx_inbox_open
 ON agent_inbox(target_role, acked_at, delivered_at);
 
+-- When a role last READ its own queue, which is not the same event as an item
+-- being delivered to it. A blanket ack must not swallow something that arrived
+-- after the agent looked, and this is what makes that decidable without
+-- stamping the items themselves: an item enqueued at or before this instant
+-- was on screen when the role looked, so acking it is honest, while anything
+-- newer stays queued and keeps its place on the wake path.
+--
+-- Recording the looking HERE rather than on the item is the point. Marking
+-- items delivered to record a read also takes them off the wake path, so a
+-- session that dies before acking silences exactly the notices it had just
+-- been shown.
+-- last_id, not a timestamp: ids are monotonic, so "already there when the role
+-- looked" is exact. Timestamps here are stored to whole seconds, which makes an
+-- item enqueued in the same second as the read undecidable — and guessing wrong
+-- in that second silently acks a notice nobody read, which is the failure this
+-- table exists to prevent. listed_at is kept for reading the ledger, never for
+-- the decision.
+CREATE TABLE IF NOT EXISTS agent_inbox_reads (
+    role                  TEXT PRIMARY KEY,
+    last_id               INTEGER NOT NULL,
+    listed_at             TEXT NOT NULL
+);
+
 -- Agent-registered wake hooks: the self-service API through which an agent asks
 -- the orchestrator to wake it later — a one-shot timer ('at'), a recurring timer
 -- ('interval'), a calendar schedule ('cron'), or a custom watcher function

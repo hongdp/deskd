@@ -47,7 +47,8 @@ from .hooks import (  # noqa: F401
 from .inbox import (  # noqa: F401
     _INBOX_RANK, _inbox_insert, _inbox_sort_key, _inbox_view,
     _roles_with_capability, _route_role, _route_unroutable, inbox_ack,
-    inbox_enqueue, inbox_mark_delivered, inbox_pending, inbox_route,
+    inbox_enqueue, inbox_mark_delivered, inbox_note_listed,
+    inbox_pending, inbox_route,
     unroutable_list,
 )
 from .presence import (  # noqa: F401

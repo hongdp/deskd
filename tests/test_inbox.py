@@ -144,3 +144,57 @@ def test_inbox_ack_is_idempotent(desk):
     with o.connect() as c:
         assert scalar(c, "SELECT acked_at FROM agent_inbox WHERE id=?",
                       (item,)) == stamped
+
+
+# --- reading a queue is not delivering it ------------------------------------
+# `desk-inbox list` has to make a following `ack` work, or an agent that reads
+# a notice and acks in the same breath gets {"acked": 0} and cannot tell that
+# from "nothing was waiting". Marking the listed items delivered achieves that
+# and costs too much: delivery is what takes an item off the wake path, so a
+# session that dies before acking silences exactly what it was just shown.
+
+def test_noting_a_read_settles_what_was_already_queued(desk):
+    o.inbox_enqueue("alpha", "system", "was on screen")
+    o.inbox_note_listed("alpha")
+
+    assert o.inbox_ack("alpha") == 1
+    assert o.inbox_pending("alpha") == []
+
+
+def test_noting_a_read_leaves_the_items_on_the_wake_path(desk):
+    """The whole reason for recording the read against the role instead of the
+    items: an unacked notice must still be able to wake somebody."""
+    o.inbox_enqueue("alpha", "system", "still owed")
+    o.inbox_note_listed("alpha")
+
+    (item,) = o.inbox_pending("alpha")
+    assert item["delivered_at"] is None, (
+        "listing must not deliver — a delivered item stops raising wakes, so a "
+        "session that dies before acking would silence it for good")
+
+
+def test_an_item_that_arrived_after_the_read_survives_a_blanket_ack(desk):
+    """The protection that was there before and must not be traded away."""
+    o.inbox_enqueue("alpha", "system", "seen")
+    o.inbox_note_listed("alpha")
+    o.inbox_enqueue("alpha", "system", "arrived afterwards")
+
+    assert o.inbox_ack("alpha") == 1
+    assert [i["title"] for i in o.inbox_pending("alpha")] == ["arrived afterwards"]
+
+
+def test_delivery_still_settles_on_its_own(desk):
+    """A role that never listed anything is unaffected: the in-session hook
+    delivers, and delivered items ack exactly as they always did."""
+    o.inbox_enqueue("alpha", "system", "hook delivered this")
+    o.inbox_mark_delivered([i["id"] for i in o.inbox_pending("alpha")])
+
+    assert o.inbox_ack("alpha") == 1
+
+
+def test_a_read_by_one_role_does_not_settle_anothers_queue(desk):
+    o.inbox_enqueue("beta", "system", "beta's own")
+    o.inbox_note_listed("alpha")
+
+    assert o.inbox_ack("beta") == 0
+    assert len(o.inbox_pending("beta")) == 1
