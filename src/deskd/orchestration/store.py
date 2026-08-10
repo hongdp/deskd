@@ -281,6 +281,33 @@ CREATE TABLE IF NOT EXISTS unroutable_demands (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unroutable_dedup
 ON unroutable_demands(require_capability, dedup_key)
 WHERE dedup_key IS NOT NULL AND routed_at IS NULL;
+
+-- What a headless turn SAID while it worked: the narration between tool calls,
+-- which otherwise goes to a terminal nobody is attached to. Layer 1
+-- (agent_sessions.last_tool) answers "on what, right now"; this answers "and
+-- what did it say about it". Append-only, trimmed to a ring per session.
+--
+-- `kind='thinking'` rows carry an EMPTY text on purpose and must stay that way.
+-- Measured against the real CLI on 2026-08-09: the harness emits the STRUCTURE
+-- of thinking — a block, five deltas, a 2880-character signature — with every
+-- payload redacted to ''. So the desk can honestly show THAT a session is
+-- thinking and for how long, and can never show what. Populating this by
+-- summarising something else would be inventing a record, not fixing a gap.
+CREATE TABLE IF NOT EXISTS session_feed (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    role       TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    -- Per session, not global: a reader can say "I have everything through 41"
+    -- without holding a cursor into a shared sequence, and trimming the ring
+    -- never renumbers what survives.
+    seq        INTEGER NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN ('narration','thinking','note')),
+    text       TEXT NOT NULL DEFAULT '',
+    at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_feed_tail
+ON session_feed(session_id, seq);
 """
 
 
