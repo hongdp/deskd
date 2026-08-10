@@ -16,7 +16,8 @@ from . import store
 from .escalations import _queue_escalation, dispatch_escalation
 from .obligations import _discharge_obligations
 from .store import (BROADCAST, MAX_WAIT_SECONDS, UPDATE_KINDS, _active_roles,
-                    _agent_role, _attendee, _clean, _event, _has_supervisor,
+                    _agent_role, _attendee, _clean, _clean_prose, _event,
+                    _has_supervisor,
                     _meeting, _meeting_projection, _meeting_roles, _mode,
                     _rearm_agent_wakes, _supervisor_claim, _visible_message_sql,
                     connect)
@@ -239,7 +240,7 @@ def _send_update(conn: sqlite3.Connection, thread_id: str, role: str, body: str,
     thread = mailbox._refresh_thread(conn, thread_id)
     message_id = mailbox._insert_message(
         conn, thread, sender=role, recipient=recipient, kind=kind,
-        body=_clean(body, "message"), reply_to=reply_to,
+        body=_clean_prose(body, "message"), reply_to=reply_to,
         allow_authenticated_supervisor=(role == supervisor),
         # An agent replying to the supervisor addresses a human who is sitting
         # in this meeting; it never speaks as one. Gated on actual attendance so

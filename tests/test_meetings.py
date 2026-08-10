@@ -2302,3 +2302,60 @@ def test_closing_a_meeting_retires_the_engines_notes_but_not_the_questions(desk)
     assert rows["engine"]["resolved_by"] == "engine"
     assert rows["agent"]["resolved_at"] is None, (
         "a question survives the meeting it was raised in")
+
+
+# --- prose survives the store ------------------------------------------------
+# Agents write paragraphs, lists, and tables, and the console renders that
+# structure. Flattening bodies at ingest destroyed it before any renderer
+# could see it, so the fix has to be measured HERE, at the write path.
+
+def test_a_message_body_keeps_its_line_structure(desk):
+    body = ("The claim  comes first.\n"
+            "\n"
+            "- evidence   one\n"
+            "- evidence two\n"
+            "\n"
+            "| a | b |\n"
+            "| 1 | 2 |")
+    thread_id = _start("prose", ["alpha", "beta"])
+    meetings.send_update(thread_id, role="alpha", kind="evidence", body=body)
+    with _db() as conn:
+        stored = conn.execute(
+            "SELECT body FROM mailbox_messages WHERE thread_id=?"
+            " ORDER BY id DESC LIMIT 1", (thread_id,)).fetchone()["body"]
+    assert stored == ("The claim comes first.\n"
+                      "\n"
+                      "- evidence one\n"
+                      "- evidence two\n"
+                      "\n"
+                      "| a | b |\n"
+                      "| 1 | 2 |"), (
+        "line structure must survive ingest; only horizontal runs collapse")
+
+
+def test_a_resolution_keeps_its_paragraphs_into_the_stop_reason(desk):
+    """The closed meeting's stop reason IS the resolution the attendees agreed
+    to — often several paragraphs. It is the one field the console shows first
+    about a finished meeting, so it must still be prose when it gets there."""
+    thread_id = _start("outcome", ["alpha", "beta"])
+    meetings.propose_end(
+        thread_id, role="alpha",
+        resolution="Decided:  ship it.\n\nFollow-ups:\n- raise the floor\n- watch the canary")
+    assert meetings.confirm_end(thread_id, role="beta")["closed"] is True
+    assert _thread_row(thread_id)["stop_reason"] == (
+        "Decided: ship it.\n\nFollow-ups:\n- raise the floor\n- watch the canary")
+
+
+def test_clean_prose_normalizes_without_destroying_lines():
+    assert meetings.store._clean_prose("\n\n a  b \n\n\n c \n\n", "x") == "a b\n\nc"
+    with pytest.raises(ValueError, match="message is required"):
+        meetings.store._clean_prose("  \n\n  ", "message")
+
+
+def test_one_line_fields_still_flatten(desk):
+    """The prose cleaner is scoped to body and resolution. Everything else —
+    agenda, roles, reasons — keeps the single-line guarantee the list views
+    and log lines rely on."""
+    status = meetings.call_meeting(agenda="two\nline agenda",
+                                   called_by="alpha", attendees=["alpha", "beta"])
+    assert status["meeting"]["agenda"] == "two line agenda"

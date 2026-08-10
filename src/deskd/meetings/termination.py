@@ -14,9 +14,9 @@ from . import store
 from .escalations import (_queue_escalation, _resolve_engine_escalations,
                           dispatch_escalation)
 from .obligations import _waive_pending_obligations
-from .store import (_active_roles, _agent_role, _attendee, _clean, _event,
-                    _has_supervisor, _known_roles, _meeting, _supervisor_claim,
-                    connect)
+from .store import (_active_roles, _agent_role, _attendee, _clean,
+                    _clean_prose, _event, _has_supervisor, _known_roles,
+                    _meeting, _supervisor_claim, connect)
 
 # --- termination handshake --------------------------------------------------
 
@@ -82,7 +82,7 @@ def _propose_end(conn: sqlite3.Connection, thread_id: str, role: str, resolution
         """INSERT INTO meeting_terminations
            (thread_id,proposer,resolution,status,auth_nonce,created_at)
            VALUES (?,?,?,'pending',?,?)""",
-        (thread_id, role, _clean(resolution, "resolution"), auth_nonce, now),
+        (thread_id, role, _clean_prose(resolution, "resolution"), auth_nonce, now),
     )
     proposal_id = int(cursor.lastrowid)
     # The proposer implicitly confirms its own proposal; requiring it to vote

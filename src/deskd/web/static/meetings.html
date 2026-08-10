@@ -216,13 +216,20 @@ function renderOne() {
     ? '<span class="chip bad">message thread ' + esc(S.human(m.thread_status))
       + " · lifecycle " + esc(S.human(m.state)) + "</span>"
     : "";
-  var stopReason = m.thread_status !== "open" && m.thread_stop_reason
-    ? '<span class="chip warn">' + esc(m.thread_stop_reason) + "</span>"
+  // A normally closed meeting's stop reason is its outcome — often the full
+  // resolution — so it renders as prose, not as a warning chip stretched
+  // around several hundred words. The warn accent survives only for threads
+  // that stopped while the meeting itself was still open (idle timeout,
+  // budget exhausted, escalation).
+  var stopNote = m.thread_status !== "open" && m.thread_stop_reason
+    ? '<div class="stop-note' + (m.state === "closed" ? "" : " warn")
+      + '"><div class="msg-body">' + S.md(m.thread_stop_reason) + "</div></div>"
     : "";
-  S.setHTML($("#status"), stateChip(state) + stateDetail + stopReason
+  S.setHTML($("#status"), stateChip(state) + stateDetail
     + '<span class="chip">' + esc(s.mode) + "</span>"
     + '<span class="chip">' + m.messages_remaining + " messages left</span>"
-    + '<span class="chip">' + m.wait_timeout_seconds + "s SLA</span>");
+    + '<span class="chip">' + m.wait_timeout_seconds + "s SLA</span>"
+    + stopNote);
   renderTermination(s);
   S.setHTML($("#people"), s.attendees.map(function (a) {
     var st = a.stopped_at ? "left" : a.checked_in_at ? "present" : "invited";

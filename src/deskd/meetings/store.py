@@ -212,6 +212,26 @@ def _clean(value: str, label: str) -> str:
     return out
 
 
+def _clean_prose(value: str, label: str) -> str:
+    # Message bodies and resolutions are prose: agents write paragraphs,
+    # lists, and tables, and the console renders that structure. Flattening
+    # them through _clean destroyed it at ingest, so no renderer downstream
+    # could ever get it back. Line structure survives here; only horizontal
+    # whitespace inside a line is normalized, and blank runs collapse to one.
+    lines = [" ".join(line.split()) for line in (value or "").splitlines()]
+    kept: list[str] = []
+    for line in lines:
+        if not line and (not kept or not kept[-1]):
+            continue
+        kept.append(line)
+    while kept and not kept[-1]:
+        kept.pop()
+    out = "\n".join(kept)
+    if not out:
+        raise ValueError(f"{label} is required")
+    return out
+
+
 @contextmanager
 def connect(db_path: Path | str | None = None, *,
             write: bool = False) -> Iterator[sqlite3.Connection]:
