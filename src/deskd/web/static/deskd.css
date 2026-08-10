@@ -346,6 +346,12 @@ input[type="checkbox"] { width: auto; }
 .msg-body table { margin: 6px 0 10px; font-size: 12px; }
 .msg-body code { background: var(--bg-2, rgba(128,128,128,.15)); padding: 0 4px; border-radius: 4px; font-size: 12px; }
 .msg-body b { font-weight: 650; }
+/* A stopped thread's reason, shown under the status chips. For a normally
+   closed meeting this is the resolution — an outcome, so it reads as neutral
+   prose. The warn accent marks only threads that stopped mid-meeting. */
+.chips .stop-note { flex-basis: 100%; }
+.stop-note { border-left: 3px solid var(--line); background: var(--surface-2); border-radius: 3px 8px 8px 3px; padding: 8px 11px; margin-top: 4px; }
+.stop-note.warn { border-left-color: var(--warn); }
 .receipts { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 7px; }
 .rpill { font-size: 10px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--text-2); cursor: help; }
 .rpill.ok { color: var(--ok); border-color: var(--ok); }

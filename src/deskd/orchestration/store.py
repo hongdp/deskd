@@ -17,6 +17,9 @@ from typing import Any, Literal, overload
 
 from .. import mailbox, meetings
 from ..config import CONFIG
+# Prose fields keep their line structure; see deskd.text for which is which.
+# Re-exported under the module-private name every caller here already uses.
+from ..text import clean_prose as _clean_prose
 
 SESSION_STATES = {
     "booting", "working", "idle_standby", "in_meeting", "stopping", "dead",
