@@ -91,6 +91,68 @@ def tool_trace(role: str, text: str, *,
             (text[:200], _iso(), role))
 
 
+#: Per-session ring size. A long turn keeps its most recent lines; the bound is
+#: per session rather than global so a chatty session cannot evict a quiet
+#: one's history.
+FEED_MAX_ROWS_PER_SESSION = 500
+
+#: The kinds a feed row may carry. `thinking` rows are markers with a duration,
+#: never content — the harness redacts the content and we record that honestly
+#: rather than inventing a summary. See docs/session-feed.md.
+FEED_KINDS = ("narration", "thinking", "note")
+
+
+def feed_append(role: str, session_id: str, kind: str, text: str = "", *,
+                db_path: Path | str | None = None) -> int | None:
+    """Append one line of a session's narration. Returns its per-session seq.
+
+    Best-effort by the same rule as :func:`tool_trace`: this describes a
+    running session and must never be the reason one dies, so every failure is
+    swallowed and returns None. That is affordable ONLY because the feed is
+    never the system of record — no decision reads it, and the report, journal
+    and task ledger stay authoritative. A silently short feed is a cosmetic
+    loss; a driver that crashes mid-turn on a telemetry write is not.
+    """
+    if kind not in FEED_KINDS:
+        return None
+    try:
+        with connect(db_path, write=True) as conn:
+            row = conn.execute(
+                "SELECT MAX(seq) AS s FROM session_feed WHERE session_id=?",
+                (session_id,)).fetchone()
+            seq = (row["s"] or 0) + 1
+            conn.execute(
+                "INSERT INTO session_feed(role, session_id, seq, kind, text, at)"
+                " VALUES (?,?,?,?,?,?)",
+                (role, session_id, seq, kind, text, _iso()))
+            # Trim by id, not by seq: id is the true insertion order and never
+            # collides, so a concurrent writer cannot make this delete a row it
+            # did not mean to.
+            conn.execute(
+                "DELETE FROM session_feed WHERE session_id=? AND id NOT IN ("
+                "  SELECT id FROM session_feed WHERE session_id=?"
+                "  ORDER BY id DESC LIMIT ?)",
+                (session_id, session_id, FEED_MAX_ROWS_PER_SESSION))
+            return seq
+    except Exception:
+        return None
+
+
+def session_feed(session_id: str, *, after_seq: int = 0, limit: int = 100,
+                 db_path: Path | str | None = None) -> list[dict]:
+    """The feed tail for one session, oldest first.
+
+    `after_seq` is how a console tails without re-reading: pass the highest seq
+    you have and you get only what is new.
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT seq, kind, text, at FROM session_feed"
+            " WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?",
+            (session_id, after_seq, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def end_session(role: str, *, db_path: Path | str | None = None) -> None:
     now = _iso()
     with connect(db_path, write=True) as conn:

@@ -9,10 +9,16 @@ from pathlib import Path
 
 from ..config import CONFIG
 from .store import (TASK_OPEN_STATUSES, TASK_PRIORITIES, TASK_STATUSES,
-                    _agent_role, _clean, _iso, _log_event,
+                    _agent_role, _clean, _clean_prose, _iso, _log_event,
                     _normalize_due, _task_sources, connect)
 
 _PRIO_RANK = {"urgent": 0, "normal": 1, "low": 2}
+
+#: `created_by` on the close-the-meeting tasks the orchestrator projects, and
+#: the marker that tells its own rows apart from an agent's. Nothing else may
+#: write it: this string is what stops the retire pass from reaching work it
+#: did not create.
+_CLOSE_TASK_AUTHOR = "orchestrator"
 
 
 def _task_sort_key(t: dict, now_iso: str) -> tuple[int, int, str, int, int, str, str]:
@@ -61,7 +67,7 @@ def task_add(title: str, *, assignee_role: str, detail: str | None = None,
                    (title, detail, assignee_role, status, priority, source_kind,
                     source_ref, due_at, created_by, created_at, updated_at)
                VALUES (?,?,?,'pending',?,?,?,?,?,?,?)""",
-            (title, _clean(detail, "detail", required=False), assignee_role,
+            (title, _clean_prose(detail, "detail", required=False), assignee_role,
              priority, source_kind, source_ref, due_at, created_by, now, now),
         )
         task_id = cur.lastrowid
@@ -160,6 +166,17 @@ def task_update(task_id: int, *, actor: str | None = None,
         raise ValueError(f"invalid priority: {updates['priority']}")
     if "due_at" in updates:
         updates["due_at"] = _normalize_due(updates["due_at"])
+    # Text arrived here raw while task_add cleaned the same columns, so a
+    # field's shape depended on which verb wrote it: a detail written at
+    # creation lost its paragraphs, the identical text written by a later
+    # --detail kept them, and two rows of one list disagreed about whether a
+    # newline was even possible. Both paths now apply the same rule per field:
+    # prose keeps its lines, a title stays inline.
+    for field, cleaner in (("title", _clean), ("detail", _clean_prose),
+                           ("result_note", _clean_prose)):
+        if field in updates:
+            updates[field] = cleaner(updates[field], field,
+                                     required=(field == "title"))
     now = _iso()
     with connect(db_path, write=True) as conn:
         if "assignee_role" in updates:
@@ -209,6 +226,18 @@ def sync_meeting_close_tasks(conn: sqlite3.Connection) -> int:
 
     Idempotent and self-healing, like sync_delivery: the meeting rows are the
     truth and this only mirrors them. Requires a write transaction.
+
+    **This projection owns only the rows it wrote.** `source_kind='meeting'`
+    means "a meeting is where this work came from", which is what `--ref` is
+    documented to accept; it does not mean "this task IS closing that meeting".
+    Reading the two as the same thing let the retire pass below mark an
+    agent's own meeting-sourced work `done` the moment the meeting closed —
+    measured four times, within a minute each, and one of them was a live
+    order-execution task. A destroyed task is the worst possible failure here:
+    the queue is the only thing that wakes anyone, so the work does not go
+    stalled or overdue, it simply stops existing, and the note it leaves reads
+    like an ordinary completion. Hence `created_by=_CLOSE_TASK_AUTHOR` on
+    every query below — the marker the generator itself stamps.
     """
     now = _iso()
     supervisor = CONFIG.supervisor_role
@@ -238,18 +267,20 @@ def sync_meeting_close_tasks(conn: sqlite3.Connection) -> int:
         for role in info["agents"]:
             row = conn.execute(
                 """SELECT id, status, priority FROM agent_tasks
-                   WHERE source_kind='meeting' AND source_ref=? AND assignee_role=?""",
-                (thread_id, role)).fetchone()
+                   WHERE source_kind='meeting' AND source_ref=? AND assignee_role=?
+                     AND created_by=?""",
+                (thread_id, role, _CLOSE_TASK_AUTHOR)).fetchone()
             if row is None:
                 conn.execute(
                     """INSERT INTO agent_tasks
                        (title,detail,assignee_role,status,priority,source_kind,
                         source_ref,created_by,created_at,updated_at)
-                       VALUES (?,?,?,'pending',?,'meeting',?,'orchestrator',?,?)""",
+                       VALUES (?,?,?,'pending',?,'meeting',?,?,?,?)""",
                     (f"close the meeting: {info['agenda']}"[:200],
                      "Agree an end with the other attendees (propose-end / "
                      "confirm-end). Leaving it open is the work not finished.",
-                     role, info["priority"], thread_id, now, now))
+                     role, info["priority"], thread_id, _CLOSE_TASK_AUTHOR,
+                     now, now))
                 touched += 1
             elif row["status"] == "pending" and row["priority"] != info["priority"]:
                 conn.execute(
@@ -260,15 +291,35 @@ def sync_meeting_close_tasks(conn: sqlite3.Connection) -> int:
     # Retire what is no longer owed: the meeting closed, or this role left it.
     # Without this the queue fills with closes nobody can perform, and any that
     # had gone urgent would climb the ladder over a finished conversation.
+    #
+    # Scoped to this projection's OWN rows. It used to retire anything with
+    # source_kind='meeting', which is also how an agent cites the meeting a
+    # piece of work came from, so filing a research task or an order-execution
+    # task against a meeting meant losing it when that meeting closed.
+    known_threads = {r["thread_id"] for r in
+                     conn.execute("SELECT thread_id FROM meetings")}
     for row in conn.execute(
             "SELECT id, source_ref, assignee_role FROM agent_tasks "
-            "WHERE source_kind='meeting' AND status='pending'").fetchall():
+            "WHERE source_kind='meeting' AND status='pending' AND created_by=?",
+            (_CLOSE_TASK_AUTHOR,)).fetchall():
+        # Fail open on a ref that resolves to no meeting at all. "I cannot tell
+        # whether this is still owed" is not "it is finished", and the cost of
+        # the two mistakes is not symmetric: a stale close task is visible and
+        # dischargeable, a retired one is gone.
+        if row["source_ref"] not in known_threads:
+            continue
         info = live.get(row["source_ref"])
         if info is None or row["assignee_role"] not in info["agents"]:
             conn.execute(
                 """UPDATE agent_tasks SET status='done',updated_at=?,
-                   result_note='meeting is no longer open to this role' WHERE id=?""",
-                (now, row["id"]))
+                   result_note=? WHERE id=?""",
+                (now,
+                 # Say who closed it and why. The old note read like something
+                 # an agent had concluded, which is what let four destroyed
+                 # tasks look like ordinary completions.
+                 "closed automatically by the orchestrator: the meeting this "
+                 "task existed to close is no longer open to this role",
+                 row["id"]))
             touched += 1
     return touched
 

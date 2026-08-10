@@ -6,6 +6,7 @@ budget/consensus flip, supervisor visibility).
 from __future__ import annotations
 
 import datetime as dt
+import re
 import sqlite3
 from pathlib import Path
 from typing import Sequence
@@ -16,11 +17,65 @@ from . import store
 from .escalations import _queue_escalation, dispatch_escalation
 from .obligations import _discharge_obligations
 from .store import (BROADCAST, MAX_WAIT_SECONDS, UPDATE_KINDS, _active_roles,
-                    _agent_role, _attendee, _clean, _event, _has_supervisor,
+                    _agent_role, _attendee, _clean, _clean_prose, _event,
+                    _has_supervisor,
                     _meeting, _meeting_projection, _meeting_roles, _mode,
                     _rearm_agent_wakes, _supervisor_claim, _visible_message_sql,
                     connect)
 from .sweep import _sweep_timeouts
+
+# --- message length hint ----------------------------------------------------
+# A meeting message is read twice: by the other seat under a message budget,
+# and by a human on a console. Both readings reward the same thing — the new
+# claim, said once — but nothing ever told a sender when a message had grown
+# past that, and a protocol rule only binds an agent that re-reads the
+# protocol. This says it at the moment of speaking, in the send response.
+#
+# Advisory ONLY. It never rejects, never truncates: a message that genuinely
+# needs the length must be able to be sent, and an engine that refuses one
+# just teaches senders to split it into three.
+#
+# Set by the supervisor 2026-08-09 against measured traffic, NOT guessed: on
+# the last 445 agent messages the median was 256 CJK characters, and these
+# thresholds hint 55% of them. That rate is deliberate and is a claim about
+# the desk, not a mis-tuning — the reading is "more than half of what you
+# write is longer than it needs to be". Revisit against the same measurement,
+# not against how often it feels like it fires: if the rate has not fallen
+# after a few weeks the hint is being ignored, and the answer is a different
+# mechanism rather than a quieter number.
+MESSAGE_HINT_WORDS = 150
+MESSAGE_HINT_CJK_CHARS = 250
+_FENCE = re.compile(r"```.*?```", re.S)
+_TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$", re.M)
+_CJK = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
+
+
+def _prose_size(body: str) -> tuple[int, int]:
+    """(latin words, CJK characters) in the PROSE of a message.
+
+    Evidence is exempt, and that exemption is what keeps the hint worth
+    reading: a table of measurements is long because it is evidence, and a
+    hint that fires on every well-supported message is one senders learn to
+    scroll past. Fenced code and table rows are removed before counting.
+    """
+    prose = _TABLE_ROW.sub("", _FENCE.sub("", body or ""))
+    cjk = len(_CJK.findall(prose))
+    words = len([w for w in _CJK.sub(" ", prose).split() if any(c.isalnum() for c in w)])
+    return words, cjk
+
+
+def _length_hint(body: str) -> str | None:
+    words, cjk = _prose_size(body)
+    over = ((cjk > MESSAGE_HINT_CJK_CHARS and f"{cjk} CJK characters")
+            or (words > MESSAGE_HINT_WORDS and f"{words} words"))
+    if not over:
+        return None
+    return (f"this message runs to {over} of prose (tables and code excluded). "
+            f"Long is allowed when it is all new — but check: are you restating "
+            f"the thread, or making more than one point? Cite an earlier message "
+            f"by id plus a one-line gist instead of re-arguing it, and move a "
+            f"second point to your journal or task detail with a pointer here")
+
 
 # --- reading ----------------------------------------------------------------
 
@@ -239,7 +294,7 @@ def _send_update(conn: sqlite3.Connection, thread_id: str, role: str, body: str,
     thread = mailbox._refresh_thread(conn, thread_id)
     message_id = mailbox._insert_message(
         conn, thread, sender=role, recipient=recipient, kind=kind,
-        body=_clean(body, "message"), reply_to=reply_to,
+        body=_clean_prose(body, "message"), reply_to=reply_to,
         allow_authenticated_supervisor=(role == supervisor),
         # An agent replying to the supervisor addresses a human who is sitting
         # in this meeting; it never speaks as one. Gated on actual attendance so
@@ -392,6 +447,15 @@ def send_update(thread_id: str, *, role: str, body: str, kind: str = "evidence",
             f"you still owe replies to {ids} in this thread and THIS message "
             f"settled none of them — answer with --reply-to <id> (or "
             f"--resolves), or the ladder will keep climbing toward a human")
+    # Deliberately its own key, not `warning`: the obligation warning above is
+    # a ledger fact with a consequence (the ladder climbs toward a human), this
+    # is advice about style. Merging them would either overwrite one or dress
+    # the softer one in the harder one's urgency. `send_update` is agent-only
+    # — _agent_role rejects the supervisor — so this never nags the human
+    # typing into the console.
+    hint = _length_hint(body)
+    if hint:
+        out["style_hint"] = hint
     if status["meeting"]["state"] in {"active", "consensus"}:
         out["next"] = (
             f"meeting still open: run `{PROJECT_NAME} meeting updates ... "

@@ -68,6 +68,13 @@ class Provider:
     name: str = ""
     models: tuple[str, ...] = ()
 
+    #: Does ``command()`` put newline-delimited JSON on stdout, in the Claude
+    #: Code stream shape? False by default, because most CLIs do not, and
+    #: parsing arbitrary output as if it were a known protocol invents
+    #: structure that is not there. Setting it True is a promise the driver
+    #: relies on — see docs/session-feed.md.
+    streams: bool = False
+
     def command(self, spec: LaunchSpec) -> list[str]:
         raise NotImplementedError
 
@@ -96,9 +103,26 @@ class ClaudeCodeProvider(Provider):
     thinking_budgets: dict = field(default_factory=lambda: {
         "low": 4096, "medium": 12288, "high": 24576, "max": 49152})
     name: str = "claude"
+    #: Off by default: turning it on changes the child's argv and therefore
+    #: what every existing consumer of that stdout sees, which is not a thing
+    #: to do behind a host's back. A host opts in with
+    #: ``ClaudeCodeProvider(stream=True)``.
+    stream: bool = False
+
+    @property
+    def streams(self) -> bool:            # type: ignore[override]
+        return self.stream
 
     def command(self, spec: LaunchSpec) -> list[str]:
         cmd = [self.binary, "-p", spec.prompt]
+        if self.stream:
+            # --verbose is required by the CLI alongside stream-json under -p;
+            # --include-partial-messages is what makes thinking observable as
+            # it happens rather than only once the message completes. The
+            # thinking payloads are empty either way (docs/session-feed.md) —
+            # what the deltas buy is the live "still thinking" signal.
+            cmd.extend(["--output-format", "stream-json", "--verbose",
+                        "--include-partial-messages"])
         model = spec.model or self.default_model
         if model:
             cmd.extend(["--model", model])

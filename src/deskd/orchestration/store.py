@@ -17,6 +17,9 @@ from typing import Any, Literal, overload
 
 from .. import mailbox, meetings
 from ..config import CONFIG
+# Prose fields keep their line structure; see deskd.text for which is which.
+# Re-exported under the module-private name every caller here already uses.
+from ..text import clean_prose as _clean_prose
 
 SESSION_STATES = {
     "booting", "working", "idle_standby", "in_meeting", "stopping", "dead",
@@ -190,6 +193,29 @@ ON agent_inbox(target_role, dedup_key) WHERE dedup_key IS NOT NULL AND acked_at 
 CREATE INDEX IF NOT EXISTS idx_inbox_open
 ON agent_inbox(target_role, acked_at, delivered_at);
 
+-- When a role last READ its own queue, which is not the same event as an item
+-- being delivered to it. A blanket ack must not swallow something that arrived
+-- after the agent looked, and this is what makes that decidable without
+-- stamping the items themselves: an item enqueued at or before this instant
+-- was on screen when the role looked, so acking it is honest, while anything
+-- newer stays queued and keeps its place on the wake path.
+--
+-- Recording the looking HERE rather than on the item is the point. Marking
+-- items delivered to record a read also takes them off the wake path, so a
+-- session that dies before acking silences exactly the notices it had just
+-- been shown.
+-- last_id, not a timestamp: ids are monotonic, so "already there when the role
+-- looked" is exact. Timestamps here are stored to whole seconds, which makes an
+-- item enqueued in the same second as the read undecidable — and guessing wrong
+-- in that second silently acks a notice nobody read, which is the failure this
+-- table exists to prevent. listed_at is kept for reading the ledger, never for
+-- the decision.
+CREATE TABLE IF NOT EXISTS agent_inbox_reads (
+    role                  TEXT PRIMARY KEY,
+    last_id               INTEGER NOT NULL,
+    listed_at             TEXT NOT NULL
+);
+
 -- Agent-registered wake hooks: the self-service API through which an agent asks
 -- the orchestrator to wake it later — a one-shot timer ('at'), a recurring timer
 -- ('interval'), a calendar schedule ('cron'), or a custom watcher function
@@ -241,7 +267,14 @@ CREATE TABLE IF NOT EXISTS wake_escalations (
                           CHECK (status IN ('queued','sent','failed')),
     details               TEXT,
     created_at            TEXT NOT NULL,
-    sent_at               TEXT
+    sent_at               TEXT,
+    -- `status` says whether the SEND worked. These say whether the thing it
+    -- paged about is still true. Different questions, so different columns: a
+    -- page that reached a person and was never retracted costs that person's
+    -- attention with no floor, because the ladder only ever pushes "you owe
+    -- this" and never "that one is settled".
+    resolved_at           TEXT,
+    resolved_reason       TEXT
 );
 
 -- Capability-addressed demands that NO enabled role can take. The wake ladder's
@@ -271,6 +304,33 @@ CREATE TABLE IF NOT EXISTS unroutable_demands (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unroutable_dedup
 ON unroutable_demands(require_capability, dedup_key)
 WHERE dedup_key IS NOT NULL AND routed_at IS NULL;
+
+-- What a headless turn SAID while it worked: the narration between tool calls,
+-- which otherwise goes to a terminal nobody is attached to. Layer 1
+-- (agent_sessions.last_tool) answers "on what, right now"; this answers "and
+-- what did it say about it". Append-only, trimmed to a ring per session.
+--
+-- `kind='thinking'` rows carry an EMPTY text on purpose and must stay that way.
+-- Measured against the real CLI on 2026-08-09: the harness emits the STRUCTURE
+-- of thinking — a block, five deltas, a 2880-character signature — with every
+-- payload redacted to ''. So the desk can honestly show THAT a session is
+-- thinking and for how long, and can never show what. Populating this by
+-- summarising something else would be inventing a record, not fixing a gap.
+CREATE TABLE IF NOT EXISTS session_feed (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    role       TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    -- Per session, not global: a reader can say "I have everything through 41"
+    -- without holding a cursor into a shared sequence, and trimming the ring
+    -- never renumbers what survives.
+    seq        INTEGER NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN ('narration','thinking','note')),
+    text       TEXT NOT NULL DEFAULT '',
+    at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_feed_tail
+ON session_feed(session_id, seq);
 """
 
 
@@ -424,6 +484,21 @@ _WAKE_HOOKS_DDL = """
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing DB up to the current schema. Idempotent."""
+    # agent_inbox_reads first shipped keyed on a timestamp and settled on an id
+    # watermark instead. CREATE TABLE IF NOT EXISTS is silent about a table that
+    # already exists with the older shape, so only a database that had already
+    # run the first version sees this — every test builds a fresh one and is
+    # green either way. Found by exercising the live desk rather than the suite.
+    reads = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(agent_inbox_reads)")}
+    if reads and "last_id" not in reads:
+        # No backfill worth inventing: the column means "the highest inbox id
+        # this role had already seen", and the old row cannot say. 0 is the
+        # honest value — it claims nothing was seen, so the worst case is one
+        # extra wake, never a notice acked that nobody read.
+        conn.execute(
+            "ALTER TABLE agent_inbox_reads ADD COLUMN last_id INTEGER NOT NULL "
+            "DEFAULT 0")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_sessions)")}
     if "session_day" not in cols:
         conn.execute("ALTER TABLE agent_sessions ADD COLUMN session_day TEXT")
@@ -442,6 +517,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # new work and its ladder position/SLA are inherited.
         conn.execute(
             "ALTER TABLE wake_attempts ADD COLUMN source_generation TEXT")
+    if "resolved_at" not in {r["name"] for r in conn.execute(
+            "PRAGMA table_info(wake_escalations)")}:
+        # A page that reached a person could not be taken back. `status` only
+        # ever answered "did the send work"; nothing answered "is the thing it
+        # was about still true". Two pages went out on 2026-08-09 and the
+        # demand settled six minutes later — both rows still read `sent`, so
+        # the only retraction available to the human was to go and query the
+        # database. Kept as separate columns rather than a new `status` value
+        # precisely because they are different questions.
+        conn.execute("ALTER TABLE wake_escalations ADD COLUMN resolved_at TEXT")
+        conn.execute(
+            "ALTER TABLE wake_escalations ADD COLUMN resolved_reason TEXT")
     # NOTE: only agent_* tables belong here. A migration for a lower layer's
     # table must live in that layer — `meetings.closed_at` was briefly added
     # here, which made it unreachable for a host that uses meetings without

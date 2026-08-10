@@ -36,6 +36,7 @@ import pytest
 from conftest import ROLES
 from deskd import mailbox, meetings
 from deskd.config import CONFIG
+from deskd.meetings import messaging
 
 ROLE_NAMES = tuple(r.name for r in ROLES)
 
@@ -2302,3 +2303,121 @@ def test_closing_a_meeting_retires_the_engines_notes_but_not_the_questions(desk)
     assert rows["engine"]["resolved_by"] == "engine"
     assert rows["agent"]["resolved_at"] is None, (
         "a question survives the meeting it was raised in")
+
+
+# --- prose survives the store ------------------------------------------------
+# Agents write paragraphs, lists, and tables, and the console renders that
+# structure. Flattening bodies at ingest destroyed it before any renderer
+# could see it, so the fix has to be measured HERE, at the write path.
+
+def test_a_message_body_keeps_its_line_structure(desk):
+    body = ("The claim  comes first.\n"
+            "\n"
+            "- evidence   one\n"
+            "- evidence two\n"
+            "\n"
+            "| a | b |\n"
+            "| 1 | 2 |")
+    thread_id = _start("prose", ["alpha", "beta"])
+    meetings.send_update(thread_id, role="alpha", kind="evidence", body=body)
+    with _db() as conn:
+        stored = conn.execute(
+            "SELECT body FROM mailbox_messages WHERE thread_id=?"
+            " ORDER BY id DESC LIMIT 1", (thread_id,)).fetchone()["body"]
+    assert stored == ("The claim comes first.\n"
+                      "\n"
+                      "- evidence one\n"
+                      "- evidence two\n"
+                      "\n"
+                      "| a | b |\n"
+                      "| 1 | 2 |"), (
+        "line structure must survive ingest; only horizontal runs collapse")
+
+
+def test_a_resolution_keeps_its_paragraphs_into_the_stop_reason(desk):
+    """The closed meeting's stop reason IS the resolution the attendees agreed
+    to — often several paragraphs. It is the one field the console shows first
+    about a finished meeting, so it must still be prose when it gets there."""
+    thread_id = _start("outcome", ["alpha", "beta"])
+    meetings.propose_end(
+        thread_id, role="alpha",
+        resolution="Decided:  ship it.\n\nFollow-ups:\n- raise the floor\n- watch the canary")
+    assert meetings.confirm_end(thread_id, role="beta")["closed"] is True
+    assert _thread_row(thread_id)["stop_reason"] == (
+        "Decided: ship it.\n\nFollow-ups:\n- raise the floor\n- watch the canary")
+
+
+def test_clean_prose_normalizes_without_destroying_lines():
+    assert meetings.store._clean_prose("\n\n a  b \n\n\n c \n\n", "x") == "a b\n\nc"
+    with pytest.raises(ValueError, match="message is required"):
+        meetings.store._clean_prose("  \n\n  ", "message")
+
+
+def test_one_line_fields_still_flatten(desk):
+    """The prose cleaner is scoped to body and resolution. Everything else —
+    agenda, roles, reasons — keeps the single-line guarantee the list views
+    and log lines rely on."""
+    status = meetings.call_meeting(agenda="two\nline agenda",
+                                   called_by="alpha", attendees=["alpha", "beta"])
+    assert status["meeting"]["agenda"] == "two line agenda"
+
+
+# --- the length hint --------------------------------------------------------
+# Advisory only. The value of a hint is that it fires when it should and stays
+# quiet otherwise; a hint that fires on well-supported messages is one senders
+# learn to scroll past, so the exemptions are part of the feature, not trim.
+
+def test_a_short_message_gets_no_hint(desk):
+    thread_id = _start("brevity", ["alpha", "beta"])
+    out = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                               body="The gate held; 3 of 31 rows survived it.")
+    assert "style_hint" not in out
+
+
+def test_a_long_message_is_hinted_but_still_sent(desk):
+    """Sized off the threshold rather than a literal: the supervisor tunes
+    these numbers against measured traffic, and a test that hardcodes today's
+    value turns the next retune into a false failure."""
+    over = messaging.MESSAGE_HINT_WORDS + 10
+    thread_id = _start("length", ["alpha", "beta"])
+    out = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                               body=" ".join(["word"] * over))
+    assert f"{over} words" in out["style_hint"]
+    assert out["message_id"], "the hint must never cost the message"
+    with _db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM mailbox_messages WHERE thread_id=?",
+            (thread_id,)).fetchone()["c"] == 1
+
+
+def test_a_long_message_of_chinese_prose_is_hinted_too(desk):
+    """Counting whitespace-separated words alone would never fire on CJK — the
+    desk's working language — so the seats this rule exists for would be the
+    ones it never reached."""
+    body = "复盘结论如下。" * (messaging.MESSAGE_HINT_CJK_CHARS // 6 + 5)
+    thread_id = _start("cjk", ["alpha", "beta"])
+    out = meetings.send_update(thread_id, role="alpha", kind="evidence", body=body)
+    assert "CJK characters" in out["style_hint"]
+
+
+def test_evidence_does_not_count_toward_the_hint(desk):
+    """A table is long because it is evidence. Charging a sender for it would
+    push them toward summarizing measurements in prose — the opposite of what
+    this desk wants."""
+    table = "\n".join(f"| row {i} | value {i} | note {i} |" for i in range(120))
+    thread_id = _start("evidence", ["alpha", "beta"])
+    out = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                               body="Six runs, one line each:\n" + table)
+    assert "style_hint" not in out
+
+
+def test_the_hint_never_displaces_the_obligation_warning(desk):
+    """The two say different things and carry different consequences: one is
+    advice, the other is a debt the escalation ladder acts on."""
+    thread_id = _start("both", ["alpha", "beta"])
+    asked = meetings.send_update(thread_id, role="beta", kind="question",
+                                 body="What is the number?")["message_id"]
+    out = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                               body=" ".join(["word"] * 200))
+    assert f"#{asked}" in out["warning"], "the debt must still be reported"
+    assert "style_hint" in out

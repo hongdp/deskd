@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from ..config import CONFIG
-from .store import (TASK_PRIORITIES, _agent_role, _clean, _iso,
+from .store import (TASK_PRIORITIES, _agent_role, _clean, _clean_prose, _iso,
                     _load_json, _log_event, connect)
 
 # --- unified agent inbox ----------------------------------------------------
@@ -33,7 +33,7 @@ def _inbox_insert(conn: sqlite3.Connection, target_role: str, source_kind: str,
                 dedup_key, enqueued_at, expires_at)
            VALUES (?,?,?,?,?,?,?,?,?)""",
         (target_role, source_kind, ref, priority, title,
-         _clean(body, "body", required=False), dedup_key, _iso(), expires_at),
+         _clean_prose(body, "body", required=False), dedup_key, _iso(), expires_at),
     )
     if cur.rowcount:
         _log_event(conn, source_kind, "inbox_enqueue", ref,
@@ -131,7 +131,7 @@ def inbox_route(require_capability: str, source_kind: str, title: str, *,
                     dedup_key, enqueued_at, expires_at)
                VALUES (?,?,?,?,?,?,?,?,?)""",
             (require_capability, source_kind, ref, priority, title,
-             _clean(body, "body", required=False), dedup_key, _iso(), expires_at))
+             _clean_prose(body, "body", required=False), dedup_key, _iso(), expires_at))
         if not cur.rowcount:
             return {"deduped": True, "unroutable": True}
         _log_event(conn, source_kind, "unroutable_demand", ref,
@@ -227,6 +227,30 @@ def inbox_mark_delivered(ids: Sequence[int],
         return cur.rowcount
 
 
+def inbox_note_listed(role: str, db_path: Path | str | None = None) -> str:
+    """Record that `role` just read its own queue. Returns the instant stored.
+
+    The read-side counterpart of :func:`inbox_mark_delivered`, and deliberately
+    NOT the same thing. Delivery says an item reached an agent, and the wake
+    ladder treats a delivered item as somebody's problem now — it stops raising
+    wakes for it. So stamping items delivered in order to record that they were
+    listed buys a working `ack` at the price of silencing them if that session
+    ends without acking. This records the reading against the ROLE instead,
+    leaving every item exactly where it was on the wake path.
+    """
+    now = _iso()
+    with connect(db_path, write=True) as conn:
+        role = _agent_role(conn, role)
+        high = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM agent_inbox"
+                            ).fetchone()["m"]
+        conn.execute(
+            "INSERT INTO agent_inbox_reads(role, last_id, listed_at) VALUES (?,?,?) "
+            "ON CONFLICT(role) DO UPDATE SET last_id=excluded.last_id,"
+            " listed_at=excluded.listed_at",
+            (role, high, now))
+    return now
+
+
 def inbox_ack(target_role: str | None = None, ids: Sequence[int] | None = None,
               db_path: Path | str | None = None) -> int:
     """Mark items processed. Pass ids to ack specific items, or target_role to
@@ -241,13 +265,19 @@ def inbox_ack(target_role: str | None = None, ids: Sequence[int] | None = None,
                 [now, *ids])
         elif target_role:
             role = _agent_role(conn, target_role)
-            # Only DELIVERED items: an item enqueued after this batch was
-            # surfaced (still delivered_at NULL) has never been seen by the
-            # agent — a blanket ack must not silently drop it.
+            # An item the agent never saw must survive a blanket ack, and there
+            # are two ways to have seen one: it was delivered, or it was already
+            # queued when the agent last read its own list. The second clause is
+            # what lets a read be recorded WITHOUT marking items delivered —
+            # delivery takes an item off the wake path, so using it to mean "was
+            # read" silences precisely what a dying session had just been shown.
+            # Anything enqueued after that read stays queued and keeps waking.
             cur = conn.execute(
                 "UPDATE agent_inbox SET acked_at=? WHERE target_role=? "
-                "AND acked_at IS NULL AND delivered_at IS NOT NULL",
-                (now, role))
+                "AND acked_at IS NULL AND (delivered_at IS NOT NULL "
+                "  OR id <= COALESCE("
+                "     (SELECT last_id FROM agent_inbox_reads WHERE role=?), 0))",
+                (now, role, role))
         else:
             raise ValueError("inbox_ack needs ids or target_role")
         if cur.rowcount:

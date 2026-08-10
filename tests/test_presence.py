@@ -629,3 +629,74 @@ def test_agent_detail_skips_a_disabled_role(clock):
     assert "beta" not in [a["role"] for a in orch.board()["agents"]]
     with pytest.raises(ValueError):
         orch.agent_detail("beta")
+
+
+# --- prose fields keep their shape, whichever verb writes them ---------------
+# task_add cleaned these columns and task_update did not, so the SAME text
+# stored two ways came out two shapes: a detail written at creation lost its
+# paragraphs, the identical text written by a later --detail kept them, and one
+# task list held rows that disagreed about whether a newline was possible.
+
+PROSE = ("The claim   first.\n"
+         "\n"
+         "- point   one\n"
+         "- point two")
+PROSE_STORED = "The claim first.\n\n- point one\n- point two"
+
+
+def _detail_of(task_id: int) -> str:
+    with orch.connect() as c:
+        return c.execute("SELECT detail FROM agent_tasks WHERE id=?",
+                         (task_id,)).fetchone()["detail"]
+
+
+def test_a_task_detail_keeps_its_paragraphs(desk):
+    assert _detail_of(orch.task_add("t", assignee_role="alpha",
+                                    detail=PROSE)) == PROSE_STORED
+
+
+def test_both_write_paths_store_a_detail_identically(desk):
+    """The defect was the disagreement itself, so this measures the two paths
+    against each other rather than against a literal: any future change that
+    moves one of them has to move both."""
+    created = orch.task_add("created", assignee_role="alpha", detail=PROSE)
+    updated = orch.task_add("updated", assignee_role="alpha")
+    orch.task_update(updated, detail=PROSE)
+
+    assert _detail_of(created) == _detail_of(updated) == PROSE_STORED
+
+
+def test_a_closing_note_keeps_its_paragraphs(desk):
+    """result_note is where a verification report lands — the longest prose the
+    task table ever holds, and the field a reviewer actually reads."""
+    task_id = orch.task_add("t", assignee_role="alpha")
+    orch.task_close(task_id, note=PROSE)
+    with orch.connect() as c:
+        assert c.execute("SELECT result_note FROM agent_tasks WHERE id=?",
+                         (task_id,)).fetchone()["result_note"] == PROSE_STORED
+
+
+def test_a_title_stays_on_one_line_on_both_paths(desk):
+    """The other half of the same asymmetry, in the other direction: titles are
+    rendered inline in every list view, and only task_add was enforcing it."""
+    task_id = orch.task_add("two\nline title", assignee_role="alpha")
+    orch.task_update(task_id, title="also\ntwo lines")
+    with orch.connect() as c:
+        assert c.execute("SELECT title FROM agent_tasks WHERE id=?",
+                         (task_id,)).fetchone()["title"] == "also two lines"
+
+
+def test_a_notification_body_keeps_its_paragraphs(desk):
+    orch.inbox_enqueue("alpha", "system", "heads up", body=PROSE)
+    (item,) = orch.inbox_pending("alpha")
+    assert item["body"] == PROSE_STORED
+
+
+def test_a_wake_hook_body_keeps_its_paragraphs(desk):
+    """A hook body becomes the notification an agent wakes up to, so it is
+    prose for the same reason the inbox body is."""
+    orch.hook_add("alpha", "check the thing", every=3600, body=PROSE)
+    with orch.connect() as c:
+        assert c.execute(
+            "SELECT body FROM wake_hooks WHERE owner_role='alpha'"
+        ).fetchone()["body"] == PROSE_STORED

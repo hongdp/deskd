@@ -19,6 +19,7 @@ from typing import Sequence
 
 from .. import auth, mailbox
 from ..config import CONFIG
+from ..text import clean_prose
 
 MEETING_TYPES = {"live", "review", "ad-hoc"}
 MEETING_STATES = {
@@ -209,6 +210,18 @@ def _clean(value: str, label: str) -> str:
     out = " ".join(value.split())
     if not out:
         raise ValueError(f"{label} is required")
+    return out
+
+
+def _clean_prose(value: str, label: str) -> str:
+    """A message body / resolution: prose, so its lines are content.
+
+    The rule itself lives in ``deskd.text`` because the orchestration store
+    needs the identical one for task details and notification bodies, and two
+    copies of "how text is stored" is precisely the drift this fixes.
+    """
+    out = clean_prose(value, label)
+    assert out is not None      # required=True never returns None
     return out
 
 

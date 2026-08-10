@@ -201,12 +201,31 @@ function eventsCard(d) {
     rows || S.empty("No events mention this agent yet."));
 }
 
+// What the session has been SAYING this turn, oldest first. `thinking` rows
+// carry no text by design — the harness emits the fact and redacts the content
+// (docs/session-feed.md) — so they render as a marker. Printing an empty body
+// under a "thinking" heading would read as a message that failed to load.
+function feedCard(f) {
+  if (!f) return "";
+  if (!f.session_id) return card("feed", "Narration", S.empty("No live session."));
+  var lines = (f.lines || []).map(function (l) {
+    var t = new Date(l.at).toLocaleTimeString();
+    if (l.kind === "thinking") {
+      return '<div class="feed-line"><span class="quiet">' + esc(t) + " · thinking…</span></div>";
+    }
+    return '<div class="feed-line"><span class="quiet">' + esc(t) + "</span> " + esc(l.text) + "</div>";
+  }).join("");
+  return card("feed", "Narration · " + (f.lines || []).length + " line(s)",
+    lines || S.empty("Nothing said yet this turn."));
+}
+
 async function load() {
   var r = role();
   if (!r) { S.setHTML(S.$("#body"), S.empty("No role in the URL.")); return; }
   var d = await S.api("/api/agent/" + encodeURIComponent(r));
-  var w = null;
+  var w = null, f = null;
   try { w = await S.api("/api/agent/" + encodeURIComponent(r) + "/wake-sources"); } catch (e) { /* panel degrades */ }
+  try { f = await S.api("/api/agent/" + encodeURIComponent(r) + "/feed?limit=40"); } catch (e) { /* panel degrades */ }
   var p = d.presence || {};
   var name = (d.profile && d.profile.display_name) || d.role;
   S.setHTML(S.$("#title"), '<span class="dot ' + esc(p.liveness) + '"></span> ' + esc(name));
@@ -216,7 +235,7 @@ async function load() {
     + (p.session_day ? '<span class="chip">' + esc(p.session_day) + "</span>" : "") + "</span>");
   document.title = name + " · Agent · console";
   S.setHTML(S.$("#body"),
-    profileCard(d) + sessionCard(d) + wakesMeCard(w) + meetingCard(d)
+    profileCard(d) + sessionCard(d) + feedCard(f) + wakesMeCard(w) + meetingCard(d)
     + inboxCard(d) + tasksCard(d) + wakeCard(d) + deliveryCard(d) + hooksCard(d) + eventsCard(d));
   S.$("#foot").textContent = "updated " + new Date(d.generated_at).toLocaleTimeString();
 }

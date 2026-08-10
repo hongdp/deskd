@@ -112,6 +112,32 @@ def _reason_ceiling(reason_kind: str, ladder: tuple[WakeRung, ...]) -> int:
         return len(ladder) - 1
     return _human_level(ladder) - 1
 
+
+def _role_floor(role: str, ladder) -> int:
+    """The LOWEST rung a demand OWED BY this role may occupy.
+
+    Mirror image of _reason_ceiling, and it exists for the mirror-image reason.
+    Every machine rung ends in the same act: boot or resume a SESSION for the
+    role that owes the thing. That is incoherent when the role is the
+    SUPERVISOR, who is a person and enters only through the authenticated
+    console — there is no session to resume and nothing to spawn. What actually
+    happened (2026-07-26) is worse than a no-op: a supervisor-owed meeting reply
+    started at `spawn`, so the orchestrator launched a headless agent session
+    every ~38 minutes for hours and handed each one a prompt telling it to
+    declare itself the supervisor. The engine's own invariant forbids exactly
+    that (store.py: "supervisor is not an agent role"), so every one of those
+    sessions could do nothing but refuse and burn a session.
+
+    Scoped by ROLE, not by reason kind: any demand can name the supervisor as
+    the owed party (owed_reply does today; stuck_delivery can, since a
+    supervisor can leave a message unread), and every one of them wants the same
+    routing. A person is reached by leaving the machine — so that is where these
+    demands start, and the machine rungs below are skipped, not climbed through.
+    """
+    if role != CONFIG.supervisor_role:
+        return 0
+    return _human_level(ladder)
+
 #: Wake reasons that may never climb to a rung that leaves the machine.
 #:
 #: The ladder exists because a MESSAGE MUST LAND: it keeps climbing until someone
@@ -492,6 +518,66 @@ def _queue_wake_escalation(conn: sqlite3.Connection, d: dict, level: int, now_is
     return cur.lastrowid
 
 
+def _resolve_wake_escalations(conn: sqlite3.Connection, role: str,
+                              reason_kind: str, source_ref: str,
+                              outcome: str, now_iso: str) -> list[int]:
+    """Mark this demand's still-open escalations settled. Returns the ids that
+    actually reached a person and therefore owe a retraction.
+
+    The ladder is one-directional by construction: it exists to push "you owe
+    this" harder and harder until someone reacts, and it had no way to say
+    "that one is settled". `status` only ever recorded whether the SEND worked.
+    So a page that reached a human stayed a standing red card — on 2026-08-09
+    two Discord pages went out and the demand settled six minutes later, with
+    the rows still reading `sent` days afterwards. The cost is not symmetric
+    with a missed page: a false standing alarm spends a person's attention with
+    no floor, and it is exactly what makes the next real page ignorable.
+    """
+    rows = conn.execute(
+        "SELECT id, status FROM wake_escalations "
+        "WHERE role=? AND reason_kind=? AND source_ref=? AND resolved_at IS NULL",
+        (role, reason_kind, source_ref)).fetchall()
+    if not rows:
+        return []
+    conn.execute(
+        "UPDATE wake_escalations SET resolved_at=?, resolved_reason=? "
+        "WHERE role=? AND reason_kind=? AND source_ref=? AND resolved_at IS NULL",
+        (now_iso, outcome, role, reason_kind, source_ref))
+    _log_event(conn, "orchestrator", "wake_escalation_resolved", source_ref,
+               {"role": role, "reason": reason_kind, "outcome": outcome,
+                "ids": [r["id"] for r in rows]})
+    # Only the ones that actually left the machine. A queued row nobody ever
+    # saw needs no correction, and paging someone to retract a page they never
+    # got would be the same disease.
+    return [r["id"] for r in rows if r["status"] == "sent"]
+
+
+def _dispatch_escalation_retraction(escalation_id: int,
+                                    db_path: Path | str | None) -> dict:
+    """Tell the channel that carried a page that it is settled.
+
+    Same after-commit path as the page itself. Deliberately one line and
+    explicitly "no action needed": a retraction that reads like another alarm
+    costs what it was sent to refund.
+    """
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM wake_escalations WHERE id=?",
+                           (escalation_id,)).fetchone()
+    if row is None:
+        return {"id": escalation_id, "status": "missing"}
+    subject = f"{PROJECT_NAME} wake escalation SETTLED: {row['role']}"
+    text = (f"{PROJECT_NAME} wake escalation settled — no action needed.\n"
+            f"Role: {row['role']}\n"
+            f"Reason: {row['reason_kind']} ({row['reason'] or row['source_ref']})\n"
+            f"Ref: {row['source_ref']}\n"
+            f"Paged at {row['sent_at'] or row['created_at']}; "
+            f"settled at {row['resolved_at']} ({row['resolved_reason']}).")
+    results = channels.deliver(subject, text, row["channel"])
+    return {"id": escalation_id, "role": row["role"],
+            "reason_kind": row["reason_kind"],
+            "status": channels.summarize(results), "results": results}
+
+
 def _dispatch_wake_escalation(escalation_id: int,
                               db_path: Path | str | None) -> dict:
     """Mirror a queued wake escalation out through the channel layer. Called
@@ -599,7 +685,7 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
     now = store._now()
     now_iso = _iso(now)
     ladder = _ladder()
-    resolved, changed, esc_ids = [], [], []
+    resolved, changed, esc_ids, retract_ids = [], [], [], []
     # Advance the meeting SLA clocks BEFORE planning, so a wake request the
     # sweep arms is collected as demand in this same tick. The sweep otherwise
     # runs only on meetings read paths — clocks that advance only while
@@ -640,6 +726,13 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
                     _log_event(conn, "orchestrator", "wake_resolved", a["source_ref"],
                                {"role": a["role"], "reason": a["reason_kind"],
                                 "outcome": outcome, "latency_s": lat})
+                    # A page that reached a person is not undone by the demand
+                    # quietly going away: the ladder only ever pushes "you owe
+                    # this", so an unretracted red card costs that person's
+                    # attention until they go and query the database.
+                    retract_ids.extend(_resolve_wake_escalations(
+                        conn, a["role"], a["reason_kind"], a["source_ref"],
+                        outcome, now_iso))
                 resolved.append({"role": a["role"], "reason_kind": a["reason_kind"],
                                  "source_ref": a["source_ref"], "outcome": outcome,
                                  "latency_seconds": lat})
@@ -655,6 +748,14 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
             # rung has nowhere legal to go, so it does not wake at all.
             ceiling = _reason_ceiling(d["reason_kind"], ladder)
             if ceiling < 0:
+                continue
+            # The floor (see _role_floor) can outrank the ceiling: that reads as
+            # "must reach a person, may never reach a person". Unsatisfiable, so
+            # the demand is not raised rather than resolved towards either rule —
+            # honouring the ceiling would spawn sessions for a human, honouring
+            # the floor would page a person for a to-do list.
+            floor = _role_floor(d["role"], ladder)
+            if floor > ceiling:
                 continue
             cur = pend.get((d["role"], d["reason_kind"], d["source_ref"]))
             fresh_generation = (
@@ -693,14 +794,15 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
                 })
                 continue
             if cur is None:
-                lvl = min(_start_level(pres.get(d["role"]), ladder), ceiling)
+                lvl = max(min(_start_level(pres.get(d["role"]), ladder), ceiling), floor)
                 if record:
                     _insert_attempt(conn, d, lvl, now_iso, ladder)
                     _log_event(conn, "orchestrator", "wake_attempt", d["source_ref"],
                                {"role": d["role"], "reason": d["reason_kind"],
                                 "level": lvl, "channel": ladder[lvl].channel})
-                # Only a host-defined ladder can START a demand on a human rung,
-                # but arrival is arrival: the sink must fire here too.
+                # A host-defined ladder, or a role floor (_role_floor), can START
+                # a demand on a human rung; arrival is arrival either way, so the
+                # sink must fire here too.
                 if ladder[lvl].leaves_machine:
                     esc_ids.append(_queue_wake_escalation(conn, d, lvl, now_iso))
                 changed.append({**d, "level": lvl, "escalated": False})
@@ -754,7 +856,10 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
                     # escalation ledger keeps the badge red; the machine keeps
                     # trying. No new escalation is queued by the recycle itself
                     # — one fires only if the ladder genuinely climbs back up.
-                    nl = min(_start_level(pres.get(d["role"]), ladder), ceiling)
+                    # The floor applies to the recycle too, or a supervisor-owed
+                    # demand would drop back onto `spawn` every cycle: that is
+                    # precisely the loop _role_floor was added to end.
+                    nl = max(min(_start_level(pres.get(d["role"]), ladder), ceiling), floor)
                     if record:
                         conn.execute(
                             "UPDATE wake_attempts SET outcome='superseded', resolved_at=? "
@@ -809,8 +914,15 @@ def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dic
     # run rolled its queue rows back and must not reach any network.
     escalations = ([_dispatch_wake_escalation(e, db_path) for e in esc_ids]
                    if record else [])
+    # Retractions ride the same after-commit path, and go out on the channel
+    # that carried the page: telling the ledger a red card is settled while
+    # leaving the person who was paged uninformed puts the correction where
+    # they will never look.
+    retractions = ([_dispatch_escalation_retraction(e, db_path)
+                    for e in retract_ids] if record else [])
     retried = _retry_wake_escalations(db_path) if record else []
     return {"generated_at": now_iso, "actions": actions,
+            "retractions": retractions,
             "resolved": resolved, "changed": changed,
             "hooks_fired": hooks_fired, "routed": routed,
             "escalations": escalations, "escalations_retried": retried}
