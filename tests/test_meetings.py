@@ -36,6 +36,7 @@ import pytest
 from conftest import ROLES
 from deskd import mailbox, meetings
 from deskd.config import CONFIG
+from deskd.meetings import messaging
 
 ROLE_NAMES = tuple(r.name for r in ROLES)
 
@@ -2359,3 +2360,64 @@ def test_one_line_fields_still_flatten(desk):
     status = meetings.call_meeting(agenda="two\nline agenda",
                                    called_by="alpha", attendees=["alpha", "beta"])
     assert status["meeting"]["agenda"] == "two line agenda"
+
+
+# --- the length hint --------------------------------------------------------
+# Advisory only. The value of a hint is that it fires when it should and stays
+# quiet otherwise; a hint that fires on well-supported messages is one senders
+# learn to scroll past, so the exemptions are part of the feature, not trim.
+
+def test_a_short_message_gets_no_hint(desk):
+    thread_id = _start("brevity", ["alpha", "beta"])
+    out = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                               body="The gate held; 3 of 31 rows survived it.")
+    assert "style_hint" not in out
+
+
+def test_a_long_message_is_hinted_but_still_sent(desk):
+    """Sized off the threshold rather than a literal: the supervisor tunes
+    these numbers against measured traffic, and a test that hardcodes today's
+    value turns the next retune into a false failure."""
+    over = messaging.MESSAGE_HINT_WORDS + 10
+    thread_id = _start("length", ["alpha", "beta"])
+    out = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                               body=" ".join(["word"] * over))
+    assert f"{over} words" in out["style_hint"]
+    assert out["message_id"], "the hint must never cost the message"
+    with _db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM mailbox_messages WHERE thread_id=?",
+            (thread_id,)).fetchone()["c"] == 1
+
+
+def test_a_long_message_of_chinese_prose_is_hinted_too(desk):
+    """Counting whitespace-separated words alone would never fire on CJK — the
+    desk's working language — so the seats this rule exists for would be the
+    ones it never reached."""
+    body = "复盘结论如下。" * (messaging.MESSAGE_HINT_CJK_CHARS // 6 + 5)
+    thread_id = _start("cjk", ["alpha", "beta"])
+    out = meetings.send_update(thread_id, role="alpha", kind="evidence", body=body)
+    assert "CJK characters" in out["style_hint"]
+
+
+def test_evidence_does_not_count_toward_the_hint(desk):
+    """A table is long because it is evidence. Charging a sender for it would
+    push them toward summarizing measurements in prose — the opposite of what
+    this desk wants."""
+    table = "\n".join(f"| row {i} | value {i} | note {i} |" for i in range(120))
+    thread_id = _start("evidence", ["alpha", "beta"])
+    out = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                               body="Six runs, one line each:\n" + table)
+    assert "style_hint" not in out
+
+
+def test_the_hint_never_displaces_the_obligation_warning(desk):
+    """The two say different things and carry different consequences: one is
+    advice, the other is a debt the escalation ladder acts on."""
+    thread_id = _start("both", ["alpha", "beta"])
+    asked = meetings.send_update(thread_id, role="beta", kind="question",
+                                 body="What is the number?")["message_id"]
+    out = meetings.send_update(thread_id, role="alpha", kind="evidence",
+                               body=" ".join(["word"] * 200))
+    assert f"#{asked}" in out["warning"], "the debt must still be reported"
+    assert "style_hint" in out
