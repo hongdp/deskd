@@ -241,7 +241,14 @@ CREATE TABLE IF NOT EXISTS wake_escalations (
                           CHECK (status IN ('queued','sent','failed')),
     details               TEXT,
     created_at            TEXT NOT NULL,
-    sent_at               TEXT
+    sent_at               TEXT,
+    -- `status` says whether the SEND worked. These say whether the thing it
+    -- paged about is still true. Different questions, so different columns: a
+    -- page that reached a person and was never retracted costs that person's
+    -- attention with no floor, because the ladder only ever pushes "you owe
+    -- this" and never "that one is settled".
+    resolved_at           TEXT,
+    resolved_reason       TEXT
 );
 
 -- Capability-addressed demands that NO enabled role can take. The wake ladder's
@@ -442,6 +449,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # new work and its ladder position/SLA are inherited.
         conn.execute(
             "ALTER TABLE wake_attempts ADD COLUMN source_generation TEXT")
+    if "resolved_at" not in {r["name"] for r in conn.execute(
+            "PRAGMA table_info(wake_escalations)")}:
+        # A page that reached a person could not be taken back. `status` only
+        # ever answered "did the send work"; nothing answered "is the thing it
+        # was about still true". Two pages went out on 2026-08-09 and the
+        # demand settled six minutes later — both rows still read `sent`, so
+        # the only retraction available to the human was to go and query the
+        # database. Kept as separate columns rather than a new `status` value
+        # precisely because they are different questions.
+        conn.execute("ALTER TABLE wake_escalations ADD COLUMN resolved_at TEXT")
+        conn.execute(
+            "ALTER TABLE wake_escalations ADD COLUMN resolved_reason TEXT")
     # NOTE: only agent_* tables belong here. A migration for a lower layer's
     # table must live in that layer — `meetings.closed_at` was briefly added
     # here, which made it unreachable for a host that uses meetings without
