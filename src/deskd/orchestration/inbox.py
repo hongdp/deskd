@@ -4,6 +4,7 @@ capability-addressed router and its unroutable-demand ledger.
 
 from __future__ import annotations
 
+import datetime as dt
 import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
@@ -286,6 +287,30 @@ def inbox_ack(target_role: str | None = None, ids: Sequence[int] | None = None,
         return cur.rowcount
 
 
+def inbox_wake_due_at(queued: Sequence[dict]) -> str | None:
+    """When queued items become a wake demand — None if there are none.
+
+    Non-urgent notifications are batched so a burst produces one session
+    instead of one per item, and an urgent one does not wait at all. That rule
+    decides when an agent gets woken, and until this existed only the planner
+    knew it: a board could say "idle, 2 queued" for three minutes with nothing
+    on screen distinguishing "batching, due shortly" from "stuck, nobody is
+    coming". Both look exactly like a full inbox and an idle seat.
+
+    Exported so the planner and any console read the SAME rule. A second copy
+    in a renderer would be a countdown that drifts from the thing it counts
+    down to.
+    """
+    if not queued:
+        return None
+    oldest = min(i["enqueued_at"] for i in queued)
+    if any(i["priority"] == "urgent" for i in queued):
+        return oldest       # urgent is due the moment it lands
+    due = (dt.datetime.fromisoformat(oldest)
+           + dt.timedelta(seconds=CONFIG.inbox_batch_seconds))
+    return _iso(due)
+
+
 def _inbox_view(rows: list[dict]) -> dict:
     """Group a role's un-acked items into queued (not delivered) vs delivered."""
     queued = [r for r in rows if not r["delivered_at"]]
@@ -294,4 +319,5 @@ def _inbox_view(rows: list[dict]) -> dict:
         "queued": queued, "delivered": delivered,
         "queued_count": len(queued), "delivered_count": len(delivered),
         "urgent_queued": sum(1 for r in queued if r["priority"] == "urgent"),
+        "wake_due_at": inbox_wake_due_at(queued),
     }
