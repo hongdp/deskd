@@ -990,6 +990,43 @@ def _dispatch_builtin(principal: Principal, verb: str, raw: dict) -> Any:
         if (current is not None and current["ended_at"] is None
                 and current["session_id"] not in {None, session_id}):
             raise CommandConflict("another session already owns this role")
+        with orchestration.connect() as conn:
+            previous_provenance = conn.execute(
+                "SELECT * FROM control_session_provenance WHERE role=?", (role,)
+            ).fetchone()
+        if p["mode"] == "resume":
+            # A resumable provider session is part of the release boundary.
+            # Never rewrite its identity with the pins that happen to be live
+            # on the control plane today: doing so would make a cross-version
+            # resume look as though the old provider process had been created
+            # by the new image.  Operators must deliberately roll over to a
+            # cold spawn whenever any of these dimensions changes.
+            expected_resume = {
+                "session_id": session_id,
+                "provider": runtime["provider"],
+                "model": runtime.get("model"),
+                "reasoning": runtime.get("reasoning"),
+                "image_digest": pinned["image_digest"],
+                "build_revision": pinned["build_revision"],
+                "config_version": pinned["config_version"],
+                "prompt_version": pinned["prompt_version"],
+                "workspace_lease_id": p.get("workspace_lease_id"),
+            }
+            if previous_provenance is None:
+                raise CommandConflict(
+                    "resume session has no recorded provenance; explicit rollover required")
+            mismatches = [
+                key for key, expected in expected_resume.items()
+                if previous_provenance[key] != expected
+            ]
+            if mismatches:
+                raise CommandConflict(
+                    "resume session provenance changed for "
+                    f"{','.join(mismatches)}; explicit rollover required")
+        elif (previous_provenance is not None
+              and previous_provenance["session_id"] == session_id):
+            raise CommandConflict(
+                "spawn may not reuse a recorded session id; choose a cold session id")
         result = orchestration.set_status(
             role, state=p.get("state") or "booting",
             activity=p.get("activity"), session_id=session_id,

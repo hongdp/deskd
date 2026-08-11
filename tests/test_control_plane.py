@@ -320,6 +320,48 @@ def test_wake_claim_session_bind_and_land_are_role_cas(desk):
     assert landed["state"] == "landed"
 
 
+def test_resume_preserves_recorded_session_provenance(desk):
+    principal = role_principal()
+    spawn = session_start_params("immutable-session")
+    commands.execute(
+        principal, "provenance-spawn-01", "agent.session.start", spawn)
+
+    resume = session_start_params("immutable-session", mode="resume")
+    resumed = commands.execute(
+        principal, "provenance-resume-01", "agent.session.start", resume)
+    assert resumed["result"]["provenance"]["session_id"] == "immutable-session"
+
+    with orch.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE control_session_provenance SET prompt_version=? WHERE role=?",
+            ("sha256:" + "0" * 64, "alpha"),
+        )
+    with pytest.raises(commands.CommandConflict, match="prompt_version"):
+        commands.execute(
+            principal, "provenance-resume-stale", "agent.session.start", resume)
+    with orch.connect() as conn:
+        stored = conn.execute(
+            "SELECT prompt_version FROM control_session_provenance WHERE role=?",
+            ("alpha",),
+        ).fetchone()
+    assert stored["prompt_version"] == "sha256:" + "0" * 64
+
+
+def test_resume_without_provenance_and_spawn_id_reuse_fail_closed(desk):
+    principal = role_principal()
+    resume = session_start_params("unknown-session", mode="resume")
+    with pytest.raises(commands.CommandConflict, match="no recorded provenance"):
+        commands.execute(
+            principal, "provenance-resume-missing", "agent.session.start", resume)
+
+    spawn = session_start_params("do-not-reuse")
+    commands.execute(
+        principal, "provenance-spawn-first", "agent.session.start", spawn)
+    with pytest.raises(commands.CommandConflict, match="may not reuse"):
+        commands.execute(
+            principal, "provenance-spawn-reused", "agent.session.start", spawn)
+
+
 def test_indeterminate_wake_quarantines_role_until_operator_reconciles(desk):
     alpha = role_principal()
     orch.task_add("unsafe retry", assignee_role="alpha", priority="urgent")
