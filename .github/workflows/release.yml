@@ -125,7 +125,6 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${VERSION#v}" python - <<'PY'
-          import hashlib
           import json
           import os
           import pathlib
@@ -133,10 +132,25 @@ jobs:
           import urllib.error
           import urllib.request
 
-          expected = {
-              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-              for path in pathlib.Path("dist").iterdir() if path.is_file()
-          }
+          # The publisher writes local ``*.publish.attestation`` sidecars into
+          # dist/.  The pre-publish checksum manifest, not the directory after
+          # that mutation, is the immutable definition of release artifacts.
+          expected = {}
+          for line in pathlib.Path("release-SHA256SUMS").read_text().splitlines():
+              digest, relative = line.split(maxsplit=1)
+              artifact = pathlib.PurePosixPath(relative)
+              valid_name = (
+                  artifact.name.endswith(".whl")
+                  or artifact.name.endswith(".tar.gz")
+              )
+              if (artifact.parent != pathlib.PurePosixPath("dist")
+                      or not valid_name or len(digest) != 64
+                      or any(character not in "0123456789abcdef" for character in digest)
+                      or artifact.name in expected):
+                  raise SystemExit("release checksum manifest is malformed")
+              expected[artifact.name] = digest
+          if not expected:
+              raise SystemExit("release checksum manifest is empty")
           endpoint = f"https://pypi.org/pypi/deskd/{os.environ['VERSION']}/json"
           observed = {}
           for attempt in range(12):
