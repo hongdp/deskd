@@ -37,20 +37,117 @@ a wrong code is a 401, distinctions the engine layer has no business making.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import json
 from pathlib import Path
+from typing import AsyncIterator
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .. import auth, channels
+from .. import auth, channels, mailbox
 from .. import config as config_mod
 from .. import meetings, orchestration
-from ..config import EngineConfig
+from .. import transaction
+from ..config import EngineConfig, __version__
+from ..control import commands as control_commands
+from ..control import store as control_store
+from ..control.auth import (ControlAuthError, Principal,
+                            TokenStore as ControlTokenStore)
 
 STATIC = Path(__file__).parent / "static"
+
+_BODY_CONTROL_PATHS = frozenset({
+    "/api/commands",
+    "/api/runtime",
+    "/api/meetings/supervisor-apply",
+    "/api/meetings/supervisor-action",
+})
+
+
+class _BoundedControlBody:
+    """Bound mutation bodies at the ASGI receive boundary.
+
+    FastAPI resolves a body model before it invokes an endpoint, which means an
+    endpoint-level check is too late: a chunked request can already have forced
+    the sole control process to buffer arbitrary bytes.  Content-Length is used
+    only for a cheap early rejection.  Every actual ``http.request`` chunk is
+    counted and replayed to FastAPI only after the complete body is known to fit.
+    """
+
+    def __init__(self, app: ASGIApp, *, max_bytes: int,
+                 paths: frozenset[str] = _BODY_CONTROL_PATHS) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+        self.paths = paths
+
+    async def _error(self, scope: Scope, receive: Receive, send: Send,
+                     status: int, detail: str) -> None:
+        await JSONResponse({"detail": detail}, status_code=status)(
+            scope, receive, send)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (scope["type"] != "http" or scope.get("path") not in self.paths
+                or scope.get("method") not in {"POST", "PUT", "PATCH"}):
+            await self.app(scope, receive, send)
+            return
+
+        lengths = [value for name, value in scope.get("headers", [])
+                   if name.lower() == b"content-length"]
+        if lengths:
+            # Reject duplicate lengths even when equal.  Intermediaries do not
+            # agree universally on how to collapse them, so accepting one here
+            # would reopen request-smuggling ambiguity at the security boundary.
+            try:
+                if len(lengths) != 1:
+                    raise ValueError
+                raw_length = lengths[0].decode("ascii")
+                if not raw_length.isdigit():
+                    raise ValueError
+                declared = int(raw_length)
+            except (UnicodeDecodeError, ValueError):
+                await self._error(
+                    scope, receive, send, 400, "invalid Content-Length")
+                return
+            if declared > self.max_bytes:
+                await self._error(
+                    scope, receive, send, 413,
+                    f"request body exceeds {self.max_bytes} bytes")
+                return
+
+        buffered: list[Message] = []
+        received = 0
+        while True:
+            message = await receive()
+            buffered.append(message)
+            if message["type"] == "http.disconnect":
+                break
+            if message["type"] != "http.request":
+                continue
+            received += len(message.get("body", b""))
+            if received > self.max_bytes:
+                await self._error(
+                    scope, receive, send, 413,
+                    f"request body exceeds {self.max_bytes} bytes")
+                return
+            if not message.get("more_body", False):
+                break
+
+        position = 0
+
+        async def replay() -> Message:
+            nonlocal position
+            if position < len(buffered):
+                message = buffered[position]
+                position += 1
+                return message
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await self.app(scope, replay, send)
 
 
 class SupervisorAssertionRequest(BaseModel):
@@ -77,6 +174,12 @@ class RuntimeTuningRequest(BaseModel):
     provider: str | None = None
     model: str | None = None
     reasoning: str | None = None
+
+
+class ControlCommandRequest(BaseModel):
+    request_id: str
+    verb: str
+    params: dict = Field(default_factory=dict)
 
 
 def _install_config(config: EngineConfig | None) -> EngineConfig:
@@ -116,7 +219,8 @@ class _RevalidatingStatic(StaticFiles):
         return response
 
 
-def create_app(config: EngineConfig | None = None) -> FastAPI:
+def create_app(config: EngineConfig | None = None, *,
+               token_store: ControlTokenStore | None = None) -> FastAPI:
     """Build the console app. `config` defaults to the process-wide CONFIG."""
     # `deskd serve` runs uvicorn with factory=True, so this factory is what a
     # reloaded WORKER process calls — a fresh interpreter where main()'s
@@ -125,17 +229,24 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
     if config is None:
         config_mod.load_host_config()
     cfg = _install_config(config)
+    control_store.ensure_schema()
+    role_tokens = token_store or ControlTokenStore.from_environment()
+    if cfg.control_api_only and not role_tokens.configured:
+        raise RuntimeError(
+            "DESKD_CONTROL_API_ONLY requires at least one role/service token")
 
     # Resolve the mode once, at construction: an invalid DESKD_SUPERVISOR_AUTH_MODE
     # must be a loud startup failure, never a surprise 500 mid-meeting.
-    auth_mode = auth.auth_mode()
-    if auth.access_code_is_ephemeral():
+    # The isolated control socket has no supervisor surface at all.  Do not
+    # even initialize/generate a legacy supervisor credential in that process.
+    auth_mode = "disabled" if cfg.control_api_only else auth.auth_mode()
+    if not cfg.control_api_only and auth.access_code_is_ephemeral():
         # auth generates rather than defaulting: a checked-in default code is a
         # published credential. Surfaced once, to this server's terminal only —
         # auth itself never logs it.
         print(f"[{config_mod.PROJECT_NAME}] generated supervisor access code "
               f"(simple auth): {auth.simple_access_code()}")
-    if auth_mode == "open":
+    if not cfg.control_api_only and auth_mode == "open":
         # Unmissable, on every boot: `open` means the socket is the only
         # boundary left, and whoever runs this should hear it from the server
         # rather than rediscover it in their own .env months later.
@@ -144,6 +255,384 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
               "port acts as supervisor. Bind to a host you trust.")
 
     app = FastAPI(title=f"{config_mod.PROJECT_NAME} console")
+    max_body_bytes = int(cfg.control_max_request_body_bytes)
+    if max_body_bytes <= 0:
+        raise RuntimeError("control_max_request_body_bytes must be positive")
+    app.add_middleware(_BoundedControlBody, max_bytes=max_body_bytes)
+
+    if cfg.control_api_only:
+        control_paths = {
+            "/healthz", "/api/snapshot", "/api/self", "/api/inbox",
+            "/api/commands", "/api/jobs", "/api/events",
+        }
+
+        @app.middleware("http")
+        async def isolate_control_socket(request: Request, call_next):
+            path = request.url.path
+            detail_path = (
+                request.method == "GET" and (
+                    (path.startswith("/api/agent/") and path.endswith("/feed"))
+                    or (path.startswith("/api/meetings/")
+                        and path.count("/") == 3)
+                )
+            )
+            if (path not in control_paths and not path.startswith("/api/jobs/")
+                    and not detail_path):
+                return JSONResponse({"detail": "not found"}, status_code=404)
+            return await call_next(request)
+
+    def control_principal(authorization: str | None) -> Principal:
+        try:
+            return role_tokens.authenticate(authorization)
+        except ControlAuthError as exc:
+            raise HTTPException(401, str(exc), headers={
+                "WWW-Authenticate": "Bearer"}) from exc
+
+    def require_read(principal: Principal) -> None:
+        if principal.role is None:
+            try:
+                principal.require("read")
+            except ControlAuthError as exc:
+                raise HTTPException(403, str(exc)) from exc
+
+    def role_or_service(principal: Principal, requested: str | None) -> str | None:
+        require_read(principal)
+        if principal.role is not None:
+            if requested is not None and requested != principal.role:
+                raise HTTPException(403, "role token cannot read another role")
+            return principal.role
+        return requested
+
+    def command_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, ControlAuthError):
+            return HTTPException(403, str(exc))
+        if isinstance(exc, (control_commands.CommandConflict,
+                            control_store.CursorExpired,
+                            control_store.CursorAhead,
+                            control_store.CursorWrongServer)):
+            return HTTPException(409, str(exc))
+        return HTTPException(400, str(exc))
+
+    @app.get("/healthz")
+    def healthz() -> dict:
+        try:
+            cursor = control_store.current_cursor()
+        except Exception as exc:
+            raise HTTPException(503, "control database unavailable") from exc
+        return {"ok": True, "version": __version__, "cursor": cursor,
+                "auth_configured": role_tokens.configured}
+
+    def scoped_board(role: str | None) -> dict:
+        board = orchestration.board()
+        if role is None:
+            return board
+        # The shared office state is useful to every role, but another role's
+        # task titles, inbox bodies, session id/tool trace and meeting agenda are
+        # private execution state.  Keep only availability/counts for peers.
+        agents = []
+        for raw in board.get("agents", []):
+            item = dict(raw)
+            if item.get("role") != role:
+                for key in ("session_id", "harness", "activity", "last_tool",
+                            "last_tool_age_seconds", "session_todos", "tasks"):
+                    item.pop(key, None)
+                inbox = item.get("inbox") or {}
+                item["inbox"] = {
+                    "queued_count": inbox.get("queued_count", 0),
+                    "delivered_count": inbox.get("delivered_count", 0),
+                    "urgent_queued": inbox.get("urgent_queued", 0),
+                }
+                meeting = item.get("meeting") or {}
+                item["meeting"] = {
+                    "pending_wakes": meeting.get("pending_wakes", 0),
+                    "unread_messages": meeting.get("unread_messages", 0),
+                    "response_obligations": meeting.get(
+                        "response_obligations", {}).get("pending", 0),
+                    "active_meeting_count": len(meeting.get("active_meetings", [])),
+                }
+            agents.append(item)
+        board["agents"] = agents
+        # Global wake activity carries source refs/details.  Role clients get
+        # their own wake projection separately in ``snapshot.wake``.
+        board.pop("wake_activity", None)
+        board.pop("recent_events", None)
+        return board
+
+    def scoped_meetings(conn, role: str | None) -> list[dict]:
+        if role is None:
+            rows = conn.execute(
+                "SELECT * FROM meetings ORDER BY created_at DESC LIMIT 500").fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT m.* FROM meetings m
+                   JOIN meeting_attendees a ON a.thread_id=m.thread_id
+                   WHERE a.role=? ORDER BY m.created_at DESC LIMIT 500""",
+                (role,)).fetchall()
+        return [meetings.meeting_status(row["thread_id"], sweep=False)
+                for row in rows]
+
+    def control_snapshot(principal: Principal) -> dict:
+        require_read(principal)
+        role = principal.role
+        # One SQLite snapshot supplies every DB-backed projection and its event
+        # cursor. Nested engine calls reuse this connection through the ambient
+        # seam, so cursor N means exactly the state shown alongside it.
+        with orchestration.connect(write=True) as conn:
+            with transaction.bind(conn, cfg.db_path):
+                board = scoped_board(role)
+                inbox = orchestration.inbox_pending(target_role=role)
+                tasks = orchestration.tasks(assignee_role=role,
+                                            include_closed=False)
+                queue = orchestration.task_queue(role)
+                hooks = orchestration.hooks(owner_role=role,
+                                             include_closed=False)
+                meeting_rows = scoped_meetings(conn, role)
+                if role:
+                    wake = orchestration.wake_sources(role)
+                    wake["attempts"] = wake.pop("pending_wake_attempts", [])
+                    one_runtime = orchestration.role_runtime(role)
+                    runtime = {"roles": [{"role": role, **one_runtime}]}
+                else:
+                    wake = {
+                        "attempts": orchestration.wake_attempts_recent(200),
+                        "ladder": orchestration.wake_ladder_view(),
+                    }
+                    runtime = orchestration.runtime_overview()
+                claim_where = "WHERE state='indeterminate'"
+                claim_params: list[str] = []
+                if role:
+                    claim_where += " AND role=?"
+                    claim_params.append(role)
+                wake["quarantine"] = [dict(row) for row in conn.execute(
+                    "SELECT claim_id,role,state,channel,mode,claimed_at,error "
+                    f"FROM control_wake_claims {claim_where} ORDER BY claimed_at",
+                    claim_params).fetchall()]
+                rollover_where = ""
+                rollover_params: list[str] = []
+                if role:
+                    rollover_where = "WHERE role=?"
+                    rollover_params.append(role)
+                wake["rollovers"] = [dict(row) for row in conn.execute(
+                    """SELECT request_id,role,resume_session_id,from_day,to_day,
+                              state,attempt_count,max_attempts,claim_id,last_error,
+                              created_at,updated_at,completed_at
+                       FROM control_rollover_requests """
+                    f"{rollover_where} ORDER BY created_at DESC LIMIT 200",
+                    rollover_params).fetchall()]
+                # Some historical "read" projections materialize durable
+                # delivery state.  Capture the cursor after those writes, in
+                # this same transaction, so the returned state is exactly at N.
+                cursor = control_store.current_cursor(conn)
+                generated = control_store.now_iso()
+        return {
+            "cursor": cursor,
+            "generated_at": generated,
+            "server_version": __version__,
+            "board": board,
+            "tasks": {"tasks": tasks,
+                      "stalled_ids": [int(t["id"]) for t in queue["stalled"]]},
+            "inbox": inbox,
+            "meetings": meeting_rows,
+            "hooks": hooks,
+            "wake": wake,
+            "runtime": runtime,
+            "meta": {
+                "role": role,
+                "subject": principal.subject,
+                "verbs": control_commands.verbs(),
+                "allowed_verbs": control_commands.allowed_verbs(principal),
+                "scopes": sorted(principal.scopes),
+                "auth": role_tokens.status(),
+                "config_version": cfg.config_version,
+                "prompt_version": cfg.prompt_version,
+                "agent_image": cfg.agent_image,
+                "image_digest": cfg.image_digest,
+                "build_revision": cfg.build_revision,
+                "build_pins": {
+                    "image_digest": cfg.image_digest,
+                    "build_revision": cfg.build_revision,
+                    "config_version": cfg.config_version,
+                    "prompt_version": cfg.prompt_version,
+                },
+            },
+        }
+
+    @app.get("/api/snapshot")
+    def api_control_snapshot(
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> dict:
+        return control_snapshot(control_principal(authorization))
+
+    @app.get("/api/self")
+    def api_control_self(
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> dict:
+        principal = control_principal(authorization)
+        if principal.role is None:
+            raise HTTPException(403, "self requires a role token")
+        try:
+            return control_commands.self_projection(principal.role)
+        except Exception as exc:
+            raise command_error(exc) from exc
+
+    @app.get("/api/inbox")
+    def api_control_inbox(
+        role: str | None = None,
+        include_delivered: bool = True,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> list[dict]:
+        principal = control_principal(authorization)
+        target = role_or_service(principal, role)
+        return orchestration.inbox_pending(
+            target_role=target, include_delivered=include_delivered)
+
+    @app.post("/api/commands", status_code=202)
+    def api_control_command(
+        req: ControlCommandRequest,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict:
+        if idempotency_key != req.request_id:
+            raise HTTPException(
+                400, "Idempotency-Key must exactly equal body request_id")
+        principal = control_principal(authorization)
+        try:
+            return control_commands.execute(
+                principal, req.request_id, req.verb, req.params)
+        except Exception as exc:
+            raise command_error(exc) from exc
+
+    @app.get("/api/jobs")
+    def api_control_jobs(
+        limit: int = 100,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> list[dict]:
+        principal = control_principal(authorization)
+        require_read(principal)
+        return control_store.command_jobs(
+            principal_id=(principal.subject if principal.role is not None else None),
+            limit=limit)
+
+    @app.get("/api/jobs/{request_id}")
+    def api_control_job(
+        request_id: str,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> dict:
+        principal = control_principal(authorization)
+        require_read(principal)
+        jobs = control_store.command_jobs(
+            principal_id=(principal.subject if principal.role is not None else None),
+            limit=1000)
+        match = [job for job in jobs if job["request_id"] == request_id]
+        if not match:
+            raise HTTPException(404, "job not found")
+        return match[0]
+
+    def event_visible(principal: Principal, event: dict) -> bool:
+        if principal.role is None:
+            return True
+        event_role = event.get("role")
+        # Fail closed by identity, independent of resource vocabulary.  Adding
+        # a new role-bearing event table must not silently make it public.
+        if event_role is not None:
+            return event_role == principal.role
+        resource = event.get("resource")
+        resource_id = event.get("resource_id")
+        if resource not in {"thread", "meeting_event"}:
+            return True
+        if not resource_id:
+            return False
+        # Thread-level rows have no single role column.  Their only role
+        # visibility is an explicit attendee/participant relationship.
+        with orchestration.connect() as conn:
+            meeting = conn.execute(
+                "SELECT 1 FROM meetings WHERE thread_id=?", (resource_id,)
+            ).fetchone()
+            if meeting:
+                return conn.execute(
+                    "SELECT 1 FROM meeting_attendees WHERE thread_id=? AND role=?",
+                    (resource_id, principal.role)).fetchone() is not None
+            if resource == "meeting_event":
+                return False
+            return conn.execute(
+                """SELECT 1 FROM mailbox_threads t WHERE t.id=? AND
+                   (t.owner_role=? OR EXISTS (
+                     SELECT 1 FROM mailbox_messages mm WHERE mm.thread_id=t.id
+                     AND (mm.sender=? OR mm.recipient IN (?,?))))""",
+                (resource_id, principal.role, principal.role, principal.role,
+                 mailbox.BROADCAST)).fetchone() is not None
+
+    @app.get("/api/events")
+    async def api_control_events(
+        request: Request,
+        after: str | None = None,
+        once: bool = False,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    ) -> StreamingResponse:
+        principal = control_principal(authorization)
+        require_read(principal)
+        if after is not None and last_event_id is not None and after != last_event_id:
+            raise HTTPException(400, "after and Last-Event-ID disagree")
+        cursor = after or last_event_id or control_store.current_cursor()
+        try:
+            # Validate before constructing StreamingResponse so wrong-server,
+            # future and expired cursors are real HTTP 409 responses.
+            control_store.events_after(cursor, limit=1)
+        except Exception as exc:
+            raise command_error(exc) from exc
+
+        async def stream() -> AsyncIterator[str]:
+            nonlocal cursor
+            while not await request.is_disconnected():
+                try:
+                    events = control_store.events_after(cursor, limit=500)
+                except (control_store.CursorExpired,
+                        control_store.CursorAhead,
+                        control_store.CursorWrongServer) as exc:
+                    data = json.dumps({"error": str(exc), "resnapshot": True})
+                    yield f"event: reset\ndata: {data}\n\n"
+                    return
+                if events:
+                    hidden_cursor: str | None = None
+                    for event in events:
+                        cursor = event["cursor"]
+                        if event_visible(principal, event):
+                            if hidden_cursor is not None:
+                                hidden = json.dumps(
+                                    {"cursor": hidden_cursor, "redacted": True},
+                                    separators=(",", ":"))
+                                yield (f"id: {hidden_cursor}\nevent: cursor\n"
+                                       f"data: {hidden}\n\n")
+                                hidden_cursor = None
+                            payload = event
+                            name = "change"
+                        else:
+                            # A global monotonic cursor must advance across rows
+                            # hidden from this role or it replay-loops forever.
+                            hidden_cursor = cursor
+                            continue
+                        data = json.dumps(payload, separators=(",", ":"),
+                                          ensure_ascii=False)
+                        yield (f"id: {cursor}\nevent: {name}\n"
+                               f"data: {data}\n\n")
+                    if hidden_cursor is not None:
+                        hidden = json.dumps(
+                            {"cursor": hidden_cursor, "redacted": True},
+                            separators=(",", ":"))
+                        yield (f"id: {hidden_cursor}\nevent: cursor\n"
+                               f"data: {hidden}\n\n")
+                    if once:
+                        return
+                    continue
+                yield f": heartbeat cursor={cursor}\n\n"
+                if once:
+                    return
+                await asyncio.sleep(10)
+
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
 
     # Shared shell assets (deskd.css + shell.js): every page loads these two
     # files instead of pasting its own CSS/JS — the design system lives in one
@@ -232,7 +721,10 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
         return meetings.meeting_days()
 
     @app.get("/api/agent/{role}/feed")
-    def api_agent_feed(role: str, after_seq: int = 0, limit: int = 100) -> dict:
+    def api_agent_feed(
+        role: str, after_seq: int = 0, limit: int = 100,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> dict:
         """What this agent's live session has been saying, oldest first.
 
         `after_seq` makes tailing cheap: the page sends the highest seq it
@@ -241,6 +733,9 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
         answer, not an error, and a console that 404s on an idle agent teaches
         people to ignore its errors.
         """
+        if cfg.control_api_only:
+            principal = control_principal(authorization)
+            role_or_service(principal, role)
         try:
             detail = orchestration.agent_detail(role)
         except ValueError as exc:
@@ -430,7 +925,20 @@ def create_app(config: EngineConfig | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/meetings/{meeting_id}")
-    def api_meeting(meeting_id: str) -> dict:
+    def api_meeting(
+        meeting_id: str,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> dict:
+        if cfg.control_api_only:
+            principal = control_principal(authorization)
+            require_read(principal)
+            if principal.role is not None:
+                with orchestration.connect() as conn:
+                    attendee = conn.execute(
+                        "SELECT 1 FROM meeting_attendees WHERE thread_id=? AND role=?",
+                        (meeting_id, principal.role)).fetchone()
+                if attendee is None:
+                    raise HTTPException(403, "role is not an attendee")
         try:
             return meetings.meeting_transcript(meeting_id)
         except ValueError as exc:

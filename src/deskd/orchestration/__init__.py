@@ -54,8 +54,8 @@ from .inbox import (  # noqa: F401
 )
 from .presence import (  # noqa: F401
     FEED_KINDS, FEED_MAX_ROWS_PER_SESSION,
-    _is_busy, _presence_list, _presence_row, _role_presence, end_session,
-    feed_append, session_feed, tool_trace,
+    _is_busy, _presence_list, _presence_row, _role_presence, bind_session_id,
+    discard_provisional_session, end_session, feed_append, session_feed, tool_trace,
     heartbeat, presence, record_todos, set_status,
 )
 from .store import (  # noqa: F401

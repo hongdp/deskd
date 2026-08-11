@@ -1,0 +1,10 @@
+# Reproducible dependencies for the published control-plane image only.
+#
+# Library consumers keep the compatible ranges in pyproject.toml. Regenerate
+# this image lock after deliberate upgrades with:
+#   uv pip compile requirements-container.in --python-version 3.13 \
+#     --generate-hashes --output-file requirements-container.lock
+cryptography==49.0.0
+fastapi==0.139.2
+hatchling==1.32.0
+uvicorn[standard]==0.51.0

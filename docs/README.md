@@ -8,7 +8,13 @@ index you can read in one screen beats navigation you have to maintain.
   delivery ledger, bounded meetings, and what deskd deliberately does not do.
 - [`security.md`](security.md) — threat model, the supervisor boundary
   (`simple` / `signed` / `hybrid` / the `open`-mode surrender), probes, and
-  one-session-per-role.
+  one-session-per-role, plus role/service tokens and container isolation.
+- [`control-plane.md`](control-plane.md) — the optional isolated deployment:
+  authenticated principals, atomic command receipts, snapshot/SSE recovery,
+  shared/private state, workspace leases and operational boundaries.
+- [`container-deployment.md`](container-deployment.md) — the production runbook:
+  immutable image provenance, UID/mount/network boundaries, secret projection,
+  startup, backup, reconciliation, rolling upgrade and rollback gates.
 - [`glossary.md`](glossary.md) — the vocabulary, and the two words that name two
   different things: `escalation` (a per-meeting queue **and** the wake ladder's
   human-rung outbox) and `store` (one module per subpackage, with two
@@ -17,6 +23,9 @@ index you can read in one screen beats navigation you have to maintain.
   each item says what it unlocks, what it must wait for, and which claims are
   still untested. Ends with the known structural debt and why each piece is
   not being fixed yet.
+- [`tui.md`](tui.md) — the remote realtime terminal interface, its fast
+  multi-agent command composer, HTTP/SSE contract, reconnect semantics and
+  credential boundaries.
 - [`images/`](images/) — console screenshots (light/dark pairs), captured from
   the seeded demo desk in
   [`examples/support_desk/`](../examples/support_desk/README.md) — never from

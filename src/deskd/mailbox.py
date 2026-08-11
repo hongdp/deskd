@@ -57,6 +57,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .config import CONFIG
+from . import transaction
 
 #: Recipient token addressing every participant of a thread rather than one
 #: role. Stored verbatim in ``mailbox_messages.recipient``, so the word itself
@@ -220,6 +221,10 @@ def connect(db_path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
     schema is applied on every connect so any entry point can be the first one.
     """
     path = Path(db_path or CONFIG.db_path)
+    ambient = transaction.current(path)
+    if ambient is not None:
+        yield ambient
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -391,7 +396,7 @@ def open_thread(subject: str, *, kind: str = "live", idle_minutes: int = 45,
     phase = "reports" if kind == "review" else "live"
     thread_id = _thread_id(kind, now)
     with connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction.begin_immediate(conn)
         if owner_role is not None:
             owner_role = _role(conn, owner_role)
         same_subject = [r["id"] for r in conn.execute(
@@ -619,7 +624,7 @@ def send_message(thread_id: str, *, sender: str, recipient: str, kind: str,
                  db_path: Path | str | None = None) -> dict:
     """Send one message. ``recipient`` may be a role or ``BROADCAST``."""
     with connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction.begin_immediate(conn)
         thread = _refresh_thread(conn, thread_id)
         message_id = _insert_message(
             conn, thread, sender=sender, recipient=recipient, kind=kind, body=body,
@@ -687,7 +692,7 @@ def acknowledge(message_id: int, *, role: str,
                 db_path: Path | str | None = None) -> None:
     """Record that ``role`` has read a message addressed to it."""
     with connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction.begin_immediate(conn)
         role = _role(conn, role)
         message = conn.execute(
             "SELECT * FROM mailbox_messages WHERE id=?", (message_id,)
@@ -719,7 +724,7 @@ def stop_thread(thread_id: str, *, action: str, actor: str, reason: str,
         raise ValueError(f"invalid thread action: {action}")
     reason = _normalize_body(reason)
     with connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction.begin_immediate(conn)
         actor = _role(conn, actor)
         row = _refresh_thread(conn, thread_id)
         now = _now()
@@ -832,6 +837,7 @@ def _require_finalizer(conn: sqlite3.Connection, thread: sqlite3.Row,
 
 def submit_review_artifact(thread_id: str, *, role: str, stage: str,
                            path: str | Path,
+                           artifact_label: str | None = None,
                            db_path: Path | str | None = None) -> dict:
     """File a report, a cross-review, or the final artifact.
 
@@ -844,7 +850,7 @@ def submit_review_artifact(thread_id: str, *, role: str, stage: str,
         raise ValueError(f"invalid review stage: {stage}")
     artifact = _artifact(path)
     with connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction.begin_immediate(conn)
         role = _role(conn, role)
         thread = _refresh_thread(conn, thread_id)
         if thread["kind"] != "review":
@@ -866,10 +872,11 @@ def submit_review_artifact(thread_id: str, *, role: str, stage: str,
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"{role} already submitted a {stage}") from exc
 
+        label = _normalize_body(artifact_label) if artifact_label else artifact
         message_id = _insert_message(
             conn, thread, sender=role, recipient=BROADCAST,
             kind="decision" if stage == "final" else stage,
-            body=f"{role} submitted {stage}: {artifact}", artifact_path=artifact,
+            body=f"{role} submitted {stage}: {label}", artifact_path=artifact,
         )
 
         if stage in _STAGE_NEXT_PHASE:
@@ -915,7 +922,7 @@ def review_discuss(thread_id: str, *, role: str, body: str, agree: bool = False,
     whichever comes first.
     """
     with connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction.begin_immediate(conn)
         role = _role(conn, role)
         thread = _refresh_thread(conn, thread_id)
         _meeting_guard(conn, thread_id, role)
@@ -974,7 +981,7 @@ def conclude_review(thread_id: str, *, role: str, reason: str,
     visible in the record rather than being papered over.
     """
     with connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction.begin_immediate(conn)
         role = _role(conn, role)
         thread = _refresh_thread(conn, thread_id)
         _meeting_guard(conn, thread_id, role)

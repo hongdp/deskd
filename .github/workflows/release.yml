@@ -1,44 +1,72 @@
-name: Release to PyPI
+name: Release
 
-# Publishes when a GitHub Release is published. Auth is PyPI Trusted Publishing
-# (OIDC): no API token anywhere — PyPI trusts this exact repo + workflow +
-# environment, and the job proves its identity with a short-lived id-token.
+# Publishes PyPI artifacts and a multi-architecture GHCR image when a GitHub
+# Release is published. PyPI uses Trusted Publishing (OIDC): no API token is
+# stored; GHCR uses the release job's short-lived repository token.
 
 on:
   release:
     types: [published]
 
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   test:
+    if: github.event.release.prerelease == false && github.event.release.draft == false
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install -e ".[web]" pytest httpx httpx2
+      - run: python -m pip install -e ".[web,tui]" pytest httpx httpx2
+      - name: Require the release tag to match the package version
+        run: |
+          package_version="$(python -c 'from deskd import __version__; print(__version__)')"
+          test "${GITHUB_REF_NAME}" = "v${package_version}"
       - run: python -m pytest -q
 
   build:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
-      - run: python -m pip install build
-      - run: python -m build
-      - uses: actions/upload-artifact@v4
+      - run: python -m pip install --require-hashes -r requirements-release.lock
+      - name: Build and inspect reproducible Python artifacts
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export PYTHONHASHSEED=0
+          python -m build --no-isolation
+          python -m twine check dist/*
+          python -m venv /tmp/deskd-wheel-smoke
+          /tmp/deskd-wheel-smoke/bin/python -m pip install --require-hashes -r requirements-container.lock
+          /tmp/deskd-wheel-smoke/bin/python -m pip install --no-deps dist/*.whl
+          test "$(/tmp/deskd-wheel-smoke/bin/deskd --version)" = "deskd ${GITHUB_REF_NAME#v}"
+          sha256sum dist/* > release-SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist
-          path: dist/
+          path: |
+            dist/
+            release-SHA256SUMS
 
   publish:
-    needs: build
+    needs: [build, publish-container]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -46,8 +74,375 @@ jobs:
     permissions:
       id-token: write   # OIDC — this is the whole credential
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          path: .
+      - name: Verify checksums and the identity of any existing PyPI files
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          sha256sum --check release-SHA256SUMS
+          VERSION="${VERSION#v}" python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import urllib.error
+          import urllib.request
+
+          local = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in pathlib.Path("dist").iterdir() if path.is_file()
+          }
+          try:
+              with urllib.request.urlopen(
+                  f"https://pypi.org/pypi/deskd/{os.environ['VERSION']}/json",
+                  timeout=20,
+              ) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  raise SystemExit(0)
+              raise
+          remote = {
+              item["filename"]: item["digests"]["sha256"]
+              for item in payload.get("urls", [])
+          }
+          for filename, digest in remote.items():
+              if filename not in local:
+                  raise SystemExit(f"PyPI already has unexpected file {filename}")
+              if local[filename] != digest:
+                  raise SystemExit(f"PyPI file identity mismatch for {filename}")
+          PY
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          skip-existing: true
+
+  attach-checksums:
+    needs: [publish, publish-container]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: .
+      - name: Attach or verify the immutable checksum manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONTAINER_IMAGE: ${{ needs.publish-container.outputs.image }}
+          CONTAINER_DIGEST: ${{ needs.publish-container.outputs.digest }}
+        run: |
+          set -euo pipefail
+          sha256sum --check release-SHA256SUMS
+          [[ "${CONTAINER_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s@%s\n' "${CONTAINER_IMAGE}" "${CONTAINER_DIGEST}" \
+            > container-digest.txt
+          existing="$(mktemp -d)"
+          verify_or_upload() {
+            asset="$1"
+            if gh release download "${GITHUB_REF_NAME}" \
+                --pattern "${asset}" --dir "${existing}"; then
+              cmp "${asset}" "${existing}/${asset}"
+            else
+              gh release upload "${GITHUB_REF_NAME}" "${asset}"
+            fi
+          }
+          verify_or_upload release-SHA256SUMS
+          verify_or_upload container-digest.txt
+
+  publish-container:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.names.outputs.image }}
+      digest: ${{ steps.release-image.outputs.digest }}
+      ref: ${{ steps.release-image.outputs.ref }}
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve immutable candidate and final image names
+        id: names
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          repository="$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${repository}"
+          version="${GITHUB_REF_NAME#v}"
+          short_sha="${GITHUB_SHA:0:12}"
+          {
+            echo "image=${image}"
+            echo "version=${version}"
+            echo "candidate=${image}:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo 'final_tags<<EOF'
+            printf '%s\n' \
+              "${image}:${GITHUB_REF_NAME}" \
+              "${image}:${version}" \
+              "${image}:sha-${short_sha}"
+            echo EOF
+          } >> "${GITHUB_OUTPUT}"
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: container-build
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.names.outputs.candidate }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.names.outputs.version }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Attest the exact candidate image digest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ steps.names.outputs.image }}
+          subject-digest: ${{ steps.container-build.outputs.digest }}
+          push-to-registry: true
+      - name: Select the new or previously promoted release digest
+        id: release-image
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+          BUILT_DIGEST: ${{ steps.container-build.outputs.digest }}
+          CANDIDATE: ${{ steps.names.outputs.candidate }}
+          FINAL_TAGS: ${{ steps.names.outputs.final_tags }}
+        run: |
+          set -euo pipefail
+          [[ "${BUILT_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          candidate_digest="$(docker buildx imagetools inspect "${CANDIDATE}" \
+            | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
+          test "${candidate_digest}" = "${BUILT_DIGEST}"
+
+          selected=''
+          while IFS= read -r target; do
+            [ -n "${target}" ] || continue
+            if current="$(docker buildx imagetools inspect "${target}" 2>/dev/null \
+                | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"; then
+              [[ "${current}" =~ ^sha256:[0-9a-f]{64}$ ]]
+              if [ -n "${selected}" ]; then
+                test "${current}" = "${selected}" || {
+                  echo "existing release tags disagree on their digest" >&2
+                  exit 1
+                }
+              else
+                selected="${current}"
+              fi
+            fi
+          done <<< "${FINAL_TAGS}"
+          if [ -z "${selected}" ]; then
+            selected="${BUILT_DIGEST}"
+          else
+            echo "resuming previously promoted release digest ${selected}"
+          fi
+          {
+            echo "digest=${selected}"
+            echo "ref=${IMAGE}@${selected}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Verify release provenance before execution or promotion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.names.outputs.image }}
+          DIGEST: ${{ steps.release-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+            --source-digest "${GITHUB_SHA}" \
+            --source-ref "${GITHUB_REF}" \
+            --deny-self-hosted-runners
+      - name: Verify both release architectures as real control services
+        env:
+          RELEASE_IMAGE: ${{ steps.release-image.outputs.ref }}
+          EXPECTED: deskd ${{ steps.names.outputs.version }}
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          token='release-reader-token-0000000000000000000001'
+          token_hash="$(printf '%s' "${token}" | sha256sum | cut -d' ' -f1)"
+          secret_dir="$(mktemp -d)"
+          cat > "${secret_dir}/broker-smoke.py" <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import tempfile
+
+          from deskd import RepositorySpec, RoleSpec, workspaces
+          from deskd.config import configure
+
+          root = pathlib.Path(tempfile.mkdtemp(prefix="broker-", dir="/tmp"))
+          repo = root / "repo"
+          repo.mkdir()
+          git_env = {
+              **os.environ,
+              "GIT_CONFIG_GLOBAL": "/dev/null",
+              "GIT_CONFIG_NOSYSTEM": "1",
+          }
+
+          def git(*args: str) -> str:
+              result = subprocess.run(
+                  ["git", "-C", str(repo), *args],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+                  env=git_env,
+              )
+              return result.stdout.strip()
+
+          git("init", "-b", "main")
+          (repo / "README.md").write_text("release smoke\n", encoding="utf-8")
+          git("add", "README.md")
+          git("-c", "user.name=Release Smoke", "-c",
+              "user.email=release-smoke@deskd.invalid", "commit", "-m", "seed")
+          worktree_root = root / "workspaces"
+          db_path = root / "deskd.db"
+          configure(
+              roles=(RoleSpec("engineer", "Engineer"),),
+              db_path=db_path,
+              repositories=(RepositorySpec(
+                  "smoke", repo, worktree_root,
+                  allowed_bases=("main",),
+                  branch_prefix="codex/",
+                  allowed_roles=("engineer",),
+                  container_worktree_root=worktree_root,
+              ),),
+          )
+          lease = workspaces.acquire(
+              "smoke", owner_role="engineer", task_key="release-smoke",
+              base_ref="main", db_path=db_path,
+          )
+          path = pathlib.Path(lease["path"])
+          assert path.is_dir() and not (path / ".git").exists()
+          (path / "feature.txt").write_text("broker commit\n", encoding="utf-8")
+          state = workspaces.status(
+              lease["lease_id"], owner_role="engineer", db_path=db_path)
+          assert state["dirty"] is True
+          committed = workspaces.commit(
+              lease["lease_id"], owner_role="engineer",
+              message="Verify release broker",
+              expected_head=state["head_sha"],
+              expected_workspace_version=state["workspace_version"],
+              expected_base_sha=state["base_sha"],
+              db_path=db_path,
+          )
+          assert committed["committed"] is True and committed["clean"] is True
+          released = workspaces.release(
+              lease["lease_id"], owner_role="engineer",
+              expected_workspace_version=committed["workspace_version"],
+              db_path=db_path,
+          )
+          assert released["state"] == "released" and not path.exists()
+          PY
+          printf '{"version":1,"principals":[{"subject":"release-reader","scopes":["read"],"token_sha256":"%s"}]}\n' \
+            "${token_hash}" > "${secret_dir}/service-tokens.json"
+          chmod 0444 "${secret_dir}/broker-smoke.py"
+          chmod 0600 "${secret_dir}/service-tokens.json"
+          sudo chown 65532:65532 \
+            "${secret_dir}/broker-smoke.py" "${secret_dir}/service-tokens.json"
+          cleanup() {
+            docker ps --all --filter label=io.deskd.release-smoke="${GITHUB_RUN_ID}" \
+              --quiet | xargs --no-run-if-empty docker rm --force >/dev/null
+            sudo rm -rf "${secret_dir}"
+          }
+          trap cleanup EXIT
+
+          smoke_arch() {
+            arch="$1"
+            slug="${arch//\//-}"
+            container="deskd-release-${slug}-${GITHUB_RUN_ID}"
+            docker pull --platform "${arch}" "${RELEASE_IMAGE}" >/dev/null
+            test "$(docker image inspect "${RELEASE_IMAGE}" --format \
+              '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" \
+              = "${EXPECTED_REVISION}"
+            test "$(docker image inspect "${RELEASE_IMAGE}" --format \
+              '{{ .Config.User }}')" = 'deskd:deskd'
+            test "$(docker run --rm --platform "${arch}" --entrypoint deskd \
+              "${RELEASE_IMAGE}" --version)" = "${EXPECTED}"
+            docker run --rm --platform "${arch}" --read-only \
+              --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
+              --mount "type=bind,src=${secret_dir}/broker-smoke.py,dst=/tmp/broker-smoke.py,readonly" \
+              --entrypoint python "${RELEASE_IMAGE}" /tmp/broker-smoke.py
+            docker run --detach --name "${container}" \
+              --label io.deskd.release-smoke="${GITHUB_RUN_ID}" \
+              --platform "${arch}" --init --read-only \
+              --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
+              --mount "type=bind,src=${secret_dir}/service-tokens.json,dst=/run/secrets/service-tokens.json,readonly" \
+              --env DESKD_SERVICE_TOKENS_FILE=/run/secrets/service-tokens.json \
+              --publish 127.0.0.1::8000 "${RELEASE_IMAGE}"
+            port="$(docker port "${container}" 8000/tcp | sed -n 's/.*://p')"
+            test -n "${port}"
+            healthy=0
+            for _ in $(seq 1 90); do
+              if curl --fail --silent --show-error \
+                  "http://127.0.0.1:${port}/healthz" >/dev/null; then
+                healthy=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "${healthy}" -ne 1 ]; then
+              docker logs "${container}"
+              return 1
+            fi
+            test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              "http://127.0.0.1:${port}/api/snapshot")" = 401
+            curl --fail --silent --show-error \
+              --header "Authorization: Bearer ${token}" \
+              "http://127.0.0.1:${port}/api/snapshot" \
+              | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["server_version"]; assert "cursor" in value and "meta" in value'
+            docker rm --force "${container}" >/dev/null
+          }
+
+          docker buildx imagetools inspect "${RELEASE_IMAGE}"
+          smoke_arch linux/amd64
+          smoke_arch linux/arm64
+      - name: Promote the verified digest to immutable release tags
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+          DIGEST: ${{ steps.release-image.outputs.digest }}
+          FINAL_TAGS: ${{ steps.names.outputs.final_tags }}
+        run: |
+          set -euo pipefail
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" >/dev/null
+          while IFS= read -r target; do
+            [ -n "${target}" ] || continue
+            if current="$(docker buildx imagetools inspect "${target}" 2>/dev/null \
+                | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"; then
+              test "${current}" = "${DIGEST}" || {
+                echo "refusing to move existing release tag ${target}" >&2
+                exit 1
+              }
+            fi
+          done <<< "${FINAL_TAGS}"
+          promote=()
+          while IFS= read -r target; do
+            [ -n "${target}" ] && promote+=(--tag "${target}")
+          done <<< "${FINAL_TAGS}"
+          test "${#promote[@]}" -eq 6
+          docker buildx imagetools create "${promote[@]}" "${IMAGE}@${DIGEST}"
+          while IFS= read -r target; do
+            [ -n "${target}" ] || continue
+            actual="$(docker buildx imagetools inspect "${target}" \
+              | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
+            test "${actual}" = "${DIGEST}"
+          done <<< "${FINAL_TAGS}"

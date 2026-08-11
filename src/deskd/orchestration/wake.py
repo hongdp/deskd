@@ -669,11 +669,16 @@ def _planning_txn(db_path: Path | str | None, *,
     network call.
     """
     with connect(db_path, write=True) as conn:
+        if not record:
+            # A savepoint makes dry-run inert without rolling back a control
+            # command's ambient receipt/event transaction around us.
+            conn.execute("SAVEPOINT deskd_wake_preview")
         try:
             yield conn
         finally:
             if not record:
-                conn.rollback()
+                conn.execute("ROLLBACK TO deskd_wake_preview")
+                conn.execute("RELEASE deskd_wake_preview")
 
 
 def plan_wakes(db_path: Path | str | None = None, *, record: bool = True) -> dict:

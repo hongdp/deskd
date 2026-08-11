@@ -47,6 +47,63 @@ exist, because each was a real bug that a green suite hid.
 
 ---
 
+## The 0.4 control-plane decision (2026-08-11)
+
+**Status: release gate for 0.4.0.** Production isolation now has a concrete
+deployment shape: one authoritative control process and one independently
+contained runner per role. The embedded Python/SQLite mode remains supported;
+the network control plane is an optional production boundary, not a rewrite of
+the engine or a requirement for small local desks.
+
+This supersedes one conclusion in the original P3 sketch below: a coordinator
+*does* sit in the coordination write path. The old objection was correct about
+an ordinary RPC — if the mutation commits and its reply is lost, a retry may
+perform it twice. The missing piece was not "keep every role on the database";
+it was a protocol that makes the reply recoverable:
+
+1. every mutation carries a caller-scoped request id and a fingerprint of its
+   verb and parameters;
+2. the receipt, engine mutation and committed-change event are written in the
+   same SQLite transaction;
+3. a retry with the same caller/id/content returns the stored result, while the
+   same id with different content fails;
+4. operations outside that SQLite transaction are explicit durable jobs. Once
+   a job may have started, an unknown outcome is `indeterminate` and is never
+   blindly replayed.
+
+That closes the lost-ack ambiguity without claiming exactly-once execution. It
+also lets role containers receive no database mount at all: the bearer token is
+the caller, rather than a role string supplied by code that can read every
+other role's rows.
+
+The resulting state boundary is deliberate:
+
+- **shared authoritative state** — registry, presence projection, inbox and
+  delivery receipts, tasks, meetings, wake ledger, command receipts, event
+  cursor and workspace leases — lives in the control plane's one WAL database;
+- **role-private state** — provider credentials, provider session files, local
+  journals and caches — lives in a distinct volume for each role and is never
+  mounted by another role or the terminal client;
+- **provider session identity** is a shared reference to private provider state.
+  A provider-minted id is bound with a compare-and-swap before the runner treats
+  it as resumable;
+- **source changes** live in a broker lease at an exact base SHA. The broker
+  alone owns writable Git metadata and may acquire, inspect, renew, diff,
+  commit or release through fixed operations; agents cannot push, merge, reset
+  or choose an arbitrary repository path.
+
+HTTP commands carry intent; SSE carries low-latency invalidation and heartbeat;
+an atomic snapshot remains the truth. A client starts its event replay at the
+cursor returned inside that snapshot transaction. Retention gaps and cursors
+from a different future are explicit resynchronizations, never silent skips.
+
+This is still not a distributed database or workflow cluster. There is one
+coordination writer on one host, and role runners fail closed when it is
+unavailable. The point of the network hop is identity and filesystem isolation,
+not horizontal scale.
+
+---
+
 ## P1 — Authority as a first-class dimension
 
 **Status: shipped (unreleased).** Wake and rollover plans carry each role's
@@ -146,6 +203,12 @@ decoupled from delivery — anything that can block does not belong in a probe.
 
 ## P3 — The desk model
 
+**Status: the isolation goal is the 0.4 control-plane release gate; the
+per-desk-store proposal in this original sketch is superseded by the decision
+above.** The useful boundary survived: an authenticated caller, private
+role-local state, and one independently supervised runner per role. The storage
+topology changed after the lost-ack problem acquired a transactional answer.
+
 **The reframing:** stop thinking of one global orchestrator. Think of a desk per
 agent: a **phone** others can ring, an **alarm clock** it sets itself, a **watcher**
 that shouts when the world outside changes, a **notepad**, and a **lock** so only
@@ -165,7 +228,7 @@ facts on anyone's desk. They need one place where the fact is decided.
 That boundary lands in exactly the same place as P4, derived independently. Two
 unrelated lines of reasoning finding the same seam is evidence the seam is real.
 
-### The keystone: one question, three resolvers
+### The keystone: one question, four resolvers
 
 Every agent-facing entry point takes `role: str` as a plain argument. The engine
 has **no notion of a caller** — `check_in(role="beta")` *is* beta checking in.
@@ -174,11 +237,12 @@ Collapse all deployment modes into one seam:
 ```
 resolve_caller() -> role
     local     : trust the argument            (a trusted single operator)
-    production: ask the kernel (SO_PEERCRED)  (uid -> role via the registry)
+    unix      : ask the kernel (SO_PEERCRED)  (uid -> role via the registry)
+    container : authenticate a bearer token   (token -> one role or service scope)
     tests     : a fake resolver               (arbitrary uid -> role)
 ```
 
-**One code path, three resolvers — never `if mode == ...` sprinkled through the
+**One code path, four resolvers — never `if mode == ...` sprinkled through the
 engine.** The engine always asks; the local resolver is the trivial one.
 
 This is what turns `role` from a *claim* into an *authenticated identity*, and it
@@ -187,46 +251,46 @@ advised.
 
 ### Run the production architecture locally
 
-Same processes, same code, same paths — only `chmod` and uid differ. This kills
-the failure mode that otherwise dooms the whole item: **the shape you never
-exercise is the shape that breaks.** (The two-role hardcoding survived for exactly
-this reason: there were only ever two roles.) Locally every peer is the same uid,
-so the plumbing is exercised daily while the *discrimination* is not — which is
-what the fake resolver in the test suite is for. Production isolation must be in
-CI from day one or it is fiction.
+Same images, API paths, token resolver, read-only root filesystems and private
+volumes are exercised in local Compose before production. This kills the
+failure mode that otherwise dooms the whole item: **the shape you never
+exercise is the shape that breaks.** (The two-role hardcoding survived for
+exactly this reason: there were only ever two roles.) Unit tests still use fake
+principals, while integration tests prove that a real role token cannot read or
+mutate another role's private projection. Production isolation must be in CI
+from day one or it is fiction.
 
-### The coordinator reads; it does not gate
+### The control plane gates coordination; receipts remove ambiguity
 
-Do **not** put a coordinator daemon in the write path. Today `inbox_enqueue()`
-either commits to SQLite or raises: "landed" is a local, synchronous, durable
-fact. Behind an RPC, "landed" becomes "the coordinator acked" — and a lost ack
-means the caller does not know. That is the exact question the product exists to
-answer: you would create an at-least-once problem *inside* the at-least-once
-solver.
+The earlier version of this section rejected an RPC writer because a lost ack
+made "did it land?" unknowable. That diagnosis remains the acceptance test; the
+0.4 command receipt protocol above is the answer. A role cannot open SQLite or
+claim `role="beta"`; the server derives beta only from beta's token, and commits
+the receipt with the mutation and event. Private provider state does not move
+into this database merely because coordination does.
 
-Instead: each desk owns its own store and writes it directly (local, synchronous,
-same durability as today). The coordinator **reads all desks** and derives the
-shared view, then rings bells. It holds no authoritative state — which matches the
-existing principle that the ledger is a projection and therefore self-healing.
+Two properties are now explicit instead of accidental:
 
-Two things fall out for free:
+- **"Never create both sides" is an authenticated-command fact.** Alpha's token
+  cannot create beta's attendance, report or vote, even though the authoritative
+  rows share a database.
+- **Private state stops leaking.** Provider homes, credentials, transcripts not
+  promoted to the shared feed, caches and journals are distinct role volumes.
+  Shared presence and activity remain visible only through scoped projections.
 
-- **"Never create both sides" becomes a filesystem fact.** Alpha can only write
-  alpha's store; beta's attendance can only be written by beta.
-- **Private state stops leaking.** Today `session_todos` and
-  `agent_sessions.activity` sit in a store every role can read, with no reason.
-
-And one component-level property worth the whole cost: **nothing in the system can
-act as more than one agent.** Each desk spawns only its own agent, so no
-privileged spawner exists to impersonate anyone.
+There is no privileged *agent* spawner. Each role runner can launch only its own
+provider seat; service principals can plan and schedule wakes but carry no role
+and cannot speak in a meeting. The control process is privileged over
+coordination and Git leases, which is why it receives neither provider
+credentials nor a path to the host's side-effecting domain systems.
 
 ### Cost, stated honestly
 
-deskd today has **zero always-on processes** — a real design virtue it would give
-up, N daemons for N desks plus supervision. Today's shared store is not required
-by waking; it is **cheaper than N daemons**, with cron as a free shared alarm
-clock. That is an operational choice, not an architectural necessity, and the
-trade only pays once isolation has value.
+The embedded mode still has **zero always-on processes**. The isolated mode
+deliberately pays for one control process and N role runners plus supervision.
+It also adds token rotation, backup, health checks, image provenance and a
+network failure mode. That cost only pays when filesystem and identity isolation
+have value; it is not hidden behind the simple local install.
 
 ### The mode must be observable
 
@@ -399,12 +463,12 @@ ever happens it rides a major version, with the glossary as the migration note.
 
 ## What this does not become
 
-- **A distributed system.** Not now. The differentiator is reliable activation
-  with delivery proof — unsolved and hard. Distribution is solved, and building it
-  here means rebuilding a queue, a scheduler and a broker with the budget that
-  should go to the hard part. Delivery proof also gets *harder* across a network,
-  not easier. Isolation is the actual goal; per-account is the cheap way to get it
-  and multi-host is the expensive one.
+- **A distributed state system.** The optional control API crosses a container
+  network, but one process still owns one SQLite WAL database. There is no
+  leader election, replication, partition tolerance or multi-host execution
+  claim. The differentiator is reliable activation with delivery proof;
+  isolation is the goal, and a cluster would make that proof harder rather than
+  stronger.
 - **An enforcement point for host permissions.** deskd has no path to a host's
   side-effecting systems and must not grow one. It declares; the harness, the OS,
   the container enforce.

@@ -71,6 +71,55 @@ def set_status(role: str, *, state: str | None = None, activity: str | None = No
         return _presence_row(dict(row), store._now())
 
 
+def bind_session_id(role: str, expected_session_id: str, actual_session_id: str,
+                    *, db_path: Path | str | None = None) -> dict:
+    """CAS a provider-minted resumable id into the live role session."""
+    if (not expected_session_id or not actual_session_id
+            or len(actual_session_id) > 256
+            or any(c.isspace() or ord(c) < 33 for c in actual_session_id)):
+        raise ValueError("provider session id is invalid")
+    with connect(db_path, write=True) as conn:
+        role = _agent_role(conn, role)
+        row = conn.execute(
+            "SELECT session_id,ended_at FROM agent_sessions WHERE role=?", (role,)
+        ).fetchone()
+        if row is None or row["ended_at"] is not None:
+            raise ValueError("role has no live session to bind")
+        if row["session_id"] == actual_session_id:
+            return _presence_row(dict(conn.execute(
+                "SELECT * FROM agent_sessions WHERE role=?", (role,)).fetchone()),
+                store._now())
+        if row["session_id"] != expected_session_id:
+            raise ValueError("provider session bind compare-and-swap failed")
+        collision = conn.execute(
+            "SELECT role FROM agent_sessions WHERE session_id=? AND role!=?",
+            (actual_session_id, role)).fetchone()
+        if collision:
+            raise ValueError("provider session id already belongs to another role")
+        conn.execute(
+            "UPDATE agent_sessions SET session_id=? WHERE role=? AND session_id=?",
+            (actual_session_id, role, expected_session_id))
+        conn.execute(
+            "UPDATE session_feed SET session_id=? WHERE role=? AND session_id=?",
+            (actual_session_id, role, expected_session_id))
+        return _presence_row(dict(conn.execute(
+            "SELECT * FROM agent_sessions WHERE role=?", (role,)).fetchone()),
+            store._now())
+
+
+def discard_provisional_session(role: str, session_id: str, *,
+                                db_path: Path | str | None = None) -> None:
+    """Remove a launch identity its provider never confirmed."""
+    with connect(db_path, write=True) as conn:
+        role = _agent_role(conn, role)
+        conn.execute(
+            "DELETE FROM agent_sessions WHERE role=? AND session_id=?",
+            (role, session_id))
+        conn.execute(
+            "DELETE FROM session_feed WHERE role=? AND session_id=?",
+            (role, session_id))
+
+
 #: A tool line older than this is HIDDEN, not shown stale: "last seen doing
 #: X" minutes ago reads as "doing X now" on a dashboard, and a misleading
 #: live-trace is worse than none.

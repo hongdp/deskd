@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, overload
 
-from .. import mailbox, meetings
+from .. import mailbox, meetings, transaction
 from ..config import CONFIG
 # Prose fields keep their line structure; see deskd.text for which is which.
 # Re-exported under the module-private name every caller here already uses.
@@ -581,7 +581,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
 def connect(db_path: Path | str | None = None, *,
             write: bool = False) -> Iterator[sqlite3.Connection]:
     """Open the shared DB with mailbox + meeting + orchestration schema."""
-    with meetings.connect(db_path) as conn:
+    path = Path(db_path or CONFIG.db_path)
+    ambient = transaction.current(path)
+    if ambient is not None:
+        yield ambient
+        return
+    with meetings.connect(path) as conn:
         conn.executescript(ORCH_SCHEMA)
         _migrate(conn)
         _seed_registry(conn)

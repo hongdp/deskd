@@ -8,6 +8,7 @@ model/reasoning/grant; any other CLI becomes a provider via a template."""
 
 from __future__ import annotations
 
+import json
 import pytest
 
 from deskd import orchestration as orch
@@ -72,6 +73,23 @@ def test_command_provider_fills_and_drops_missing_flags():
         ["mycli", "continue", "s-1", "wake up"]
     assert p.environment(_spec(reasoning="low")) == {"MYCLI_EFFORT": "low"}
     assert p.environment(_spec()) == {}
+
+
+def test_command_provider_supports_workspace_env_deletion_and_session_event():
+    p = CommandProvider(
+        name="codex", template=("codex", "exec", "--json", "-C",
+                                "{workspace_path}", "{prompt}"),
+        env={"PARLAY_LIVE_TRADING": None}, unset_env=("ALSO_REMOVE",),
+        stream=True, session_event_type="thread.started",
+        session_id_path=("thread_id",))
+    spec = _spec(workspace_path="/workspaces/task")
+    assert p.command(spec)[3:5] == ["-C", "/workspaces/task"]
+    assert p.environment(spec) == {
+        "ALSO_REMOVE": None, "PARLAY_LIVE_TRADING": None}
+    assert p.requires_session_id_event is True
+    assert p.session_id_from_event({
+        "type": "thread.started", "thread_id": "thread-42"}) == "thread-42"
+    assert p.session_id_from_event({"type": "other", "thread_id": "x"}) is None
 
 
 def test_host_registration_wins_by_name(desk):
@@ -196,6 +214,49 @@ def test_run_agent_executes_parks_and_reports_preflight(desk, tmp_path):
     rt.set_role_runtime("alpha", "provider", "ghost")
     assert agent_run.run_agent("alpha", "spawn", "s-10", "p") == 75, \
         "a failed preflight is infrastructure (75), not a served wake"
+
+
+def test_driver_applies_deleting_env_patch_and_scrubs_supervisor(
+        desk, tmp_path, monkeypatch):
+    output = tmp_path / "env.json"
+    script = (
+        "import json,os,pathlib; "
+        f"pathlib.Path({str(output)!r}).write_text(json.dumps(dict(os.environ)))")
+    CONFIG.providers = (CommandProvider(
+        name="envcheck", template=("python3", "-c", script),
+        env={"PARLAY_LIVE_TRADING": None}, unset_env=("REMOVE_ME",)),)
+    rt.set_role_runtime("alpha", "provider", "envcheck")
+    monkeypatch.setenv("DESKD_SUPERVISOR_ACCESS_CODE", "must-not-cross")
+    monkeypatch.setenv("PARLAY_LIVE_TRADING", "1")
+    monkeypatch.setenv("REMOVE_ME", "1")
+    assert agent_run.run_agent("alpha", "spawn", "env-1", "p") == 0
+    child = json.loads(output.read_text())
+    assert "DESKD_SUPERVISOR_ACCESS_CODE" not in child
+    assert "PARLAY_LIVE_TRADING" not in child
+    assert "REMOVE_ME" not in child
+
+
+def test_provider_minted_session_is_bound_or_provisional_is_discarded(desk):
+    event = '{"type":"thread.started","thread_id":"actual-thread-7"}\n'
+    CONFIG.providers = (CommandProvider(
+        name="minted", template=(
+            "python3", "-c", f"import sys;sys.stdout.write({event!r})"),
+        stream=True, session_event_type="thread.started"),)
+    rt.set_role_runtime("alpha", "provider", "minted")
+    assert agent_run.run_agent(
+        "alpha", "spawn", "provisional-7", "p") == 0
+    alpha = {p["role"]: p for p in orch.presence()}["alpha"]
+    assert alpha["session_id"] == "actual-thread-7"
+
+    no_event = '{"type":"result"}\n'
+    CONFIG.providers = (CommandProvider(
+        name="missing-id", template=(
+            "python3", "-c", f"import sys;sys.stdout.write({no_event!r})"),
+        stream=True, session_event_type="thread.started"),)
+    rt.set_role_runtime("beta", "provider", "missing-id")
+    assert agent_run.run_agent("beta", "spawn", "provisional-8", "p") == 76
+    beta = {p["role"]: p for p in orch.presence()}["beta"]
+    assert beta["session_id"] is None
 
 
 # --- the console's runtime view ----------------------------------------------

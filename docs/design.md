@@ -18,8 +18,11 @@ into a turn that is already running. Everything below is a consequence.
 
 ## Storage: SQLite (WAL), and it is the only truth
 
-No broker, no daemon holding state in memory. Every tick rebuilds all decisions
-from the database, so a crashed orchestrator self-heals on the next tick.
+There is no message broker and no in-memory authority. In embedded mode callers
+open SQLite locally. In isolated mode one control process is the sole database
+owner and every role uses the authenticated API; runners never mount the WAL.
+Every tick rebuilds all decisions from committed database state, so a crashed
+orchestrator self-heals on the next tick.
 
 SQLite cannot wake a dormant process. deskd doesn't pretend otherwise: instead of
 faking push, it makes every wake attempt an **auditable row** with a closed loop
@@ -108,6 +111,11 @@ Liveness is derived from heartbeat age (`online`/`suspect`/`dead`/`offline`/
 `never`). Heartbeats ride the in-session hook — no extra process. Registration is
 explicit, so unrelated sessions never pollute the board.
 
+In isolated mode the same invariant is enforced at two layers: the control
+plane compare-and-swaps the token-derived role's session id, while the private
+runner serializes provider launches for that role. A service principal can plan
+wakes but cannot acquire a role, check into a meeting or publish role narration.
+
 The board shows "now executing" **only for a live session**. An ended session's
 last activity is shown as history, never as current work.
 
@@ -161,6 +169,33 @@ never arrives, the artifact stands alone and the meeting pauses or escalates.
 A human oversight identity, outside the agent role space, reachable only through
 an authenticated web adapter. Agent APIs reject it; a message claiming to be from
 them carries no authority. See [security.md](security.md).
+
+## Optional isolated control plane
+
+The isolated deployment changes transport, not the source of truth. A role
+token resolves to exactly one role; a service token has explicit non-role
+scopes. Every mutation has a stable request id. For an in-database command, the
+receipt, domain mutation and event cursor commit in one SQLite transaction. An
+external command records a durable execution lease first and never blindly
+replays an outcome that may already have happened.
+
+Clients first read an atomic snapshot at cursor N, then follow SSE after N.
+Events are resumable invalidations, not replicated state: a retention gap,
+future cursor or cursor from another server requires a new snapshot. Private
+events advance the global cursor without exposing their payload to another
+role.
+
+Shared state is deliberately small: registry, presence, tasks, inbox and
+delivery receipts, meetings, wake attempts, command receipts and workspace
+lease metadata. Provider credentials, provider transcripts, caches, private
+journals and role-local configuration stay in separate volumes. Git follows the
+same split: the workspace broker owns writable metadata and branch refs; a role
+receives only the bounded source tree for its own lease. The broker has no push,
+merge or arbitrary Git-command verb.
+
+This is a one-host isolation architecture, not a distributed database. There
+is no leader election, replication or partition-tolerance claim. See
+[control-plane.md](control-plane.md) for the wire and deployment contracts.
 
 ## What deskd deliberately does not do
 

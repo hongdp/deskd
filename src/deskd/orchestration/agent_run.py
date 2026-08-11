@@ -29,7 +29,8 @@ import sys
 from pathlib import Path
 
 from ..providers import LaunchSpec, get_provider
-from .presence import feed_append, set_status
+from .presence import (bind_session_id, discard_provisional_session,
+                       feed_append, set_status)
 from .runtime import role_runtime
 from .store import connect
 
@@ -55,6 +56,7 @@ def session_provider(role: str, session_id: str,
 
 def build_launch(role: str, mode: str, session_id: str, prompt: str, *,
                  default_allowed_tools: tuple[str, ...] | None = None,
+                 workspace_lease_id: str | None = None,
                  db_path: Path | str | None = None) -> tuple[list[str], dict, str]:
     """(argv, env_overrides, provider_name) for one launch — pure enough to
     test and to print (``deskd agent command``) without executing."""
@@ -74,10 +76,15 @@ def build_launch(role: str, mode: str, session_id: str, prompt: str, *,
     # harness's widest one — the same fail-closed direction the reference
     # script has always taken (its DESKD_WAKE_ALLOWED_TOOLS default).
     allowed = rt["allowed_tools"] or default_allowed_tools
+    workspace_path = None
+    if workspace_lease_id is not None:
+        from ..workspaces import launch_path
+        workspace_path = str(launch_path(
+            workspace_lease_id, owner_role=role, db_path=db_path))
     spec = LaunchSpec(role=role, mode=mode, session_id=session_id,
                      prompt=prompt, model=rt["model"],
                      reasoning=rt["reasoning"],
-                     allowed_tools=allowed)
+                     allowed_tools=allowed, workspace_path=workspace_path)
     return provider.command(spec), provider.environment(spec), provider_name
 
 
@@ -113,7 +120,9 @@ def _feed_lines(event: dict):
             yield "thinking", ""
 
 
-def _run_streaming(command, env, timeout, role, session_id, db_path) -> int:
+def _run_streaming(command, env, timeout, role, session_id, db_path, *,
+                   provider=None, cwd: str | None = None,
+                   session_state: dict | None = None) -> int:
     """Run the child, forward its stdout verbatim, and file what it narrates.
 
     Forwarding first is the compatibility contract: whoever reads this
@@ -121,8 +130,10 @@ def _run_streaming(command, env, timeout, role, session_id, db_path) -> int:
     capture — must see exactly what they saw before capture existed. Parsing
     is strictly additional, and every parse failure is ignored.
     """
-    proc = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+    proc = subprocess.Popen(command, env=env, cwd=cwd, stdout=subprocess.PIPE,
                             text=True, bufsize=1)
+    state = session_state if session_state is not None else {
+        "id": session_id, "bound": True}
     try:
         for line in proc.stdout:            # type: ignore[union-attr]
             sys.stdout.write(line)
@@ -133,11 +144,27 @@ def _run_streaming(command, env, timeout, role, session_id, db_path) -> int:
                 continue                    # not ours; already forwarded
             if not isinstance(event, dict):
                 continue
+            actual = (provider.session_id_from_event(event)
+                      if provider is not None else None)
+            if actual:
+                if state.get("bound") and state.get("id") != actual:
+                    raise ValueError(
+                        "provider emitted conflicting durable session ids")
+                if not state.get("bound"):
+                    # Persistence is a prerequisite to continuing the child:
+                    # failure raises, the exception path kills it, and no
+                    # resumable id exists only in worker-private memory.
+                    bind_session_id(role, session_id, actual, db_path=db_path)
+                    state.update({"id": actual, "bound": True})
             for kind, text in _feed_lines(event):
-                feed_append(role, session_id, kind, text, db_path=db_path)
+                feed_append(role, state["id"], kind, text, db_path=db_path)
         return proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
+        raise
+    except Exception:
+        proc.kill()
+        proc.wait()
         raise
     finally:
         if proc.stdout:
@@ -148,33 +175,77 @@ def run_agent(role: str, mode: str, session_id: str, prompt: str, *,
               harness_base: str = "deskd-agent",
               timeout: int | None = None,
               default_allowed_tools: tuple[str, ...] | None = None,
+              workspace_lease_id: str | None = None,
               db_path: Path | str | None = None) -> int:
     """Execute one agent turn. Returns the child's exit code (75 = a
     preflight refusal: infrastructure, not the model — retry later)."""
     command, env_overrides, provider_name = build_launch(
         role, mode, session_id, prompt,
-        default_allowed_tools=default_allowed_tools, db_path=db_path)
-    health = get_provider(provider_name).preflight()
+        default_allowed_tools=default_allowed_tools,
+        workspace_lease_id=workspace_lease_id, db_path=db_path)
+    provider = get_provider(provider_name)
+    health = provider.preflight()
     if not health.get("ok"):
         print(f"[deskd-agent] preflight failed for provider={provider_name}: "
               f"{health.get('message', health)}")
+        return 75
+    if provider.requires_session_id_event and not provider.streams:
+        print(f"[deskd-agent] provider={provider_name} requires a session-id "
+              "stream event but streaming is disabled")
         return 75
     harness = f"{harness_base}#{provider_name}"
     set_status(role, state="booting" if mode == "spawn" else "working",
                session_id=session_id, harness=harness, db_path=db_path)
     env = dict(os.environ)
-    env.update(env_overrides)
-    try:
-        if get_provider(provider_name).streams:
-            code = _run_streaming(command, env, timeout, role, session_id,
-                                  db_path)
+    # Generic child drivers must never inherit the human supervisor credential
+    # boundary. A provider patch may additionally delete host hazards such as
+    # PARLAY_LIVE_TRADING by assigning None.
+    for key in list(env):
+        if key.startswith("DESKD_SUPERVISOR_"):
+            env.pop(key, None)
+    for key, value in env_overrides.items():
+        if value is None:
+            env.pop(key, None)
         else:
-            proc = subprocess.run(command, env=env, timeout=timeout)
+            env[key] = value
+    cwd = None
+    if workspace_lease_id is not None:
+        from ..workspaces import launch_path
+        cwd = str(launch_path(workspace_lease_id, owner_role=role,
+                              db_path=db_path))
+    session_state = {
+        "id": session_id,
+        "bound": not provider.requires_session_id_event,
+    }
+    park = True
+    try:
+        if provider.streams:
+            code = _run_streaming(command, env, timeout, role, session_id,
+                                  db_path, provider=provider, cwd=cwd,
+                                  session_state=session_state)
+        else:
+            proc = subprocess.run(command, env=env, cwd=cwd, timeout=timeout)
             code = proc.returncode
+        if provider.requires_session_id_event and not session_state["bound"]:
+            print(f"[deskd-agent] provider={provider_name} exited without its "
+                  "required session-id event")
+            discard_provisional_session(role, session_id, db_path=db_path)
+            park = False
+            code = 76
     except subprocess.TimeoutExpired:
+        if provider.requires_session_id_event and not session_state["bound"]:
+            discard_provisional_session(role, session_id, db_path=db_path)
+            park = False
         code = 124
+    except Exception as exc:
+        print(f"[deskd-agent] provider={provider_name} stream/persistence failed: {exc}")
+        if provider.requires_session_id_event:
+            discard_provisional_session(role, session_id, db_path=db_path)
+            park = False
+        code = 70
     finally:
         # Park, never end: the session remains resumable; rollover retires it.
-        set_status(role, state="idle_standby", session_id=session_id,
-                   harness=harness, db_path=db_path)
+        if park:
+            set_status(role, state="idle_standby", session_id=session_state["id"],
+                       harness=harness, db_path=db_path)
     return code

@@ -28,6 +28,7 @@ contract.
 from __future__ import annotations
 
 import shutil
+import re
 from dataclasses import dataclass, field
 
 #: The engine-wide tier vocabulary. Providers map these onto their own knobs.
@@ -49,6 +50,7 @@ class LaunchSpec:
     model: str | None = None
     reasoning: str | None = None    # one of REASONING_TIERS, or None
     allowed_tools: tuple[str, ...] | None = None
+    workspace_path: str | None = None
 
 
 class Provider:
@@ -75,11 +77,20 @@ class Provider:
     #: relies on — see docs/session-feed.md.
     streams: bool = False
 
+    @property
+    def requires_session_id_event(self) -> bool:
+        return False
+
     def command(self, spec: LaunchSpec) -> list[str]:
         raise NotImplementedError
 
-    def environment(self, spec: LaunchSpec) -> dict[str, str]:
+    def environment(self, spec: LaunchSpec) -> dict[str, str | None]:
+        """Child-environment patch: ``None`` deletes an inherited key."""
         return {}
+
+    def session_id_from_event(self, event: dict) -> str | None:
+        """Provider-minted durable session id carried by a stream event."""
+        return None
 
     def preflight(self) -> dict:
         return {"ok": True, "provider": self.name}
@@ -134,7 +145,7 @@ class ClaudeCodeProvider(Provider):
             cmd.extend(["--allowedTools", ",".join(spec.allowed_tools)])
         return cmd
 
-    def environment(self, spec: LaunchSpec) -> dict[str, str]:
+    def environment(self, spec: LaunchSpec) -> dict[str, str | None]:
         if spec.reasoning and spec.reasoning in self.thinking_budgets:
             return {"MAX_THINKING_TOKENS": str(self.thinking_budgets[spec.reasoning])}
         return {}
@@ -178,8 +189,26 @@ class CommandProvider(Provider):
     template: tuple[str, ...] = ()
     resume_template: tuple[str, ...] | None = None
     env: dict = field(default_factory=dict)
+    #: Explicit inherited-key removals.  This is a patch, not an overlay-only
+    #: map: a host can fail closed on e.g. PARLAY_LIVE_TRADING even when the
+    #: driver process inherited it.
+    unset_env: tuple[str, ...] = ()
+    #: Opt into newline-delimited JSON capture for CLIs that promise it.
+    stream: bool = False
+    #: Event carrying the provider-minted resumable id.  Codex uses
+    #: type='thread.started', path ('thread_id',).
+    session_event_type: str | None = None
+    session_id_path: tuple[str, ...] = ("thread_id",)
     name: str = "command"
     models: tuple[str, ...] = ()
+
+    @property
+    def streams(self) -> bool:            # type: ignore[override]
+        return self.stream
+
+    @property
+    def requires_session_id_event(self) -> bool:
+        return self.session_event_type is not None
 
     def _values(self, spec: LaunchSpec) -> dict[str, str | None]:
         return {
@@ -188,6 +217,7 @@ class CommandProvider(Provider):
             "reasoning": spec.reasoning,
             "allowed_tools": ",".join(spec.allowed_tools)
             if spec.allowed_tools else None,
+            "workspace_path": spec.workspace_path,
         }
 
     @staticmethod
@@ -220,10 +250,20 @@ class CommandProvider(Provider):
             raise ValueError(f"provider {self.name!r} has an empty template")
         return self._fill(parts, self._values(spec))
 
-    def environment(self, spec: LaunchSpec) -> dict[str, str]:
+    def environment(self, spec: LaunchSpec) -> dict[str, str | None]:
         values = self._values(spec)
-        out = {}
+        key_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        out: dict[str, str | None] = {}
+        for key in self.unset_env:
+            if not key_re.fullmatch(key):
+                raise ValueError(f"invalid environment key to unset: {key!r}")
+            out[key] = None
         for key, tmpl in self.env.items():
+            if not key_re.fullmatch(key):
+                raise ValueError(f"invalid environment key: {key!r}")
+            if tmpl is None:
+                out[key] = None
+                continue
             keys = [k for k in values if "{" + k + "}" in tmpl]
             if any(values[k] is None for k in keys):
                 continue
@@ -232,6 +272,21 @@ class CommandProvider(Provider):
                 text = text.replace("{" + k + "}", str(values[k]))
             out[key] = text
         return out
+
+    def session_id_from_event(self, event: dict) -> str | None:
+        if not self.session_event_type or event.get("type") != self.session_event_type:
+            return None
+        value: object = event
+        for part in self.session_id_path:
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not value or len(value) > 256 or any(ord(c) < 33 for c in value):
+            return None
+        return value
 
     def preflight(self) -> dict:
         binary = (self.template[0] if self.template else "")

@@ -82,6 +82,7 @@ from .config import (
     SUPERVISOR_PUBLIC_KEY_PATH,
     env,
 )
+from . import transaction
 
 __all__ = [
     "AuthError",
@@ -180,6 +181,10 @@ def connect(db_path: Path | str | None = None, *,
     fails fast rather than deadlocking at COMMIT.
     """
     path = Path(db_path or CONFIG.db_path)
+    ambient = transaction.current(path)
+    if ambient is not None:
+        yield ambient
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=30)
     try:
