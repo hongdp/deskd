@@ -364,6 +364,29 @@ jobs:
           token='release-reader-token-0000000000000000000001'
           token_hash="$(printf '%s' "${token}" | sha256sum | cut -d' ' -f1)"
           secret_dir="$(mktemp -d)"
+          cat > "${secret_dir}/platform-ref.py" <<'PY'
+          import json
+          import re
+          import sys
+
+          index_path, image, wanted_os, wanted_arch = sys.argv[1:]
+          payload = json.loads(open(index_path, encoding="utf-8").read())
+          matches = [
+              item for item in payload.get("manifests", [])
+              if item.get("platform", {}).get("os") == wanted_os
+              and item.get("platform", {}).get("architecture") == wanted_arch
+              and not item.get("platform", {}).get("variant")
+          ]
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"release index has {len(matches)} {wanted_os}/{wanted_arch} manifests"
+              )
+          digest = matches[0].get("digest", "")
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("release platform manifest has an invalid digest")
+          repository = image.split("@", 1)[0]
+          print(f"{repository}@{digest}")
+          PY
           cat > "${secret_dir}/broker-smoke.py" <<'PY'
           import os
           import pathlib
@@ -438,7 +461,8 @@ jobs:
           PY
           printf '{"version":1,"principals":[{"subject":"release-reader","scopes":["read"],"token_sha256":"%s"}]}\n' \
             "${token_hash}" > "${secret_dir}/service-tokens.json"
-          chmod 0444 "${secret_dir}/broker-smoke.py"
+          chmod 0444 "${secret_dir}/platform-ref.py" \
+            "${secret_dir}/broker-smoke.py"
           chmod 0600 "${secret_dir}/service-tokens.json"
           sudo chown 65532:65532 \
             "${secret_dir}/broker-smoke.py" "${secret_dir}/service-tokens.json"
@@ -451,27 +475,28 @@ jobs:
 
           smoke_arch() {
             arch="$1"
+            arch_image="$2"
             slug="${arch//\//-}"
             container="deskd-release-${slug}-${GITHUB_RUN_ID}"
-            docker pull --platform "${arch}" "${RELEASE_IMAGE}" >/dev/null
-            test "$(docker image inspect "${RELEASE_IMAGE}" --format \
+            docker pull --platform "${arch}" "${arch_image}" >/dev/null
+            test "$(docker image inspect "${arch_image}" --format \
               '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" \
               = "${EXPECTED_REVISION}"
-            test "$(docker image inspect "${RELEASE_IMAGE}" --format \
+            test "$(docker image inspect "${arch_image}" --format \
               '{{ .Config.User }}')" = 'deskd:deskd'
             test "$(docker run --rm --platform "${arch}" --entrypoint deskd \
-              "${RELEASE_IMAGE}" --version)" = "${EXPECTED}"
+              "${arch_image}" --version)" = "${EXPECTED}"
             docker run --rm --platform "${arch}" --read-only \
               --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
               --mount "type=bind,src=${secret_dir}/broker-smoke.py,dst=/tmp/broker-smoke.py,readonly" \
-              --entrypoint python "${RELEASE_IMAGE}" /tmp/broker-smoke.py
+              --entrypoint python "${arch_image}" /tmp/broker-smoke.py
             docker run --detach --name "${container}" \
               --label io.deskd.release-smoke="${GITHUB_RUN_ID}" \
               --platform "${arch}" --init --read-only \
               --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
               --mount "type=bind,src=${secret_dir}/service-tokens.json,dst=/run/secrets/service-tokens.json,readonly" \
               --env DESKD_SERVICE_TOKENS_FILE=/run/secrets/service-tokens.json \
-              --publish 127.0.0.1::8000 "${RELEASE_IMAGE}"
+              --publish 127.0.0.1::8000 "${arch_image}"
             port="$(docker port "${container}" 8000/tcp | sed -n 's/.*://p')"
             test -n "${port}"
             healthy=0
@@ -497,8 +522,15 @@ jobs:
           }
 
           docker buildx imagetools inspect "${RELEASE_IMAGE}"
-          smoke_arch linux/amd64
-          smoke_arch linux/arm64
+          docker buildx imagetools inspect --raw "${RELEASE_IMAGE}" \
+            > "${secret_dir}/image-index.json"
+          amd64_image="$(python3 "${secret_dir}/platform-ref.py" \
+            "${secret_dir}/image-index.json" "${RELEASE_IMAGE}" linux amd64)"
+          arm64_image="$(python3 "${secret_dir}/platform-ref.py" \
+            "${secret_dir}/image-index.json" "${RELEASE_IMAGE}" linux arm64)"
+          test "${amd64_image}" != "${arm64_image}"
+          smoke_arch linux/amd64 "${amd64_image}"
+          smoke_arch linux/arm64 "${arm64_image}"
       - name: Promote the verified digest to immutable release tags
         env:
           IMAGE: ${{ steps.names.outputs.image }}
