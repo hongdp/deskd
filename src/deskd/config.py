@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -105,6 +106,67 @@ class ConsoleLink:
             raise ValueError("console link href must be a root-relative path")
         if not self.label.strip():
             raise ValueError("console link label is required")
+
+
+_REPOSITORY_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
+_BRANCH_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*/$")
+
+
+@dataclass(frozen=True)
+class RepositorySpec:
+    """One repository the deterministic workspace broker may touch.
+
+    Agent requests name ``name``; they never supply a filesystem path.  Bases
+    are exact allowlisted ref names, and every created branch must start with
+    ``branch_prefix``.  ``allowed_roles`` being empty means every registered
+    agent role may lease this repository; production hosts should normally
+    narrow it (for example to their engineer role).
+
+    Both paths must be absolute.  The repository contains the broker-owned Git
+    metadata; ``worktree_root`` contains lease directories that may be mounted
+    into agent containers.  The agent container must not receive the repository
+    path or any writable Git metadata mount.
+    """
+
+    name: str
+    path: Path
+    worktree_root: Path
+    allowed_bases: tuple[str, ...] = ("origin/main",)
+    branch_prefix: str = "codex/"
+    allowed_roles: tuple[str, ...] = ()
+    lease_seconds: int = 86_400
+    # Broker-side defence in depth.  Production should also put a filesystem
+    # quota on ``worktree_root``; these limits make a single lease fail closed
+    # before Git is asked to enumerate or stage an unbounded tree.
+    max_files: int = 20_000
+    max_file_bytes: int = 64 * 1024 * 1024
+    max_total_bytes: int = 512 * 1024 * 1024
+    max_git_output_bytes: int = 2 * 1024 * 1024
+    # Kept last so the original positional RepositorySpec contract remains
+    # stable (the fourth positional argument is still ``allowed_bases``).
+    container_worktree_root: Path = Path("/workspaces")
+
+    def __post_init__(self) -> None:
+        if not _REPOSITORY_NAME_RE.fullmatch(self.name):
+            raise ValueError(
+                "repository name must match [a-z][a-z0-9_-]{0,62}")
+        if (not self.path.is_absolute() or not self.worktree_root.is_absolute()
+                or not self.container_worktree_root.is_absolute()):
+            raise ValueError(
+                "repository, broker worktree and container worktree paths must be absolute")
+        if not self.allowed_bases or any(
+                not ref or ref.startswith("-") or any(c.isspace() for c in ref)
+                for ref in self.allowed_bases):
+            raise ValueError("repository allowed_bases must be non-empty safe refs")
+        if (not _BRANCH_PREFIX_RE.fullmatch(self.branch_prefix)
+                or ".." in self.branch_prefix or "//" in self.branch_prefix):
+            raise ValueError("repository branch_prefix must be a safe ref prefix")
+        if self.lease_seconds < 60:
+            raise ValueError("repository lease_seconds must be at least 60")
+        if (self.max_files < 1 or self.max_file_bytes < 1
+                or self.max_total_bytes < self.max_file_bytes
+                or self.max_git_output_bytes < 4096):
+            raise ValueError("repository workspace/output quotas are invalid")
 
 
 # --- wake ladder ------------------------------------------------------------
@@ -248,6 +310,57 @@ class EngineConfig:
     providers: tuple = ()
     #: Provider a role launches with when its registry row pins none.
     default_provider: str = "claude"
+
+    #: Repositories exposed through the non-LLM workspace broker.  Empty is a
+    #: fail-closed default: no agent can cause deskd to run Git anywhere.
+    repositories: tuple[RepositorySpec, ...] = ()
+
+    #: Host command adapters installed into the authenticated control API.
+    #: Entries are ``deskd.control.HostCommand`` objects, kept opaque here to
+    #: preserve the config -> control import direction.
+    command_handlers: tuple = ()
+
+    #: Explicit role-to-role task delegation edges.  Self-assignment is always
+    #: allowed; cross-role assignment is denied unless ``(sender, target)`` is
+    #: listed here.  The message transport has no equivalent policy because it
+    #: carries no execution authority: every configured role may address every
+    #: other configured role, with the sender always credential-derived.
+    task_delegations: tuple[tuple[str, str], ...] = ()
+
+    #: A duplicate external request only takes over a recoverable operation
+    #: after this durable execution lease has gone stale.  Live duplicates
+    #: return the existing running job and never invoke the callback twice.
+    external_command_lease_seconds: int = 900
+
+    #: Production control containers set this true.  Legacy HTML and open
+    #: projection routes then return 404, leaving only bearer-authenticated
+    #: control endpoints plus /healthz.  A separate trusted console process may
+    #: expose the legacy UI; agent containers must never share that socket.
+    control_api_only: bool = field(default_factory=lambda:
+        str(env("CONTROL_API_ONLY") or "").lower() in {"1", "true", "yes", "on"})
+
+    #: Version provenance copied into agent self-projections and workspace
+    #: leases.  Hosts should pin immutable build identifiers in production.
+    config_version: str = field(
+        default_factory=lambda: env("CONFIG_VERSION") or "unversioned")
+    prompt_version: str = field(
+        default_factory=lambda: env("PROMPT_VERSION") or "unversioned")
+    agent_image: str = field(
+        default_factory=lambda: env("AGENT_IMAGE") or "unversioned")
+    #: Immutable deployment provenance. ``agent_image`` remains a human label;
+    #: these two are the content-addressed image/source pins workers must echo.
+    image_digest: str = field(
+        default_factory=lambda: env("IMAGE_DIGEST") or "unversioned")
+    build_revision: str = field(
+        default_factory=lambda: env("BUILD_REVISION") or "unversioned")
+
+    #: Private host-only root for artifacts uploaded through the authenticated
+    #: review control API.  ``None`` is deliberately fail-closed: a production
+    #: host must choose and mount the path; agent containers never name it.
+    review_artifact_root: Path | None = field(default_factory=lambda: (
+        Path(value) if (value := env("REVIEW_ARTIFACT_ROOT")) else None))
+    review_artifact_max_bytes: int = field(default_factory=lambda:
+        int(env("REVIEW_ARTIFACT_MAX_BYTES") or 1024 * 1024))
 
     def role_names(self) -> tuple[str, ...]:
         return tuple(r.name for r in self.roles)

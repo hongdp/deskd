@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Sequence
 
-from .. import auth, mailbox
+from .. import auth, mailbox, transaction
 from ..config import CONFIG
 from ..text import clean_prose
 
@@ -234,7 +234,12 @@ def connect(db_path: Path | str | None = None, *,
     `supervisor_nonces`, so the nonce ledger must already exist before any
     supervisor-authenticated row can be written.
     """
-    with mailbox.connect(db_path) as conn:
+    path = Path(db_path or CONFIG.db_path)
+    ambient = transaction.current(path)
+    if ambient is not None:
+        yield ambient
+        return
+    with mailbox.connect(path) as conn:
         conn.executescript(auth.SCHEMA)
         conn.executescript(MEETING_SCHEMA)
         _migrate(conn)

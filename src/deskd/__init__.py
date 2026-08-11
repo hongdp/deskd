@@ -57,6 +57,7 @@ from .config import (
     ConsoleLink,
     EngineConfig,
     PromptBuilder,
+    RepositorySpec,
     RoleSpec,
     WakeRung,
     __version__,
@@ -71,6 +72,7 @@ __all__ = [
     "configure",
     "ConsoleLink",
     "RoleSpec",
+    "RepositorySpec",
     "PromptBuilder",
     "WakeRung",
     "DEFAULT_WAKE_LADDER",
@@ -84,6 +86,8 @@ __all__ = [
     "mailbox",
     "meetings",
     "orchestration",
+    "control",
+    "workspaces",
 ]
 
 
@@ -104,7 +108,8 @@ def __getattr__(name: str) -> ModuleType:
     by `deskd.channels.register_channel(...)` did not — which is precisely the
     spelling the meetings deprecation warning points people at.
     """
-    if name in ("auth", "channels", "mailbox", "meetings", "orchestration"):
+    if name in ("auth", "channels", "mailbox", "meetings", "orchestration",
+                "control", "workspaces"):
         import importlib
 
         module = importlib.import_module(f".{name}", __name__)
