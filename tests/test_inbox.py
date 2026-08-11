@@ -9,12 +9,15 @@ interrupt while an urgent one isn't held behind a batch window.
 
 from __future__ import annotations
 
+import datetime as dt
+from unittest import mock
 import pytest
 
 from conftest import iso, scalar
 from deskd import config as cfg_mod
 from deskd import orchestration as o
 from deskd.config import CONFIG
+from deskd.orchestration import store
 
 
 # --- dedup ------------------------------------------------------------------
@@ -226,3 +229,66 @@ def test_an_older_reads_table_is_migrated_rather_than_ignored(tmp_path):
         assert row["last_id"] == 0, (
             "the old row cannot say what had been seen; 0 claims nothing was, "
             "which costs an extra wake and never acks an unread notice")
+
+
+# --- when a queued inbox becomes a wake -------------------------------------
+# The board used to show "idle" beside a non-empty inbox for the whole batching
+# window, with nothing on screen separating "due shortly" from "nobody is
+# coming". Both are a full inbox and an idle seat.
+
+def test_a_queued_item_is_due_after_the_batch_window(desk):
+    o.inbox_enqueue("alpha", "system", "not urgent")
+    (item,) = o.inbox_pending("alpha")
+    due = o.inbox_wake_due_at([item])
+    expected = (dt.datetime.fromisoformat(item["enqueued_at"])
+                + dt.timedelta(seconds=CONFIG.inbox_batch_seconds))
+    assert dt.datetime.fromisoformat(due) == expected
+
+
+def test_an_urgent_item_is_due_the_moment_it_lands(desk):
+    """Urgent does not wait, so its countdown must not invent one."""
+    o.inbox_enqueue("alpha", "system", "urgent one", priority="urgent")
+    (item,) = o.inbox_pending("alpha")
+    assert o.inbox_wake_due_at([item]) == item["enqueued_at"]
+
+
+def test_one_urgent_item_pulls_the_whole_batch_forward(desk):
+    """It rides along with everything else queued for that role, so the due
+    instant is the urgent one's, not the oldest item's window."""
+    o.inbox_enqueue("alpha", "system", "ordinary")
+    o.inbox_enqueue("alpha", "system", "urgent one", priority="urgent")
+    items = o.inbox_pending("alpha")
+    assert o.inbox_wake_due_at(items) == min(i["enqueued_at"] for i in items)
+
+
+def test_an_empty_queue_has_no_due_instant(desk):
+    assert o.inbox_wake_due_at([]) is None
+
+
+def test_the_view_carries_the_due_instant_for_the_console(desk):
+    o.inbox_enqueue("alpha", "system", "shown on the board")
+    view = o.board()
+    row = next(a for a in view["agents"] if a["role"] == "alpha")
+    assert row["inbox"]["wake_due_at"], (
+        "the board cannot render a countdown the payload does not carry")
+
+
+def test_the_planner_raises_the_demand_exactly_when_the_due_instant_says(desk):
+    """The anti-drift property, and the reason the rule has one home.
+
+    A countdown that disagrees with the planner is worse than no countdown,
+    because it looks like an answer. This pins them to each other rather than
+    to a literal, so moving the rule moves both or fails here.
+    """
+    o.inbox_enqueue("alpha", "system", "batched")
+    items = o.inbox_pending("alpha")
+    due = dt.datetime.fromisoformat(o.inbox_wake_due_at(items))
+
+    def demand_at(when):
+        with mock.patch.object(store, "_now", return_value=when):
+            with o.connect() as conn:
+                return [d for d in o.collect_wake_demand(conn)
+                        if d["reason_kind"] == "inbox" and d["role"] == "alpha"]
+
+    assert demand_at(due - dt.timedelta(seconds=1)) == [], "not due yet"
+    assert demand_at(due + dt.timedelta(seconds=1)), "due, so it must be raised"

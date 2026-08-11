@@ -17,7 +17,8 @@ from . import store
 from ..config import CONFIG, PROJECT_NAME, WakeRung
 from .delivery import _delivery_state, _wake_keys, sync_delivery
 from .hooks import _eval_wake_hooks
-from .inbox import _inbox_sort_key, _route_unroutable
+from .inbox import (_inbox_sort_key, _route_unroutable,
+                    inbox_wake_due_at)
 from .presence import _is_busy, _presence_list
 from .store import (_agent_role, _iso, _known_roles, _load_json,
                     _log_event, _session_day, connect)
@@ -324,9 +325,12 @@ def collect_wake_demand(conn: sqlite3.Connection) -> list[dict]:
         inbox_by_role.setdefault(r["target_role"], []).append(r)
     for role, items in inbox_by_role.items():
         oldest = min(i["enqueued_at"] for i in items)
-        has_urgent = any(i["priority"] == "urgent" for i in items)
-        age = (now - dt.datetime.fromisoformat(oldest)).total_seconds()
-        if has_urgent or age > CONFIG.inbox_batch_seconds:
+        # inbox_wake_due_at owns this rule. The console renders its countdown
+        # from the same call, so "waking in 40s" cannot drift from when the
+        # wake actually happens — a countdown that disagrees with the planner
+        # is worse than no countdown, because it looks like an answer.
+        due = inbox_wake_due_at(items)
+        if due is not None and now >= dt.datetime.fromisoformat(due):
             demands.append({"role": role, "reason_kind": "inbox",
                             "source_ref": f"inbox:{role}",
                             "label": f"{len(items)} notification(s)", "since_at": oldest})
