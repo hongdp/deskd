@@ -5,6 +5,7 @@ and the meeting -> task projection.
 from __future__ import annotations
 
 import sqlite3
+import warnings
 from pathlib import Path
 
 from ..config import CONFIG
@@ -42,6 +43,46 @@ def _task_view(row: dict, now_iso: str) -> dict:
     return out
 
 
+def _is_thread(conn: sqlite3.Connection, thread_id: str) -> bool:
+    return conn.execute("SELECT 1 FROM meetings WHERE thread_id=?",
+                        (thread_id,)).fetchone() is not None
+
+
+def _normalize_meeting_ref(conn: sqlite3.Connection,
+                           source_ref: str | None) -> tuple[str | None, str | None]:
+    """Reduce a `source_kind='meeting'` ref to the thread id it names.
+
+    Agents cite a meeting the way they read it — `<thread>#412`, `<thread>:412`
+    — because that is how the wake demand and the console spell a message. The
+    ledger stores one column and queries it against `meetings.thread_id`, so
+    the suffixed spelling names nothing: the projection cannot resolve it and
+    the board shows a reference no reader can follow.
+
+    Resolution decides, not syntax. Strip a trailing message number ONLY when
+    what remains is a thread this desk actually held, which is what keeps a
+    ref like `risk_policy.md#2026-07-21` — a real ref whose `#` means something
+    else entirely — from being mangled by a rule that only counted separators.
+
+    Returns ``(ref, note)``. The note is never an error: a ref that resolves to
+    nothing is still stored as typed. Losing the citation is a worse outcome
+    than keeping one that has to be read by hand, and the caller asked for a
+    task, not for a lecture about its provenance.
+    """
+    ref = (source_ref or "").strip()
+    if not ref or _is_thread(conn, ref):
+        return source_ref, None
+    for sep in ("#", ":"):
+        head, found, tail = ref.rpartition(sep)
+        if found and tail.isdigit() and _is_thread(conn, head):
+            return head, (f"--ref {ref!r} names message {tail} of a meeting; "
+                          f"stored as the thread id {head!r}, which is what the "
+                          f"ledger can resolve. The message stays findable "
+                          f"inside the thread.")
+    return source_ref, (f"--ref {ref!r} names no meeting on this desk; stored "
+                        f"as typed. The task is created either way — but "
+                        f"nothing on the board will be able to follow it.")
+
+
 def task_add(title: str, *, assignee_role: str, detail: str | None = None,
              priority: str = "normal", source_kind: str = "self",
              source_ref: str | None = None, due_at: str | None = None,
@@ -51,6 +92,11 @@ def task_add(title: str, *, assignee_role: str, detail: str | None = None,
 
     ``due_at`` is a SOFT deadline: it drives ordering and the overdue flag, and
     never wakes anyone. Only priority='urgent' generates a wake demand.
+
+    A `meeting` ref is normalized on the way in (see `_normalize_meeting_ref`).
+    Other kinds are stored verbatim: `self` refs are free-form traces that
+    deliberately carry several parts (`tasks:230,229`, `scan:f360b4fe`), and
+    normalizing those would destroy what the author wrote.
     """
     now = _iso()
     title = _clean(title, "title")
@@ -62,6 +108,9 @@ def task_add(title: str, *, assignee_role: str, detail: str | None = None,
     with connect(db_path, write=True) as conn:
         assignee_role = _agent_role(conn, assignee_role)
         created_by = _clean(created_by, "created_by", required=False) or assignee_role
+        ref_note = None
+        if source_kind == "meeting":
+            source_ref, ref_note = _normalize_meeting_ref(conn, source_ref)
         cur = conn.execute(
             """INSERT INTO agent_tasks
                    (title, detail, assignee_role, status, priority, source_kind,
@@ -73,6 +122,15 @@ def task_add(title: str, *, assignee_role: str, detail: str | None = None,
         task_id = cur.lastrowid
         _log_event(conn, created_by, "task_add", str(task_id),
                    {"assignee": assignee_role, "priority": priority, "title": title})
+        if ref_note:
+            # Two audiences, and only one of them is present. The event is the
+            # durable half — a note that exists only on a terminal nobody was
+            # watching is a note that was never delivered. The warning is the
+            # courtesy half: it reaches the stderr of whoever typed the command
+            # without any host CLI having to learn about this at all.
+            _log_event(conn, created_by, "task_ref_note", str(task_id),
+                       {"stored": source_ref, "note": ref_note})
+            warnings.warn(f"task #{task_id}: {ref_note}", stacklevel=2)
         return task_id
 
 
