@@ -22,9 +22,13 @@ RUN apt-get update \
        --home-dir /var/lib/deskd --no-create-home --shell /usr/sbin/nologin deskd
 
 WORKDIR /opt/deskd
+COPY requirements-container.in requirements-container.lock /tmp/
+RUN python -m pip install --require-hashes \
+      --requirement /tmp/requirements-container.lock \
+    && rm -f /tmp/requirements-container.in /tmp/requirements-container.lock
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
-RUN python -m pip install ".[web]" \
+RUN python -m pip install --no-deps --no-build-isolation . \
     && mkdir -p /var/lib/deskd \
     && chown -R deskd:deskd /var/lib/deskd /opt/deskd
 

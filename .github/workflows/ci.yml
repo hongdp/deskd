@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,3 +27,24 @@ jobs:
           cache: pip
       - run: python -m pip install -e ".[web,tui]" pytest httpx httpx2
       - run: python -m pytest -q
+
+  container:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: deskd-ci:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke-test the non-root image and packaged CLI
+        run: |
+          test "$(docker image inspect deskd-ci:${GITHUB_SHA} --format '{{.Config.User}}')" = "deskd:deskd"
+          expected="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/deskd/config.py)"
+          test -n "${expected}"
+          test "$(docker run --rm deskd-ci:${GITHUB_SHA} deskd --version)" = "deskd ${expected}"
