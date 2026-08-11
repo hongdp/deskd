@@ -18,7 +18,8 @@ from .client import (
     load_api_token,
     parse_sse,
 )
-from .commands import CommandRequest, LocalAction, command_help, parse_command
+from .commands import (CommandRequest, LocalAction, capabilities_from_meta,
+                       command_help, command_hint, parse_command)
 
 __all__ = [
     "APIError",
@@ -31,7 +32,9 @@ __all__ = [
     "LocalAction",
     "ProtocolError",
     "SSEEvent",
+    "capabilities_from_meta",
     "command_help",
+    "command_hint",
     "load_api_token",
     "parse_command",
     "parse_sse",

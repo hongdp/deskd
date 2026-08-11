@@ -15,6 +15,10 @@ from deskd.tui.client import (APIError, ClientError, ConnectionNotice,
                               load_api_token, parse_sse)
 
 
+CURSOR_1 = "evt_0123456789abcdef_0000000000000001"
+CURSOR_2 = "evt_0123456789abcdef_0000000000000002"
+
+
 class FakeResponse:
     def __init__(self, payload=b"", *, content_type="application/json", status=200,
                  lines=None):
@@ -72,7 +76,7 @@ def http_error(status, detail):
 def test_sse_parser_preserves_opaque_cursor_multiline_data_and_heartbeat():
     events = list(parse_sse([
         b": keepalive\n",
-        b"id: evt_0000000a\n",
+        b"id: evt_0123456789abcdef_000000000000000a\n",
         b"event: resource.changed\n",
         b"retry: 2500\n",
         b'data: {"resource":"task",\n',
@@ -80,7 +84,7 @@ def test_sse_parser_preserves_opaque_cursor_multiline_data_and_heartbeat():
         b"\n",
     ]))
     assert events[0] == SSEEvent("heartbeat", {"comment": "keepalive"})
-    assert events[1].id == "evt_0000000a"
+    assert events[1].id == "evt_0123456789abcdef_000000000000000a"
     assert events[1].event == "resource.changed"
     assert events[1].data == {"resource": "task", "id": 7}
     assert events[1].retry_ms == 2500
@@ -169,6 +173,39 @@ def test_legacy_snapshot_fallback_is_explicitly_non_atomic_and_flattens_inbox():
                                      (2, "operator", "delivered")]
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_no_auth_control_rejection_falls_back_to_legacy_projections(status):
+    replies = {
+        ("GET", "/api/snapshot"): http_error(status, "Bearer token required"),
+        ("GET", "/api/board"): response(
+            {"generated_at": "now", "health": {}, "agents": []}),
+        ("GET", "/api/tasks"): response({"tasks": [], "stalled_ids": []}),
+        ("GET", "/api/meetings"): response([]),
+        ("GET", "/api/hooks"): response([]),
+        ("GET", "/api/wake"): response({"attempts": []}),
+        ("GET", "/api/runtime"): response({"roles": []}),
+        ("GET", "/api/meeting-meta"): response({"project": "deskd"}),
+    }
+    transport = FakeTransport(replies)
+    snapshot = ControlPlaneClient(
+        "https://deskd.example", transport=transport).fetch_snapshot()
+    assert snapshot.consistent is False
+    assert len(transport.requests) == 8
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_authenticated_control_rejection_never_downgrades_to_legacy(status):
+    transport = FakeTransport({
+        ("GET", "/api/snapshot"): http_error(status, "invalid bearer token"),
+    })
+    client = ControlPlaneClient(
+        "https://deskd.example", token="present", transport=transport)
+    with pytest.raises(APIError) as caught:
+        client.fetch_snapshot()
+    assert caught.value.status == status
+    assert len(transport.requests) == 1
+
+
 def test_command_has_idempotency_but_never_client_claimed_actor():
     transport = FakeTransport({
         ("POST", "/api/commands"): response(
@@ -200,21 +237,22 @@ def test_http_errors_are_bounded_and_cursor_conflict_is_typed():
 def test_event_follower_sends_both_cursor_forms_and_stops_cleanly():
     stream = FakeResponse(
         content_type="text/event-stream; charset=utf-8",
-        lines=[b"id: evt_0002\n", b"event: task.changed\n", b"data: {}\n", b"\n"])
+        lines=[f"id: {CURSOR_2}\n".encode(), b"event: task.changed\n",
+               b"data: {}\n", b"\n"])
     transport = FakeTransport({("GET", "/api/events"): stream})
     client = ControlPlaneClient("https://deskd.example", transport=transport)
     stop = threading.Event()
-    tail = client.follow_events(stop, cursor="evt_0001", min_backoff=0.01)
+    tail = client.follow_events(stop, cursor=CURSOR_1, min_backoff=0.01)
     assert next(tail).state == "connecting"
     assert next(tail).state == "connected"
     event = next(tail)
-    assert isinstance(event, SSEEvent) and event.id == "evt_0002"
+    assert isinstance(event, SSEEvent) and event.id == CURSOR_2
     stop.set()
     assert list(tail) == []
     request, timeout = transport.requests[0]
-    assert request.get_header("Last-event-id") == "evt_0001"
+    assert request.get_header("Last-event-id") == CURSOR_1
     assert urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query) == {
-        "after": ["evt_0001"]}
+        "after": [CURSOR_1]}
     assert timeout >= 30
 
 
@@ -227,4 +265,27 @@ def test_cursor_expiry_stops_follower_until_caller_obtains_new_snapshot():
     items = list(client.follow_events(stop, cursor="evt_old", min_backoff=0.01))
     assert [item.state for item in items if isinstance(item, ConnectionNotice)] == [
         "connecting", "cursor_expired"]
+    assert len(transport.requests) == 1
+
+
+def test_sse_reset_immediately_requires_snapshot_without_stale_reconnect():
+    stream = FakeResponse(
+        content_type="text/event-stream",
+        lines=[
+            f"id: {CURSOR_2}\n".encode(), b"event: change\n",
+            b'data: {"resource":"task"}\n',
+            b"\n", b"event: reset\n",
+            b'data: {"error":"event cursor expired","resnapshot":true}\n', b"\n",
+        ])
+    transport = FakeTransport({("GET", "/api/events"): [stream]})
+    client = ControlPlaneClient("https://deskd.example", transport=transport)
+    items = list(client.follow_events(
+        threading.Event(), cursor=CURSOR_1, min_backoff=0.01))
+
+    assert [item.event for item in items if isinstance(item, SSEEvent)] == ["change"]
+    notices = [item for item in items if isinstance(item, ConnectionNotice)]
+    assert [item.state for item in notices] == [
+        "connecting", "connected", "cursor_expired"]
+    assert notices[-1].cursor is None
+    assert notices[-1].retry_in == 0.0
     assert len(transport.requests) == 1

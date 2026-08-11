@@ -163,6 +163,16 @@ def wake_rows(snapshot: DeskSnapshot) -> list[tuple[str, ...]]:
             short(item.get("reason") or item.get("demand_key"), 70),
             age(item.get("attempted_at") or item.get("created_at")),
         ))
+    for item in snapshot.wake.get("quarantine", []):
+        if not isinstance(item, Mapping):
+            continue
+        detail = item.get("error") or (
+            f"{item.get('mode') or 'unknown'} provider outcome is indeterminate")
+        rows.append((
+            str(item.get("claim_id") or "?"), str(item.get("role") or "?"),
+            "!", str(item.get("channel") or "?"), "QUARANTINED",
+            short(detail, 70), age(item.get("claimed_at")),
+        ))
     return rows
 
 
@@ -197,6 +207,9 @@ def health_text(snapshot: DeskSnapshot) -> str:
     parts = [f"{label}: {health.get(key, 0)}" for label, key in keys]
     if health.get("human_rung_unwired"):
         parts.append("HUMAN RUNG UNWIRED")
+    quarantine = snapshot.wake.get("quarantine") or []
+    if isinstance(quarantine, list) and quarantine:
+        parts.append(f"WAKE QUARANTINE: {len(quarantine)}")
     if not snapshot.consistent:
         parts.append("compat snapshot (non-atomic)")
     return "  •  ".join(parts)

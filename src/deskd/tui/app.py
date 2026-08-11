@@ -20,7 +20,8 @@ from textual.widgets import TabbedContent, TabPane
 
 from .client import (ClientError, ConnectionNotice, ControlPlaneClient,
                      DeskSnapshot, SSEEvent)
-from .commands import CommandRequest, LocalAction, command_help, parse_command
+from .commands import (CommandRequest, LocalAction, capabilities_from_meta,
+                       command_help, command_hint, parse_command)
 from .model import (agent_rows, health_text, hook_rows, inbox_rows, meeting_rows,
                     runtime_rows, safe_text, task_rows, transcript_lines, wake_rows)
 
@@ -120,7 +121,7 @@ class DeskTUI(App[None]):
                 yield DataTable(id="runtime", cursor_type="row", zebra_stripes=True)
             with TabPane("Activity", id="activity-tab"):
                 yield RichLog(id="events", wrap=True, markup=True, highlight=True)
-        yield Label("@ROLE instruction  •  /help  •  Ctrl+L focuses composer", id="composer-help")
+        yield Label(command_hint(allowed_verbs=()), id="composer-help")
         yield Input(placeholder="@role instruction or /command", id="composer")
         yield Footer()
 
@@ -137,6 +138,14 @@ class DeskTUI(App[None]):
     def action_focus_composer(self) -> None:
         self.query_one("#composer", Input).focus()
 
+    def _composer_capabilities(self) -> tuple[frozenset[str] | None, str | None]:
+        if self.snapshot is None or not self.snapshot.consistent:
+            # Do not offer remote commands before authority is known, or while
+            # using projection-only compatibility endpoints with no command
+            # contract. Local /help, /refresh and /quit remain available.
+            return frozenset(), None
+        return capabilities_from_meta(self.snapshot.meta)
+
     def action_refresh(self) -> None:
         if self._refresh_scheduled:
             return
@@ -144,9 +153,11 @@ class DeskTUI(App[None]):
         self.run_worker(self._refresh(), group="snapshot", exclusive=True)
 
     def action_show_help(self) -> None:
+        allowed, principal_role = self._composer_capabilities()
         log = self.query_one("#events", RichLog)
         log.clear()
-        log.write(command_help())
+        log.write(command_help(
+            allowed_verbs=allowed, principal_role=principal_role))
         self.query_one(TabbedContent).active = "activity-tab"
 
     async def _refresh(self) -> None:
@@ -158,19 +169,28 @@ class DeskTUI(App[None]):
             self._log(f"snapshot failed: {safe_text(exc)}", style="red")
         else:
             self.snapshot = snapshot
-            if snapshot.cursor:
-                self.cursor = snapshot.cursor
+            self.cursor = snapshot.cursor if snapshot.consistent else None
             self._last_contact = time.monotonic()
             self._render(snapshot)
-            if (self._stream_thread is None
-                    or not self._stream_thread.is_alive()):
+            if (snapshot.consistent and snapshot.cursor
+                    and (self._stream_thread is None
+                         or not self._stream_thread.is_alive())):
                 self._start_stream(snapshot.cursor)
                 self._stream_needs_snapshot = False
+            elif not snapshot.consistent or not snapshot.cursor:
+                self._stream_needs_snapshot = False
+                self._connection_state = "polling"
+                self._connection_message = (
+                    "compatibility projections; realtime events unavailable, "
+                    f"polling every {self.refresh_seconds:g}s")
         finally:
             self._refresh_scheduled = False
             self._update_connection()
 
     def _render(self, snapshot: DeskSnapshot) -> None:
+        allowed, principal_role = self._composer_capabilities()
+        self.query_one("#composer-help", Label).update(command_hint(
+            allowed_verbs=allowed, principal_role=principal_role))
         self.query_one("#health", Static).update(health_text(snapshot))
         for table_id, (_, row_builder) in _TABLES.items():
             table = self.query_one(f"#{table_id}", DataTable)
@@ -290,7 +310,10 @@ class DeskTUI(App[None]):
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         event.input.clear()
         try:
-            parsed = parse_command(event.value, default_role=self.default_role)
+            allowed, principal_role = self._composer_capabilities()
+            parsed = parse_command(
+                event.value, default_role=self.default_role,
+                allowed_verbs=allowed, principal_role=principal_role)
             if isinstance(parsed, LocalAction):
                 if parsed.action == "help":
                     self.action_show_help()

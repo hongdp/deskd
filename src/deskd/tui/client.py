@@ -57,8 +57,9 @@ class CursorExpired(APIError):
 class SSEEvent:
     """One decoded server-sent event.
 
-    ``id`` remains an opaque string.  Cursors such as ``evt_0000000a`` are not
-    integers, and clients must never infer sequence arithmetic from them.
+    ``id`` remains an opaque string. Cursors such as
+    ``evt_0123456789abcdef_000000000000000a`` contain a server epoch and a
+    sequence, but clients must never parse either component or infer arithmetic.
     """
 
     event: str
@@ -381,7 +382,9 @@ class ControlPlaneClient:
         try:
             payload = self.request_json("GET", "/api/snapshot")
         except APIError as exc:
-            if exc.status != 404:
+            legacy_without_auth = (not self.authenticated
+                                   and exc.status in {401, 403})
+            if exc.status != 404 and not legacy_without_auth:
                 raise
         else:
             return DeskSnapshot.from_payload(
@@ -494,6 +497,18 @@ class ControlPlaneClient:
                     delay = max(min_backoff, 0.05)
                     for event in parse_sse(response):
                         if stop.is_set():
+                            return
+                        if (event.event == "reset"
+                                and isinstance(event.data, Mapping)
+                                and event.data.get("resnapshot") is True):
+                            detail = _safe_detail(
+                                event.data.get("error") or "server requested a new snapshot")
+                            yield ConnectionNotice(
+                                "cursor_expired", detail, cursor=None,
+                                attempt=attempt, retry_in=0.0)
+                            # Do not reconnect this follower with the stale ID.
+                            # The app must obtain a new atomic snapshot boundary
+                            # and start a new follower from that returned cursor.
                             return
                         if event.id:
                             cursor = event.id
