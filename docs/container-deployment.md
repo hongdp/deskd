@@ -3,6 +3,8 @@
 The repository Dockerfile builds the generic deskd control service. A host such
 as parlay normally derives its own image from this one, installs its host module,
 and sets `DESKD_CONFIG_MODULE` to the module that calls `deskd.configure(...)`.
+The image deliberately has no package-manager step: it copies Git from a pinned
+matching full Bookworm stage into the pinned slim runtime.
 
 ## Image provenance
 
@@ -53,6 +55,22 @@ Expose the control socket only to agent, orchestrator, scheduler, operator CLI,
 and trusted UI networks. The health endpoint may be probed without a token; all
 other control endpoints require bearer auth.
 
+The application enforces a hard mutation-body limit (1 MiB by default; tune
+with `DESKD_CONTROL_MAX_REQUEST_BODY_BYTES`) for both declared and chunked
+bodies. That protects parser memory but is not a substitute for an ingress
+connection policy. Put a trusted proxy or service-mesh policy in front of the
+generic image with per-source request rate limits, a small concurrent-connection
+budget, header and request timeouts, and TLS. Bound the number of issued role and
+service tokens; a compromised token must not be able to monopolize the sole
+SQLite writer through unlimited parallel requests.
+
+SQLite control events have an internal retention bound, but durable command
+receipts, completed rollovers, task/mail/meeting history, and host-owned tables
+need an explicit operational retention policy. Monitor database and WAL bytes,
+checkpoint and back up before pruning, and delete only terminal rows older than
+the host's audit/replay window. Retention maintenance must run as the trusted
+control owner, in bounded batches, never from an agent container.
+
 Agent containers should have:
 
 - no Docker/container runtime socket;
@@ -76,6 +94,36 @@ capability is infrastructure authority and must remain separate from role
 tokens. If the host uses a dedicated launcher, give it the narrow service token
 and container-runtime permissions; do not put those permissions in the deskd
 HTTP process unless the deployment explicitly accepts that combined boundary.
+
+The dedicated launcher uses the one-time `launcher.mount.claim` →
+`launcher.mount.start` → `launcher.mount.land` protocol. Before `start`, fsync
+the ticket id, lease/version, and exact labelled container launch id. It must
+bind only the returned exact host lease path to the returned container target
+and verify the returned device/inode immediately before the bind. Never
+statically mount the worktree parent. Expired or version-mismatched tickets fail
+closed.
+
+On restart, call `launcher.mount.inspect {lease_id}` with a new command request
+id (or repeat claim with a new request id and the same launcher subject) to
+recover a consumed ticket without recovering its paths. Replaying the original
+claim request id returns its immutable issued receipt and is not state
+inspection. Stop and verify absence of the exact labelled orphan, record
+`launcher.mount.land(... outcome=indeterminate ...)`, then call
+`launcher.mount.reconcile(... resolution=orphan_stopped, note=...)` before a
+new claim. Cancel an issued-but-unstarted ticket with
+`resolution=cancelled_before_start`. `workspace.release` is launcher/operator
+service-only and fails while any issued, started, or indeterminate mount ticket
+is live.
+
+The image runs `deskd` directly as PID 1 and handles `SIGTERM`; it does not ship
+an init binary. Run it with Docker `--init`, Compose `init: true`, or the
+equivalent orchestrator setting so an infrastructure init process reaps any
+orphaned Git/provider children. Keep the documented stop signal as `SIGTERM`.
+The Python 3.13 runtime also requires a current container runtime/seccomp
+profile that permits its thread-creation syscall (`clone3`). Docker 20.10's old
+default profile returns `EPERM` instead of a fallback-compatible `ENOSYS`;
+upgrade Docker/containerd or deploy a reviewed profile that permits `clone3`.
+Do not use `seccomp=unconfined` as the production workaround.
 
 ## Startup sequence
 

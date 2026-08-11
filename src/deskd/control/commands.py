@@ -60,6 +60,7 @@ class HostCommand:
 _REQUEST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 _VERB_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_MOUNT_TICKET_RE = re.compile(r"^mount_[0-9a-f]{32}$")
 _FORBIDDEN_ACTOR_PARAMS = frozenset({
     "actor", "actor_role", "role", "by", "sender", "caller", "called_by",
     "owner_role", "created_by", "principal", "supervisor",
@@ -161,6 +162,12 @@ def _self_projection(role: str) -> dict:
             "reconciliation_note FROM control_wake_claims WHERE role=? "
             "AND state='reconciled' ORDER BY reconciled_at DESC LIMIT 20",
             (role,)).fetchall()]
+        rollovers = [dict(row) for row in conn.execute(
+            """SELECT request_id,role,resume_session_id,from_day,to_day,state,
+                      attempt_count,max_attempts,claim_id,last_error,created_at,
+                      updated_at,completed_at
+               FROM control_rollover_requests WHERE role=?
+               ORDER BY created_at DESC LIMIT 20""", (role,)).fetchall()]
     return {
         "role": role,
         "runtime": runtime,
@@ -185,6 +192,7 @@ def _self_projection(role: str) -> dict:
         "workspace_leases": leases,
         "wake_quarantine": quarantines,
         "wake_reconciliations": reconciliations,
+        "rollover_requests": rollovers,
     }
 
 
@@ -235,6 +243,333 @@ def _wake_claim_view(row) -> dict:
     return out
 
 
+def _record_rollovers(plan: dict) -> list[dict]:
+    """Persist scheduler rollover actions in the command's ambient transaction."""
+    max_attempts = int(CONFIG.rollover_max_attempts)
+    if not 1 <= max_attempts <= 100:
+        raise CommandError("rollover_max_attempts must be between 1 and 100")
+    recorded: list[dict] = []
+    with orchestration.connect(write=True) as conn:
+        for action in plan.get("rollovers", []):
+            stable = json.dumps({
+                "role": action["role"], "session_id": action["session_id"],
+                "from_day": action["from_day"], "to_day": action["to_day"],
+            }, sort_keys=True, separators=(",", ":")).encode()
+            request_id = "rollover_" + hashlib.sha256(stable).hexdigest()[:32]
+            now = store.now_iso()
+            conn.execute(
+                """INSERT OR IGNORE INTO control_rollover_requests
+                   (request_id,role,resume_session_id,from_day,to_day,prompt,state,
+                    attempt_count,max_attempts,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,'pending',0,?,?,?)""",
+                (request_id, action["role"], action["session_id"],
+                 action["from_day"], action["to_day"], action["prompt"],
+                 max_attempts, now, now))
+            row = conn.execute(
+                "SELECT * FROM control_rollover_requests WHERE request_id=?",
+                (request_id,)).fetchone()
+            recorded.append(dict(row))
+    return recorded
+
+
+def _mount_ticket_view(row, *, include_paths: bool = False,
+                       recovered: bool = False) -> dict:
+    out = {
+        "ticket_id": row["ticket_id"],
+        "lease_id": row["lease_id"],
+        "owner_role": row["owner_role"],
+        "workspace_version": int(row["workspace_version"]),
+        "expires_at": row["expires_at"],
+        "expected_device": int(row["expected_device"]),
+        "expected_inode": int(row["expected_inode"]),
+        "state": row["state"],
+        "build_pins": {
+            "image_digest": row["image_digest"],
+            "build_revision": row["build_revision"],
+            "config_version": row["config_version"],
+            "prompt_version": row["prompt_version"],
+        },
+        "recovered": recovered,
+    }
+    if include_paths:
+        out["host_path"] = row["host_path"]
+        out["container_path"] = row["container_path"]
+    if row["error"]:
+        out["error"] = row["error"]
+    return out
+
+
+def _lease_launch_descriptor(row) -> dict:
+    """Revalidate one active lease and derive its two host-owned paths."""
+    host_path = workspaces.launch_path(
+        row["lease_id"], owner_role=row["owner_role"])
+    spec = next((candidate for candidate in CONFIG.repositories
+                 if candidate.name == row["repo"]), None)
+    if spec is None:
+        raise CommandConflict("workspace repository configuration disappeared")
+    try:
+        relative = host_path.resolve(strict=True).relative_to(
+            spec.worktree_root.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise CommandConflict("workspace launch path escaped its configured root") from exc
+    if row["worktree_device"] is None or row["worktree_inode"] is None:
+        raise CommandConflict("workspace lease lacks an inode launch pin")
+    return {
+        "host_path": str(host_path),
+        "container_path": str(spec.container_worktree_root / relative),
+        "expected_device": int(row["worktree_device"]),
+        "expected_inode": int(row["worktree_inode"]),
+        "build_pins": {
+            "image_digest": row["image_digest"],
+            "build_revision": row["build_revision"],
+            "config_version": row["config_version"],
+            "prompt_version": row["prompt_version"],
+        },
+    }
+
+
+def _mount_ticket_row(conn, principal: Principal, ticket_id: str):
+    if not _MOUNT_TICKET_RE.fullmatch(str(ticket_id or "")):
+        raise CommandError("invalid mount ticket_id")
+    row = conn.execute(
+        "SELECT * FROM control_mount_tickets WHERE ticket_id=?", (ticket_id,)
+    ).fetchone()
+    if row is None or row["launcher_subject"] != principal.subject:
+        # Do not disclose whether another launcher owns a guessed ticket id.
+        raise ControlAuthError("mount ticket does not belong to this launcher")
+    return row
+
+
+def _mount_service(principal: Principal, *, allow_operator: bool = False) -> str:
+    """Require a non-role launcher (or, where explicit, operator) principal."""
+    if principal.role is not None:
+        raise ControlAuthError("mount control requires a service principal")
+    if allow_operator and "operator" in principal.scopes:
+        return "operator"
+    if "launcher" in principal.scopes:
+        return "launcher"
+    required = "launcher or operator" if allow_operator else "launcher"
+    raise ControlAuthError(f"principal lacks required scope: {required}")
+
+
+def _claim_mount_ticket(principal: Principal, lease_id: str,
+                        ttl_seconds: object | None) -> dict:
+    _mount_service(principal)
+    try:
+        default_ttl = int(CONFIG.launcher_ticket_ttl_seconds)
+        max_ttl = int(CONFIG.launcher_ticket_max_seconds)
+        ttl = int(ttl_seconds if ttl_seconds is not None else default_ttl)
+    except (TypeError, ValueError) as exc:
+        raise CommandError("ttl_seconds must be an integer") from exc
+    if not 5 <= default_ttl <= max_ttl <= 600 or not 5 <= ttl <= max_ttl:
+        raise CommandError(
+            f"ttl_seconds must be between 5 and {max_ttl} seconds")
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    now = now_dt.isoformat(timespec="seconds")
+    with orchestration.connect(write=True) as conn:
+        lease = conn.execute(
+            "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,)
+        ).fetchone()
+        existing = conn.execute(
+            """SELECT * FROM control_mount_tickets WHERE lease_id=?
+               AND state IN ('issued','started','indeterminate')""",
+            (lease_id,)).fetchone()
+        if existing is not None:
+            if existing["launcher_subject"] != principal.subject:
+                raise ControlAuthError(
+                    "workspace mount is owned by another launcher service")
+            if existing["state"] in {"started", "indeterminate"}:
+                # Recovery must not depend on a lease that expired, drifted or
+                # disappeared after the mount operation began.  The opaque id
+                # is precisely what lets the launcher stop/reconcile it.
+                return _mount_ticket_view(existing, recovered=True)
+        if (lease is None or lease["state"] != "active"
+                or lease["expires_at"] <= now
+                or (lease["last_error"] or "").startswith(
+                    "release-in-progress:")):
+            raise CommandConflict("mount ticket requires an active workspace lease")
+        descriptor = _lease_launch_descriptor(lease)
+        if existing is not None:
+            still_exact = (
+                existing["state"] == "issued"
+                and existing["expires_at"] > now
+                and int(existing["workspace_version"])
+                    == int(lease["workspace_version"])
+                and existing["host_path"] == descriptor["host_path"]
+                and existing["container_path"] == descriptor["container_path"]
+                and int(existing["expected_device"])
+                    == descriptor["expected_device"]
+                and int(existing["expected_inode"])
+                    == descriptor["expected_inode"]
+            )
+            if still_exact:
+                return _mount_ticket_view(
+                    existing, include_paths=True, recovered=True)
+            conn.execute(
+                "UPDATE control_mount_tickets SET state='expired' WHERE ticket_id=?",
+                (existing["ticket_id"],))
+
+        lease_expiry = dt.datetime.fromisoformat(lease["expires_at"])
+        expires = min(now_dt + dt.timedelta(seconds=ttl), lease_expiry).isoformat(
+            timespec="seconds")
+        if expires <= now:
+            raise CommandConflict("workspace lease expires too soon to issue a ticket")
+        ticket_id = f"mount_{uuid.uuid4().hex}"
+        pins = descriptor["build_pins"]
+        conn.execute(
+            """INSERT INTO control_mount_tickets
+               (ticket_id,lease_id,launcher_subject,owner_role,workspace_version,
+                host_path,container_path,expected_device,expected_inode,
+                image_digest,build_revision,config_version,prompt_version,
+                state,expires_at,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'issued',?,?)""",
+            (ticket_id, lease_id, principal.subject, lease["owner_role"],
+             int(lease["workspace_version"]), descriptor["host_path"],
+             descriptor["container_path"], descriptor["expected_device"],
+             descriptor["expected_inode"], pins["image_digest"],
+             pins["build_revision"], pins["config_version"],
+             pins["prompt_version"], expires, now))
+        issued = conn.execute(
+            "SELECT * FROM control_mount_tickets WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()
+    return _mount_ticket_view(issued, include_paths=True)
+
+
+def _start_mount_ticket(principal: Principal, ticket_id: str) -> dict:
+    _mount_service(principal)
+    now = store.now_iso()
+    with orchestration.connect(write=True) as conn:
+        ticket = _mount_ticket_row(conn, principal, ticket_id)
+        if ticket["state"] == "started":
+            return _mount_ticket_view(ticket, recovered=True)
+        if ticket["state"] != "issued":
+            raise CommandConflict(f"mount ticket is {ticket['state']}, not issued")
+        if ticket["expires_at"] <= now:
+            raise CommandConflict("mount ticket expired before start")
+        lease = conn.execute(
+            "SELECT * FROM workspace_leases WHERE lease_id=?",
+            (ticket["lease_id"],)).fetchone()
+        if (lease is None or lease["state"] != "active"
+                or lease["expires_at"] <= now
+                or (lease["last_error"] or "").startswith(
+                    "release-in-progress:")
+                or int(lease["workspace_version"])
+                    != int(ticket["workspace_version"])):
+            raise CommandConflict("mount ticket was invalidated by its workspace lease")
+        descriptor = _lease_launch_descriptor(lease)
+        exact = (
+            descriptor["host_path"] == ticket["host_path"]
+            and descriptor["container_path"] == ticket["container_path"]
+            and descriptor["expected_device"] == int(ticket["expected_device"])
+            and descriptor["expected_inode"] == int(ticket["expected_inode"])
+            and descriptor["build_pins"] == {
+                "image_digest": ticket["image_digest"],
+                "build_revision": ticket["build_revision"],
+                "config_version": ticket["config_version"],
+                "prompt_version": ticket["prompt_version"],
+            }
+        )
+        if not exact:
+            raise CommandConflict("mount ticket launch assertions changed")
+        conn.execute(
+            "UPDATE control_mount_tickets SET state='started',started_at=? "
+            "WHERE ticket_id=? AND state='issued'", (now, ticket_id))
+        started = conn.execute(
+            "SELECT * FROM control_mount_tickets WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()
+    return _mount_ticket_view(started)
+
+
+def _land_mount_ticket(principal: Principal, ticket_id: str, outcome: str,
+                       error: object | None) -> dict:
+    _mount_service(principal)
+    if outcome not in {"landed", "indeterminate"}:
+        raise CommandError("outcome must be landed|indeterminate")
+    detail = str(error or "").strip()[:4000] or None
+    if outcome == "indeterminate" and detail is None:
+        raise CommandError("indeterminate mount landing requires error detail")
+    with orchestration.connect(write=True) as conn:
+        ticket = _mount_ticket_row(conn, principal, ticket_id)
+        if ticket["state"] == outcome:
+            return _mount_ticket_view(ticket, recovered=True)
+        if ticket["state"] != "started":
+            raise CommandConflict(
+                f"mount ticket is {ticket['state']}, not started")
+        now = store.now_iso()
+        conn.execute(
+            "UPDATE control_mount_tickets SET state=?,landed_at=?,error=? "
+            "WHERE ticket_id=? AND state='started'",
+            (outcome, now, detail, ticket_id))
+        landed = conn.execute(
+            "SELECT * FROM control_mount_tickets WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()
+    return _mount_ticket_view(landed)
+
+
+def _inspect_mount_ticket(principal: Principal, lease_id: str) -> dict:
+    """Recover a live ticket id by lease without replaying mount authority."""
+    authority = _mount_service(principal, allow_operator=True)
+    lease_id = str(lease_id or "").strip()
+    if not lease_id or len(lease_id) > 128:
+        raise CommandError("invalid workspace lease_id")
+    with orchestration.connect() as conn:
+        ticket = conn.execute(
+            """SELECT * FROM control_mount_tickets WHERE lease_id=?
+               AND state IN ('issued','started','indeterminate')
+               ORDER BY created_at DESC LIMIT 1""", (lease_id,)).fetchone()
+        if ticket is None:
+            raise CommandConflict("workspace lease has no live mount ticket")
+        if (authority != "operator"
+                and ticket["launcher_subject"] != principal.subject):
+            raise ControlAuthError(
+                "workspace mount is owned by another launcher service")
+    return _mount_ticket_view(ticket, recovered=True)
+
+
+def _reconcile_mount_ticket(principal: Principal, ticket_id: str,
+                            resolution: str, note: object | None) -> dict:
+    """Close a proven-unused or proven-stopped mount quarantine."""
+    authority = _mount_service(principal, allow_operator=True)
+    if resolution not in {"cancelled_before_start", "orphan_stopped"}:
+        raise CommandError(
+            "resolution must be cancelled_before_start|orphan_stopped")
+    detail = str(note or "").strip()
+    if not detail or len(detail) > 4000:
+        raise CommandError("mount reconciliation note is required (max 4000 chars)")
+    now = store.now_iso()
+    with orchestration.connect(write=True) as conn:
+        if not _MOUNT_TICKET_RE.fullmatch(str(ticket_id or "")):
+            raise CommandError("invalid mount ticket_id")
+        ticket = conn.execute(
+            "SELECT * FROM control_mount_tickets WHERE ticket_id=?",
+            (ticket_id,)).fetchone()
+        if ticket is None:
+            raise ControlAuthError("mount ticket is unavailable")
+        if (authority != "operator"
+                and ticket["launcher_subject"] != principal.subject):
+            raise ControlAuthError(
+                "mount ticket does not belong to this launcher")
+        marker = f"reconciled:{resolution}:"
+        if (ticket["state"] == "expired"
+                and (ticket["error"] or "").startswith(marker)):
+            return _mount_ticket_view(ticket, recovered=True)
+        allowed_states = ({"issued"} if resolution == "cancelled_before_start"
+                          else {"started", "indeterminate"})
+        if ticket["state"] not in allowed_states:
+            raise CommandConflict(
+                f"resolution {resolution} cannot close ticket state "
+                f"{ticket['state']}")
+        audit = f"{marker}{principal.actor}: {detail}"
+        conn.execute(
+            "UPDATE control_mount_tickets SET state='expired',landed_at=?,error=? "
+            "WHERE ticket_id=? AND state=?",
+            (now, audit, ticket_id, ticket["state"]))
+        closed = conn.execute(
+            "SELECT * FROM control_mount_tickets WHERE ticket_id=?",
+            (ticket_id,)).fetchone()
+    return _mount_ticket_view(closed)
+
+
 def _claim_wake(role: str) -> dict:
     """Claim one durable per-role launch batch from planner attempt rows."""
     with orchestration.connect(write=True) as conn:
@@ -251,6 +586,57 @@ def _claim_wake(role: str) -> dict:
             (role,)).fetchone()
         if existing:
             return {"claim": _wake_claim_view(existing), "recovered": True}
+        rollover = conn.execute(
+            """SELECT * FROM control_rollover_requests
+               WHERE role=? AND state='pending' ORDER BY created_at,request_id LIMIT 1""",
+            (role,)).fetchone()
+        if rollover is not None:
+            presence = conn.execute(
+                "SELECT session_id,ended_at FROM agent_sessions WHERE role=?",
+                (role,)).fetchone()
+            if (presence is None or presence["ended_at"] is not None
+                    or presence["session_id"] != rollover["resume_session_id"]):
+                terminal = ("completed" if presence is not None
+                            and presence["session_id"] == rollover["resume_session_id"]
+                            and presence["ended_at"] is not None else "cancelled")
+                now = store.now_iso()
+                conn.execute(
+                    "UPDATE control_rollover_requests SET state=?,updated_at=?,"
+                    "completed_at=? WHERE request_id=?",
+                    (terminal, now, now, rollover["request_id"]))
+            else:
+                attempt_number = int(rollover["attempt_count"]) + 1
+                reasons = [{
+                    "reason_kind": "session_rollover",
+                    "source_ref": rollover["request_id"],
+                    "label": (f"wind down session {rollover['resume_session_id']} "
+                              f"from {rollover['from_day']} for {rollover['to_day']}"),
+                    "from_day": rollover["from_day"],
+                    "to_day": rollover["to_day"],
+                    "resume_session_id": rollover["resume_session_id"],
+                }]
+                claim_id = f"wake_{uuid.uuid4()}"
+                now = store.now_iso()
+                conn.execute(
+                    """INSERT INTO control_wake_claims
+                       (claim_id,role,state,channel,mode,attempt_ids_json,
+                        inbox_ids_json,reasons_json,prompt,claimed_at,reason_kind,
+                        resume_session_id,rollover_request_id,attempt_number)
+                       VALUES (?,?,'claimed','resume','resume','[]','[]',?,?,?,?,?,?,?)""",
+                    (claim_id, role, json.dumps(reasons, sort_keys=True),
+                     rollover["prompt"], now, "session_rollover",
+                     rollover["resume_session_id"], rollover["request_id"],
+                     attempt_number))
+                conn.execute(
+                    """UPDATE control_rollover_requests
+                       SET state='claimed',attempt_count=?,claim_id=?,updated_at=?,
+                           last_error=NULL WHERE request_id=? AND state='pending'""",
+                    (attempt_number, claim_id, now, rollover["request_id"]))
+                claimed = conn.execute(
+                    "SELECT * FROM control_wake_claims WHERE claim_id=?",
+                    (claim_id,)).fetchone()
+                return {"claim": _wake_claim_view(claimed), "recovered": False,
+                        "resume_session_id": rollover["resume_session_id"]}
         launch_channels = [
             rung.channel for rung in CONFIG.wake_ladder
             if not rung.leaves_machine and rung.channel != "hook"
@@ -292,11 +678,12 @@ def _claim_wake(role: str) -> dict:
         conn.execute(
             """INSERT INTO control_wake_claims
                (claim_id,role,state,channel,mode,attempt_ids_json,inbox_ids_json,
-                reasons_json,prompt,claimed_at)
-               VALUES (?,?,'claimed',?,?,?,?,?,?,?)""",
+                reasons_json,prompt,claimed_at,reason_kind,resume_session_id)
+               VALUES (?,?,'claimed',?,?,?,?,?,?,?,'wake',?)""",
             (claim_id, role, top["channel"], mode,
              json.dumps(attempt_ids), json.dumps(inbox_ids),
-             json.dumps(reasons, sort_keys=True), prompt, now))
+             json.dumps(reasons, sort_keys=True), prompt, now,
+             presence["session_id"] if mode == "resume" and presence else None))
         conn.executemany(
             "INSERT INTO control_wake_claim_attempts(attempt_id,claim_id) VALUES (?,?)",
             [(attempt_id, claim_id) for attempt_id in attempt_ids])
@@ -325,6 +712,22 @@ def _land_wake(role: str, claim_id: str, outcome: str,
                 return _wake_claim_view(row)
             raise CommandConflict(f"wake claim is already {row['state']}")
         now = store.now_iso()
+        rollover = None
+        if row["rollover_request_id"]:
+            rollover = conn.execute(
+                "SELECT * FROM control_rollover_requests WHERE request_id=?",
+                (row["rollover_request_id"],)).fetchone()
+            if rollover is None:
+                raise CommandConflict("rollover request disappeared")
+            if outcome == "landed":
+                presence = conn.execute(
+                    "SELECT session_id,ended_at FROM agent_sessions WHERE role=?",
+                    (role,)).fetchone()
+                if (presence is None
+                        or presence["session_id"] != row["resume_session_id"]
+                        or presence["ended_at"] is None):
+                    raise CommandConflict(
+                        "rollover may land only after its resumed session is stopped")
         conn.execute(
             "UPDATE control_wake_claims SET state=?,landed_at=?,session_id=?,error=? "
             "WHERE claim_id=?", (outcome, now, session_id, error, claim_id))
@@ -343,6 +746,28 @@ def _land_wake(role: str, claim_id: str, outcome: str,
                 f"UPDATE wake_attempts SET outcome='failed',resolved_at=? "
                 f"WHERE id IN ({marks}) AND role=? AND outcome='pending'",
                 [now, *attempt_ids, role])
+        if rollover is not None:
+            if outcome == "landed":
+                conn.execute(
+                    """UPDATE control_rollover_requests
+                       SET state='completed',updated_at=?,completed_at=?,last_error=NULL
+                       WHERE request_id=? AND claim_id=?""",
+                    (now, now, rollover["request_id"], claim_id))
+            elif outcome == "indeterminate":
+                conn.execute(
+                    """UPDATE control_rollover_requests
+                       SET state='indeterminate',updated_at=?,last_error=?
+                       WHERE request_id=? AND claim_id=?""",
+                    (now, error, rollover["request_id"], claim_id))
+            else:
+                next_state = ("pending" if int(rollover["attempt_count"])
+                              < int(rollover["max_attempts"]) else "escalated")
+                conn.execute(
+                    """UPDATE control_rollover_requests
+                       SET state=?,claim_id=NULL,updated_at=?,last_error=?
+                       WHERE request_id=? AND claim_id=?""",
+                    (next_state, now, error or "rollover worker did not complete",
+                     rollover["request_id"], claim_id))
         return _wake_claim_view(conn.execute(
             "SELECT * FROM control_wake_claims WHERE claim_id=?", (claim_id,)
         ).fetchone())
@@ -385,6 +810,37 @@ def _reconcile_wake(principal: Principal, claim_id: str, resolution: str,
                     f"UPDATE agent_inbox SET delivered_at=? WHERE target_role=? "
                     f"AND id IN ({marks}) AND delivered_at IS NULL",
                     [now, row["role"], *inbox_ids])
+        if row["rollover_request_id"]:
+            request = conn.execute(
+                "SELECT * FROM control_rollover_requests WHERE request_id=?",
+                (row["rollover_request_id"],)).fetchone()
+            if request is None:
+                raise CommandConflict("rollover request disappeared")
+            if resolution == "landed":
+                presence = conn.execute(
+                    "SELECT session_id,ended_at FROM agent_sessions WHERE role=?",
+                    (row["role"],)).fetchone()
+                if (presence is None
+                        or presence["session_id"] != row["resume_session_id"]
+                        or presence["ended_at"] is None):
+                    raise CommandConflict(
+                        "rollover reconciliation requires the old session stopped")
+                conn.execute(
+                    """UPDATE control_rollover_requests
+                       SET state='completed',updated_at=?,completed_at=?,last_error=NULL
+                       WHERE request_id=?""",
+                    (now, now, request["request_id"]))
+            else:
+                # An operator has proved the indeterminate attempt did not land;
+                # authorize exactly one further bounded attempt if necessary.
+                retry_ceiling = max(int(request["max_attempts"]),
+                                    int(request["attempt_count"]) + 1)
+                conn.execute(
+                    """UPDATE control_rollover_requests
+                       SET state='pending',claim_id=NULL,max_attempts=?,updated_at=?,
+                           last_error=? WHERE request_id=?""",
+                    (retry_ceiling, now, f"operator retry: {note}",
+                     request["request_id"]))
         conn.execute(
             "UPDATE control_wake_claims SET state='reconciled',resolution=?,"
             "reconciled_at=?,reconciled_by=?,reconciliation_note=? "
@@ -614,12 +1070,17 @@ def _dispatch_builtin(principal: Principal, verb: str, raw: dict) -> Any:
     if verb == "agent.session.stop":
         role = _agent(principal)
         p = _params(raw, allowed={"session_id"}, required={"session_id"})
+        session_id = _session_id(p["session_id"], "session_id")
         current = _live_session(role)
-        if (current is None or current["ended_at"] is not None
-                or current["session_id"] != _session_id(p["session_id"], "session_id")):
+        if current is None or current["session_id"] != session_id:
             raise CommandConflict("stop session does not own the token role")
+        # A worker may have committed the stop and lost only the HTTP response.
+        # Repeating the same session-scoped transition must be provably safe so
+        # the durable rollover claim can still be landed after restart.
+        if current["ended_at"] is not None:
+            return {"ended": True, "role": role, "recovered": True}
         orchestration.end_session(role)
-        return {"ended": True, "role": role}
+        return {"ended": True, "role": role, "recovered": False}
     if verb == "agent.session.feed":
         role = _agent(principal)
         p = _params(raw, allowed={"session_id", "kind", "text"},
@@ -1009,6 +1470,46 @@ def _dispatch_builtin(principal: Principal, verb: str, raw: dict) -> Any:
         if verb == "meeting.wake_ack":
             return meetings.acknowledge_wake(mid, role=role)
 
+    # --- trusted launcher mount tickets ----------------------------------
+    if verb == "launcher.mount.claim":
+        p = _params(raw, allowed={"lease_id", "ttl_seconds"},
+                    required={"lease_id"})
+        return _claim_mount_ticket(
+            principal, p["lease_id"], p.get("ttl_seconds"))
+    if verb == "launcher.mount.start":
+        p = _params(raw, allowed={"ticket_id"}, required={"ticket_id"})
+        return _start_mount_ticket(principal, p["ticket_id"])
+    if verb == "launcher.mount.land":
+        p = _params(raw, allowed={"ticket_id", "outcome", "error"},
+                    required={"ticket_id", "outcome"})
+        return _land_mount_ticket(
+            principal, p["ticket_id"], p["outcome"], p.get("error"))
+    if verb == "launcher.mount.inspect":
+        p = _params(raw, allowed={"lease_id"}, required={"lease_id"})
+        return _inspect_mount_ticket(principal, p["lease_id"])
+    if verb == "launcher.mount.reconcile":
+        p = _params(raw, allowed={"ticket_id", "resolution", "note"},
+                    required={"ticket_id", "resolution", "note"})
+        return _reconcile_mount_ticket(
+            principal, p["ticket_id"], p["resolution"], p["note"])
+
+    # Deleting a host worktree is runtime authority, never provider-role
+    # authority.  The launcher/operator derives ownership from the durable
+    # lease row; caller-supplied role identity is forbidden by _params.
+    if verb == "workspace.release":
+        _mount_service(principal, allow_operator=True)
+        p = _params(raw, allowed={"lease_id", "expected_version"},
+                    required={"lease_id", "expected_version"})
+        with orchestration.connect() as conn:
+            lease = conn.execute(
+                "SELECT owner_role FROM workspace_leases WHERE lease_id=?",
+                (p["lease_id"],)).fetchone()
+        if lease is None:
+            raise CommandError("workspace lease not found")
+        return workspaces.release(
+            p["lease_id"], owner_role=lease["owner_role"],
+            expected_workspace_version=int(p["expected_version"]))
+
     # --- workspace broker -------------------------------------------------
     if verb.startswith("workspace."):
         role = _agent(principal)
@@ -1050,12 +1551,42 @@ def _dispatch_builtin(principal: Principal, verb: str, raw: dict) -> Any:
                 expected_head=p["expected_head"],
                 expected_workspace_version=int(p["workspace_version"]),
                 expected_base_sha=p.get("expected_base_sha"))
-        if verb == "workspace.release":
-            p = _params(raw, allowed={"lease_id", "expected_version"},
-                        required={"lease_id", "expected_version"})
-            return workspaces.release(
-                p["lease_id"], owner_role=role,
-                expected_workspace_version=int(p["expected_version"]))
+    if verb == "rollover.retry":
+        _service(principal, "operator")
+        p = _params(raw, allowed={"request_id", "note"},
+                    required={"request_id", "note"})
+        request_id = str(p["request_id"] or "").strip()
+        note = str(p["note"] or "").strip()
+        if not request_id.startswith("rollover_") or len(request_id) != 41:
+            raise CommandError("invalid rollover request_id")
+        if not note or len(note) > 4000:
+            raise CommandError("operator retry note is required (max 4000 chars)")
+        retry_batch = int(CONFIG.rollover_max_attempts)
+        if not 1 <= retry_batch <= 100:
+            raise CommandError("rollover_max_attempts must be between 1 and 100")
+        with orchestration.connect(write=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM control_rollover_requests WHERE request_id=?",
+                (request_id,)).fetchone()
+            if row is None:
+                raise CommandError("rollover request not found")
+            if row["state"] != "escalated":
+                raise CommandConflict(
+                    f"rollover request is {row['state']}, not escalated")
+            now = store.now_iso()
+            ceiling = int(row["attempt_count"]) + retry_batch
+            conn.execute(
+                """UPDATE control_rollover_requests
+                   SET state='pending',claim_id=NULL,max_attempts=?,updated_at=?,
+                       last_error=? WHERE request_id=? AND state='escalated'""",
+                (ceiling, now, f"operator retry: {note}", request_id))
+            updated = conn.execute(
+                """SELECT request_id,role,resume_session_id,from_day,to_day,state,
+                          attempt_count,max_attempts,claim_id,last_error,created_at,
+                          updated_at,completed_at
+                   FROM control_rollover_requests WHERE request_id=?""",
+                (request_id,)).fetchone()
+        return dict(updated)
 
     # --- service ticks ----------------------------------------------------
     if verb == "orchestrator.tick":
@@ -1065,8 +1596,17 @@ def _dispatch_builtin(principal: Principal, verb: str, raw: dict) -> Any:
     if verb == "scheduler.tick":
         _service(principal, "scheduler")
         _params(raw, allowed=set())
-        return {"wake": orchestration.plan_wakes(record=True),
-                "rollover": orchestration.rollover_plan(record=True)}
+        # Rollover detection, the draining presence transition and the durable
+        # role-claimable request are one commit.  The ordinary wake planner may
+        # run host probes, so run it only after that commit; a probe failure or
+        # lost scheduler response can no longer strand a draining session.
+        with orchestration.connect(write=True) as conn:
+            with transaction.bind(conn, CONFIG.db_path):
+                rollover = orchestration.rollover_plan(record=True)
+                rollover_requests = _record_rollovers(rollover)
+        wake = orchestration.plan_wakes(record=True)
+        return {"wake": wake,
+                "rollover": {**rollover, "requests": rollover_requests}}
 
     raise CommandError(f"unsupported command verb: {verb}")
 
@@ -1102,7 +1642,9 @@ _BUILTIN_VERBS = frozenset({
     "meeting.wake_list", "meeting.wake_ack", "workspace.acquire",
     "workspace.inspect", "workspace.renew", "workspace.status", "workspace.diff",
     "workspace.commit", "workspace.release", "orchestrator.tick", "scheduler.tick",
-    "wake.reconcile",
+    "wake.reconcile", "rollover.retry", "launcher.mount.claim",
+    "launcher.mount.start", "launcher.mount.land", "launcher.mount.inspect",
+    "launcher.mount.reconcile",
 })
 
 _RECOVERABLE_EXTERNAL = frozenset({
@@ -1118,12 +1660,17 @@ def verbs() -> list[str]:
 def allowed_verbs(principal: Principal) -> list[str]:
     """Exact command vocabulary this credential may attempt."""
     if principal.role is not None:
+        role_workspace_verbs = {
+            "workspace.acquire", "workspace.inspect", "workspace.renew",
+            "workspace.status", "workspace.diff", "workspace.commit",
+        }
         builtins = {
             verb for verb in _BUILTIN_VERBS
             if (verb != "wake.reconcile"
                 and (verb.startswith(("agent.", "message.", "mailbox.",
-                                      "meeting.", "review.", "workspace.",
+                                      "meeting.", "review.",
                                       "hook.", "wake."))
+                or verb in role_workspace_verbs
                 or verb.startswith("task.")
                 or verb in {"inbox.read", "inbox.ack"}))
         }
@@ -1139,7 +1686,13 @@ def allowed_verbs(principal: Principal) -> list[str]:
         if "scheduler" in principal.scopes:
             builtins.add("scheduler.tick")
         if "operator" in principal.scopes:
-            builtins.add("wake.reconcile")
+            builtins.update({"wake.reconcile", "rollover.retry",
+                             "launcher.mount.inspect",
+                             "launcher.mount.reconcile", "workspace.release"})
+        if "launcher" in principal.scopes:
+            builtins.update({"launcher.mount.claim", "launcher.mount.start",
+                             "launcher.mount.land", "launcher.mount.inspect",
+                             "launcher.mount.reconcile", "workspace.release"})
     for verb, handler in _host_commands().items():
         if handler.scope in principal.scopes:
             builtins.add(verb)

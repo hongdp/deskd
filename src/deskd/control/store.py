@@ -58,7 +58,11 @@ CREATE TABLE IF NOT EXISTS control_wake_claims (
     resolution            TEXT,
     reconciled_at         TEXT,
     reconciled_by         TEXT,
-    reconciliation_note   TEXT
+    reconciliation_note   TEXT,
+    reason_kind           TEXT NOT NULL DEFAULT 'wake',
+    resume_session_id     TEXT,
+    rollover_request_id   TEXT,
+    attempt_number        INTEGER
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_control_one_live_wake_claim
@@ -69,6 +73,57 @@ CREATE TABLE IF NOT EXISTS control_wake_claim_attempts (
     claim_id              TEXT NOT NULL REFERENCES control_wake_claims(claim_id)
                           ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS control_rollover_requests (
+    request_id            TEXT PRIMARY KEY,
+    role                  TEXT NOT NULL,
+    resume_session_id     TEXT NOT NULL,
+    from_day              TEXT NOT NULL,
+    to_day                TEXT NOT NULL,
+    prompt                TEXT NOT NULL,
+    state                 TEXT NOT NULL
+                          CHECK (state IN ('pending','claimed','completed',
+                                           'escalated','indeterminate','cancelled')),
+    attempt_count         INTEGER NOT NULL DEFAULT 0,
+    max_attempts          INTEGER NOT NULL,
+    claim_id              TEXT,
+    last_error            TEXT,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL,
+    completed_at          TEXT,
+    UNIQUE (role,resume_session_id,from_day,to_day)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_control_one_live_rollover
+ON control_rollover_requests(role) WHERE state IN ('pending','claimed','indeterminate');
+
+CREATE TABLE IF NOT EXISTS control_mount_tickets (
+    ticket_id             TEXT PRIMARY KEY,
+    lease_id              TEXT NOT NULL REFERENCES workspace_leases(lease_id),
+    launcher_subject      TEXT NOT NULL,
+    owner_role            TEXT NOT NULL,
+    workspace_version     INTEGER NOT NULL,
+    host_path             TEXT NOT NULL,
+    container_path        TEXT NOT NULL,
+    expected_device       INTEGER NOT NULL,
+    expected_inode        INTEGER NOT NULL,
+    image_digest          TEXT,
+    build_revision        TEXT,
+    config_version        TEXT,
+    prompt_version        TEXT,
+    state                 TEXT NOT NULL
+                          CHECK (state IN ('issued','started','landed',
+                                           'indeterminate','expired')),
+    expires_at            TEXT NOT NULL,
+    created_at            TEXT NOT NULL,
+    started_at            TEXT,
+    landed_at             TEXT,
+    error                 TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_control_one_live_mount_ticket
+ON control_mount_tickets(lease_id)
+WHERE state IN ('issued','started','indeterminate');
 
 CREATE TABLE IF NOT EXISTS control_session_provenance (
     role                  TEXT PRIMARY KEY,
@@ -147,6 +202,7 @@ _EVENT_TABLES = {
     "meeting_terminations": ("termination", "proposer", "id"),
     "meeting_termination_votes": ("termination_vote", "role", "proposal_id"),
     "control_review_artifacts": ("review_artifact", "role", "thread_id"),
+    "control_rollover_requests": ("rollover", "role", "request_id"),
     "workspace_leases": ("workspace", "owner_role", "lease_id"),
 }
 
@@ -253,6 +309,14 @@ def ensure_schema(db_path: Path | str | None = None) -> None:
             if name not in claim_columns:
                 conn.execute(
                     f"ALTER TABLE control_wake_claims ADD COLUMN {name} TEXT")
+        for name, declaration in (
+                ("reason_kind", "TEXT NOT NULL DEFAULT 'wake'"),
+                ("resume_session_id", "TEXT"),
+                ("rollover_request_id", "TEXT"),
+                ("attempt_number", "INTEGER")):
+            if name not in claim_columns:
+                conn.execute(
+                    f"ALTER TABLE control_wake_claims ADD COLUMN {name} {declaration}")
         _ensure_triggers(conn)
 
 

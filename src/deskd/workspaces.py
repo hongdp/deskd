@@ -21,10 +21,12 @@ import json
 import os
 import re
 import selectors
+import shlex
 import shutil
 import sqlite3
 import stat as statmod
 import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Iterator
@@ -272,24 +274,91 @@ def _run(argv: list[str], *, ok: tuple[int, ...] = (0,), timeout: int = 120,
     return result
 
 
+_EXECUTOR_KEY_RE = re.compile(
+    r"^(filter|diff|hook)\.([A-Za-z0-9][A-Za-z0-9._-]{0,127})\."
+    r"(clean|smudge|process|required|command|textconv|event|enabled)$",
+    re.IGNORECASE,
+)
+_EXECUTOR_CONFIG_PATTERN = (
+    r"^(filter\..*\.(clean|smudge|process|required)|"
+    r"diff\..*\.(command|textconv)|"
+    r"hook\..*\.(command|event|enabled))$"
+)
+
+
+def _passthrough_filter_command() -> str:
+    helper = Path(__file__).with_name("_git_filter.py").resolve(strict=True)
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(helper))}"
+
+
+def _executor_overrides(config_keys: str) -> list[str]:
+    """Shadow repository-configured executors with fixed broker policy.
+
+    Git 2.54 treats ``-c filter.x.clean=`` as a configured empty command and
+    tries to execute it.  Do not use empty-string behavior as a disable seam.
+    Ordinary clean/smudge/textconv drivers become the documented pass-through
+    ``/bin/cat``; process filters become a trusted protocol-v2 pass-through
+    helper; external diff commands become ``/bin/false``; and filters are
+    explicitly non-required. Config-defined hooks (introduced in 2.54) are
+    disabled through their supported ``enabled`` key.
+
+    Unknown executor key shapes fail closed.  Silently skipping one would let a
+    future Git/config spelling turn repository data into broker code execution.
+    """
+    filters: dict[str, set[str]] = {}
+    diffs: dict[str, set[str]] = {}
+    hooks: set[str] = set()
+    keys = [key for key in config_keys.split("\0") if key]
+    if len(keys) > 256:
+        raise WorkspaceError("repository defines too many Git executors")
+    for key in keys:
+        match = _EXECUTOR_KEY_RE.fullmatch(key)
+        if match is None:
+            raise WorkspaceError(
+                f"repository Git executor key cannot be neutralized: {key[:200]}")
+        section = match.group(1).lower()
+        name = match.group(2)  # Git subsection names are case-sensitive.
+        setting = match.group(3).lower()
+        if section == "filter":
+            filters.setdefault(name, set()).add(setting)
+        elif section == "diff":
+            diffs.setdefault(name, set()).add(setting)
+        else:
+            hooks.add(name)
+
+    pairs: list[tuple[str, str]] = []
+    for name, settings in sorted(filters.items()):
+        pairs.append((f"filter.{name}.required", "false"))
+        if "clean" in settings:
+            pairs.append((f"filter.{name}.clean", "/bin/cat"))
+        if "smudge" in settings:
+            pairs.append((f"filter.{name}.smudge", "/bin/cat"))
+        if "process" in settings:
+            pairs.append((f"filter.{name}.process",
+                          _passthrough_filter_command()))
+    for name, settings in sorted(diffs.items()):
+        if "command" in settings:
+            pairs.append((f"diff.{name}.command", "/bin/false"))
+        if "textconv" in settings:
+            pairs.append((f"diff.{name}.textconv", "/bin/cat"))
+    for name in sorted(hooks):
+        pairs.append((f"hook.{name}.enabled", "false"))
+    return [item for key, value in pairs for item in ("-c", f"{key}={value}")]
+
+
 def _repo_git(spec: RepositorySpec, *args: str,
               ok: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[str]:
     config_probe = _run([
-        "git", "-C", str(spec.path), "config", "--local", "--name-only",
-        "--get-regexp", r"^(filter|diff)\.",
+        "git", "-C", str(spec.path), "config", "--null", "--name-only",
+        "--get-regexp", _EXECUTOR_CONFIG_PATTERN,
     ], ok=(0, 1), output_limit=spec.max_git_output_bytes)
-    unsafe: list[str] = []
-    for key in config_probe.stdout.splitlines():
-        if re.fullmatch(
-                r"(?:filter\.[A-Za-z0-9._-]+\.(?:clean|smudge|process)|"
-                r"diff\.[A-Za-z0-9._-]+\.(?:command|textconv))", key):
-            unsafe.extend(["-c", f"{key}="])
+    executor_overrides = _executor_overrides(config_probe.stdout)
     safe = [
         "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
         "-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false",
         "-c", "protocol.allow=never", "-c", "protocol.file.allow=never",
         "-c", "submodule.recurse=false", "-c", "fetch.recurseSubmodules=false",
-        "-c", "credential.helper=", *unsafe,
+        "-c", "credential.helper=", *executor_overrides,
     ]
     return _run(["git", "-C", str(spec.path), *safe, *args], ok=ok,
                 output_limit=spec.max_git_output_bytes)
@@ -366,17 +435,12 @@ def _lease_git(row: sqlite3.Row | dict, *args: str,
         # without evaluating them, then shadow each command.
         config_probe = _run([
             "git", f"--git-dir={git_dir}", f"--work-tree={worktree}",
-            "config", "--local", "--name-only", "--get-regexp",
-            r"^(filter|diff)\.",
+            "config", "--null", "--name-only", "--get-regexp",
+            _EXECUTOR_CONFIG_PATTERN,
         ], ok=(0, 1), output_limit=spec.max_git_output_bytes,
             pass_fds=(descriptor,))
         _assert_pinned_fd(row, descriptor, identity)
-        filter_overrides: list[str] = []
-        for key in config_probe.stdout.splitlines():
-            if re.fullmatch(
-                    r"(?:filter\.[A-Za-z0-9._-]+\.(?:clean|smudge|process)|"
-                    r"diff\.[A-Za-z0-9._-]+\.(?:command|textconv))", key):
-                filter_overrides.extend(["-c", f"{key}="])
+        executor_overrides = _executor_overrides(config_probe.stdout)
         result = _run([
             "git", f"--git-dir={git_dir}", f"--work-tree={worktree}",
             "-c", "core.fsmonitor=false",
@@ -388,7 +452,7 @@ def _lease_git(row: sqlite3.Row | dict, *args: str,
             "-c", "submodule.recurse=false",
             "-c", "fetch.recurseSubmodules=false",
             "-c", "credential.helper=",
-            *filter_overrides, *args,
+            *executor_overrides, *args,
         ], ok=ok, output_limit=output_limit or spec.max_git_output_bytes,
             truncate=truncate, pass_fds=(descriptor,))
         _assert_pinned_fd(row, descriptor, identity)
@@ -1151,11 +1215,30 @@ def release(lease_id: str, *, owner_role: str,
                 if head != row["head_sha"]:
                     raise WorkspaceError(
                         "workspace HEAD is not a broker-recorded commit")
-        if not recovering:
-            # Durable intent separates "validation failed before deletion"
-            # from "deletion may be partial".  A retry bearing the same CAS
-            # version may finish only this exact broker-derived path.
-            with _connect(db_path, write=True) as conn:
+        # Mount claim/start and release serialize through the same SQLite
+        # BEGIN IMMEDIATE boundary.  A release can commit its durable intent
+        # only when no launcher operation is live; after that point claim/start
+        # reject the release-in-progress marker.  This closes both orderings of
+        # the race before any directory removal occurs.
+        with _connect(db_path, write=True) as conn:
+            ticket_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='control_mount_tickets'").fetchone()
+            live_ticket = None
+            if ticket_table is not None:
+                live_ticket = conn.execute(
+                    """SELECT ticket_id,state FROM control_mount_tickets
+                       WHERE lease_id=?
+                       AND state IN ('issued','started','indeterminate')
+                       LIMIT 1""", (lease_id,)).fetchone()
+            if live_ticket is not None:
+                raise WorkspaceError(
+                    "workspace has a live mount ticket in state "
+                    f"{live_ticket['state']}; launcher reconciliation required")
+            if not recovering:
+                # Durable intent separates "validation failed before deletion"
+                # from "deletion may be partial".  A retry bearing the same CAS
+                # version may finish only this exact broker-derived path.
                 changed = conn.execute(
                     "UPDATE workspace_leases SET last_error=?,updated_at=? "
                     "WHERE lease_id=? AND state!='released' AND workspace_version=?",

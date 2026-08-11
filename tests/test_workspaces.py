@@ -55,6 +55,14 @@ def alpha_principal() -> Principal:
     return Principal("role:alpha", "alpha", frozenset({"agent"}))
 
 
+def launcher_principal(subject: str = "launcher-a") -> Principal:
+    return Principal(subject, None, frozenset({"launcher"}))
+
+
+def operator_principal(subject: str = "operator-a") -> Principal:
+    return Principal(subject, None, frozenset({"operator"}))
+
+
 def test_allocate_is_idempotent_and_records_provenance(repo):
     first = acquire()
     second = acquire()
@@ -128,6 +136,256 @@ def test_broker_status_diff_commit_and_release(repo):
         expected_workspace_version=result["workspace_version"])["state"] == "released"
 
 
+def test_launcher_mount_ticket_is_scoped_single_use_and_version_pinned(repo):
+    lease = acquire()
+    lease_id = lease["lease_id"]
+    host_path = Path(lease["path"])
+    spec = CONFIG.repositories[0]
+    CONFIG.repositories = (dataclasses.replace(
+        spec, container_worktree_root=Path("/agent/workspaces")),)
+    launcher = launcher_principal()
+    peer = launcher_principal("launcher-b")
+
+    with pytest.raises(commands.ControlAuthError):
+        commands.execute(
+            alpha_principal(), "mount-role-denied", "launcher.mount.claim",
+            {"lease_id": lease_id})
+    issued = commands.execute(
+        launcher, "mount-claim-0001", "launcher.mount.claim",
+        {"lease_id": lease_id, "ttl_seconds": 30})["result"]
+    assert issued["state"] == "issued"
+    assert issued["host_path"] == str(host_path)
+    assert issued["container_path"].startswith("/agent/workspaces/")
+    assert issued["expected_device"] == host_path.stat().st_dev
+    assert issued["expected_inode"] == host_path.stat().st_ino
+    assert set(issued["build_pins"]) == {
+        "image_digest", "build_revision", "config_version", "prompt_version"}
+    assert "launcher.mount.claim" in commands.allowed_verbs(launcher)
+    assert "launcher.mount.claim" not in commands.allowed_verbs(alpha_principal())
+    assert "workspace.release" in commands.allowed_verbs(launcher)
+    assert "workspace.release" in commands.allowed_verbs(operator_principal())
+    assert "workspace.release" not in commands.allowed_verbs(alpha_principal())
+
+    # A new request from the same launcher recovers the one live issued ticket;
+    # a peer launcher cannot learn or consume it.
+    recovered = commands.execute(
+        launcher, "mount-claim-0002", "launcher.mount.claim",
+        {"lease_id": lease_id})["result"]
+    assert recovered["ticket_id"] == issued["ticket_id"]
+    assert recovered["recovered"] is True
+    with pytest.raises(commands.ControlAuthError):
+        commands.execute(peer, "mount-peer-claim", "launcher.mount.claim",
+                         {"lease_id": lease_id})
+    with pytest.raises(commands.ControlAuthError):
+        commands.execute(peer, "mount-peer-start", "launcher.mount.start",
+                         {"ticket_id": issued["ticket_id"]})
+
+    started = commands.execute(
+        launcher, "mount-start-001", "launcher.mount.start",
+        {"ticket_id": issued["ticket_id"]})["result"]
+    assert started["state"] == "started"
+    assert "host_path" not in started and "container_path" not in started
+    assert commands.execute(
+        launcher, "mount-start-002", "launcher.mount.start",
+        {"ticket_id": issued["ticket_id"]})["result"]["recovered"] is True
+    # Simulate a launcher restart after start but before land. The durable
+    # subject can rediscover the consumed id by lease, but never receives the
+    # host path again, even if the underlying lease expired meanwhile. A peer
+    # service cannot inspect it.
+    restarted = launcher_principal("launcher-a")
+    from deskd import orchestration
+    with orchestration.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE workspace_leases SET expires_at='2000-01-01T00:00:00+00:00' "
+            "WHERE lease_id=?", (lease_id,))
+    recovered_started = commands.execute(
+        restarted, "mount-crash-recover-claim", "launcher.mount.claim",
+        {"lease_id": lease_id})["result"]
+    assert recovered_started["ticket_id"] == issued["ticket_id"]
+    assert recovered_started["state"] == "started"
+    assert "host_path" not in recovered_started
+    inspected = commands.execute(
+        restarted, "mount-crash-recover-inspect", "launcher.mount.inspect",
+        {"lease_id": lease_id})["result"]
+    assert inspected["ticket_id"] == issued["ticket_id"]
+    assert "host_path" not in inspected and "container_path" not in inspected
+    with pytest.raises(commands.ControlAuthError):
+        commands.execute(
+            peer, "mount-peer-inspect", "launcher.mount.inspect",
+            {"lease_id": lease_id})
+    with pytest.raises(workspaces.WorkspaceError, match="live mount ticket"):
+        workspaces.release(
+            lease_id, owner_role="alpha",
+            expected_workspace_version=lease["workspace_version"])
+    with orchestration.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE workspace_leases SET expires_at=? WHERE lease_id=?",
+            (lease["expires_at"], lease_id))
+    landed = commands.execute(
+        launcher, "mount-land-0001", "launcher.mount.land", {
+            "ticket_id": issued["ticket_id"], "outcome": "landed",
+        })["result"]
+    assert landed["state"] == "landed"
+    assert commands.execute(
+        launcher, "mount-land-0002", "launcher.mount.land", {
+            "ticket_id": issued["ticket_id"], "outcome": "landed",
+        })["result"]["recovered"] is True
+
+    # An unconsumed ticket is invalid as soon as the lease version changes.
+    stale = commands.execute(
+        launcher, "mount-claim-stale", "launcher.mount.claim",
+        {"lease_id": lease_id})["result"]
+    with orchestration.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE workspace_leases SET workspace_version=workspace_version+1 "
+            "WHERE lease_id=?", (lease_id,))
+    with pytest.raises(commands.CommandConflict, match="invalidated"):
+        commands.execute(
+            launcher, "mount-start-stale", "launcher.mount.start",
+            {"ticket_id": stale["ticket_id"]})
+    renewed = commands.execute(
+        launcher, "mount-claim-renewed", "launcher.mount.claim",
+        {"lease_id": lease_id})["result"]
+    assert renewed["ticket_id"] != stale["ticket_id"]
+    assert renewed["workspace_version"] == stale["workspace_version"] + 1
+
+    # Expiry is checked against wall time, not the request's declared length or
+    # an old claim response. A subsequent claim rotates the expired ticket.
+    with orchestration.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE control_mount_tickets SET expires_at='2000-01-01T00:00:00+00:00' "
+            "WHERE ticket_id=?", (renewed["ticket_id"],))
+    with pytest.raises(commands.CommandConflict, match="expired"):
+        commands.execute(
+            launcher, "mount-start-expired", "launcher.mount.start",
+            {"ticket_id": renewed["ticket_id"]})
+    final_ticket = commands.execute(
+        launcher, "mount-claim-final", "launcher.mount.claim",
+        {"lease_id": lease_id})["result"]
+    commands.execute(
+        launcher, "mount-start-final", "launcher.mount.start",
+        {"ticket_id": final_ticket["ticket_id"]})
+    uncertain = commands.execute(
+        launcher, "mount-land-unknown", "launcher.mount.land", {
+            "ticket_id": final_ticket["ticket_id"],
+            "outcome": "indeterminate", "error": "runtime ack was lost",
+        })["result"]
+    assert uncertain["state"] == "indeterminate"
+    assert commands.execute(
+        launcher, "mount-land-unknown2", "launcher.mount.land", {
+            "ticket_id": final_ticket["ticket_id"],
+            "outcome": "indeterminate", "error": "runtime ack was lost",
+        })["result"]["recovered"] is True
+
+    # Crash recovery is explicit: after restart the launcher stops the exact
+    # labelled orphan, records the unknown launch result, then proves cleanup.
+    # Only then may a new one-time path-bearing ticket be issued.
+    recovered_unknown = commands.execute(
+        restarted, "mount-crash-recover-unknown", "launcher.mount.claim",
+        {"lease_id": lease_id})["result"]
+    assert recovered_unknown["ticket_id"] == final_ticket["ticket_id"]
+    assert recovered_unknown["state"] == "indeterminate"
+    assert "host_path" not in recovered_unknown
+    with pytest.raises(workspaces.WorkspaceError, match="indeterminate"):
+        workspaces.release(
+            lease_id, owner_role="alpha",
+            expected_workspace_version=recovered_unknown["workspace_version"])
+    reconciled = commands.execute(
+        restarted, "mount-reconcile-orphan", "launcher.mount.reconcile", {
+            "ticket_id": final_ticket["ticket_id"],
+            "resolution": "orphan_stopped",
+            "note": "exact labelled container is stopped and absent",
+        })["result"]
+    assert reconciled["state"] == "expired"
+    after_reconcile = commands.execute(
+        restarted, "mount-claim-after-reconcile", "launcher.mount.claim",
+        {"lease_id": lease_id})["result"]
+    assert after_reconcile["ticket_id"] != final_ticket["ticket_id"]
+    assert after_reconcile["state"] == "issued"
+    assert after_reconcile["host_path"] == str(host_path)
+
+    # Role projections carry only the configured container target. Ticket rows
+    # and the broker-private host launch path remain launcher-service-only.
+    role_projection = commands.self_projection("alpha")
+    encoded = str(role_projection)
+    assert str(host_path) not in encoded
+    assert final_ticket["ticket_id"] not in encoded
+
+
+def test_workspace_release_is_service_only_and_closes_mount_races(
+        repo, monkeypatch):
+    lease = acquire(task_key="release-mount-race")
+    lease_id = lease["lease_id"]
+    path = Path(lease["path"])
+    launcher = launcher_principal()
+    params = {"lease_id": lease_id,
+              "expected_version": lease["workspace_version"]}
+
+    with pytest.raises(commands.ControlAuthError, match="service principal"):
+        commands.execute(
+            alpha_principal(), "role-release-denied", "workspace.release", params)
+    assert path.is_dir()
+
+    # Claim exactly between filesystem validation and the release-intent CAS.
+    # The shared DB transaction must observe it and refuse to remove the tree.
+    original_validate = workspaces._validate_lease_files
+    raced = False
+
+    def claim_during_validation(spec, row):
+        nonlocal raced
+        result = original_validate(spec, row)
+        if not raced:
+            raced = True
+            commands.execute(
+                launcher, "release-race-claim", "launcher.mount.claim",
+                {"lease_id": lease_id})
+        return result
+
+    monkeypatch.setattr(
+        workspaces, "_validate_lease_files", claim_during_validation)
+    with pytest.raises(workspaces.WorkspaceError, match="live mount ticket"):
+        commands.execute(
+            launcher, "release-race-attempt", "workspace.release", params)
+    assert path.is_dir()
+    with workspaces._connect() as conn:
+        row = conn.execute(
+            "SELECT state,last_error FROM workspace_leases WHERE lease_id=?",
+            (lease_id,)).fetchone()
+    assert row["state"] == "active" and row["last_error"] is None
+
+    ticket = commands.execute(
+        launcher, "release-race-inspect", "launcher.mount.inspect",
+        {"lease_id": lease_id})["result"]
+    commands.execute(
+        launcher, "release-race-cancel", "launcher.mount.reconcile", {
+            "ticket_id": ticket["ticket_id"],
+            "resolution": "cancelled_before_start",
+            "note": "container creation never started",
+        })
+    monkeypatch.setattr(workspaces, "_validate_lease_files", original_validate)
+
+    # In the opposite ordering, release first commits its durable intent. A
+    # concurrent mount claim then fails before the exact directory is removed.
+    original_rmtree = workspaces.shutil.rmtree
+    claim_was_blocked = False
+
+    def claim_after_release_intent(target):
+        nonlocal claim_was_blocked
+        with pytest.raises(commands.CommandConflict, match="active workspace"):
+            commands.execute(
+                launcher, "release-after-intent-claim", "launcher.mount.claim",
+                {"lease_id": lease_id})
+        claim_was_blocked = True
+        return original_rmtree(target)
+
+    monkeypatch.setattr(workspaces.shutil, "rmtree", claim_after_release_intent)
+    released = commands.execute(
+        launcher, "release-after-intent", "workspace.release", params)["result"]
+    assert claim_was_blocked is True
+    assert released["state"] == "released"
+    assert not path.exists()
+
+
 def test_control_commit_recovers_same_request_after_head_moved_before_ledger(
         repo, monkeypatch):
     lease = acquire()
@@ -188,11 +446,11 @@ def test_control_release_recovers_same_request_after_tree_deletion(
     params = {"lease_id": lease["lease_id"],
               "expected_version": lease["workspace_version"]}
     with pytest.raises(workspaces.WorkspaceOutcomeUnknown):
-        commands.execute(alpha_principal(), "workspace-release-recovery",
+        commands.execute(launcher_principal(), "workspace-release-recovery",
                          "workspace.release", params)
     assert not path.exists()
     released = commands.execute(
-        alpha_principal(), "workspace-release-recovery",
+        launcher_principal(), "workspace-release-recovery",
         "workspace.release", params)
     assert released["result"]["state"] == "released"
     assert released["result"]["recovered"] is True
@@ -344,6 +602,13 @@ def test_repo_filter_and_textconv_commands_never_execute(repo):
     git(seed, "-c", "user.name=Seed", "-c", "user.email=seed@example.invalid",
         "commit", "-m", "attributes")
     marker.unlink(missing_ok=True)
+    # Process filters take precedence over clean/smudge. Config-defined hooks
+    # became executable in Git 2.54, while older Git accepts and ignores the
+    # keys. Keep both in the fixture so one test is a cross-version boundary.
+    git(seed, "config", "filter.evil.process", str(driver))
+    git(seed, "config", "diff.evil.command", str(driver))
+    git(seed, "config", "hook.evil.command", str(driver))
+    git(seed, "config", "--add", "hook.evil.event", "pre-commit")
 
     lease = acquire()
     path = Path(lease["path"])

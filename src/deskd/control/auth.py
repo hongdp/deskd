@@ -44,7 +44,7 @@ class Principal:
 _SUBJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SERVICE_SCOPES = frozenset({
-    "read", "directive", "orchestrator", "scheduler", "operator"})
+    "read", "directive", "orchestrator", "scheduler", "operator", "launcher"})
 
 
 def _token_hash(token: str) -> str:

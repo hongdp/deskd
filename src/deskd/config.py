@@ -332,6 +332,24 @@ class EngineConfig:
     #: return the existing running job and never invoke the callback twice.
     external_command_lease_seconds: int = 900
 
+    #: Automatic drain attempts for one stale session before the rollover is
+    #: held as a visible operator escalation.  A failed worker must not leave
+    #: an invisible, permanently draining session or retry without a bound.
+    rollover_max_attempts: int = 3
+
+    #: Hard transport limit for JSON accepted by authenticated mutation
+    #: endpoints.  The ASGI adapter enforces this before Pydantic parsing and
+    #: also counts streamed/chunked bytes, so Content-Length is only an early
+    #: rejection hint and never the security boundary.
+    control_max_request_body_bytes: int = field(default_factory=lambda:
+        int(env("CONTROL_MAX_REQUEST_BODY_BYTES") or 1024 * 1024))
+
+    #: One-time launcher mount authorization.  A caller may request a shorter
+    #: lifetime, never a longer one; tickets are consumed before a container is
+    #: started and cannot be reused for another workspace version.
+    launcher_ticket_ttl_seconds: int = 60
+    launcher_ticket_max_seconds: int = 300
+
     #: Production control containers set this true.  Legacy HTML and open
     #: projection routes then return 404, leaving only bearer-authenticated
     #: control endpoints plus /healthz.  A separate trusted console process may

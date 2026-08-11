@@ -39,6 +39,7 @@ role or `<role>.token`. Service principals are declared in the JSON manifest at
 - `orchestrator`
 - `scheduler`
 - `operator`
+- `launcher`
 
 Raw tokens are hashed in memory and are never written to SQLite. Secret and
 manifest files are opened with `O_NOFOLLOW`, validated with `fstat` as regular
@@ -78,6 +79,14 @@ The `Idempotency-Key` header must exactly equal `request_id`. Reusing a request
 id with different verb/params is a conflict. Native commands commit their
 receipt, mutation, and event atomically. A live duplicate of an external job
 returns its current job state and does not invoke it twice.
+
+All body-bearing control mutations are bounded at the ASGI receive boundary by
+`DESKD_CONTROL_MAX_REQUEST_BODY_BYTES` (default 1 MiB). A declared
+`Content-Length` above the bound is rejected early with 413; the server also
+counts every received byte, so chunked transfer encoding and a forged smaller
+length cannot bypass the limit. Duplicate or malformed length headers are
+rejected rather than interpreted ambiguously. The check runs before FastAPI or
+Pydantic materializes JSON.
 
 Clients must use `snapshot.meta.allowed_verbs` as the exact command vocabulary
 for their principal. `snapshot.meta.role` is the role name (or null for a
@@ -130,8 +139,84 @@ must present the current session id and cannot replace identity.
 role, runtime, presence, authority, capabilities, session_id,
 session_provider, session_provenance, config_version, prompt_version,
 agent_image, image_digest, build_revision, build_pins, workspace_leases,
-wake_quarantine, wake_reconciliations
+wake_quarantine, wake_reconciliations, rollover_requests
 ```
+
+## Durable daily rollover
+
+`scheduler.tick` commits stale-session detection, the presence transition to
+`draining`, and one `control_rollover_requests` row per role before it runs the
+ordinary wake planner. The request is therefore durable even if a planner probe
+fails or the scheduler loses its HTTP response. A role's next
+`agent.wake.claim` prioritizes this request and returns an exact resume claim
+with:
+
+```text
+reason_kind=session_rollover, mode=resume, resume_session_id,
+rollover_request_id, attempt_number, prompt
+```
+
+There is at most one live rollover request and one live wake claim per role.
+The worker resumes the named provider session with the full prompt, requires a
+successful provider exit and independently observes `SESSION_DONE` on its own
+line, then calls `agent.session.stop` for that same session before
+`agent.wake.land(outcome=landed)`. Stop is idempotent for an already-ended
+matching session, and deskd rejects landing until the old session is ended. A
+fresh `agent.session.start` then resets the role to an active current-day
+session.
+
+A missing sentinel or failed worker is landed as `failed`. deskd retries up to
+`rollover_max_attempts` (default 3), then keeps the old presence visibly
+`draining` and changes the rollover request to `escalated`; it appears in both
+`/api/self.rollover_requests` and `/api/snapshot.wake.rollovers`. An `operator`
+service may use `rollover.retry` with a required audit note to authorize another
+bounded batch. An `indeterminate` worker outcome instead quarantines the role
+until `wake.reconcile` proves `retry` or `landed`.
+
+## Trusted launcher mount ticket
+
+The container runtime belongs to a separate service principal with only the
+`launcher` scope. It asks for an exact active lease through:
+
+```text
+launcher.mount.claim {lease_id, ttl_seconds?}
+launcher.mount.start {ticket_id}
+launcher.mount.land {ticket_id, outcome=landed|indeterminate, error?}
+launcher.mount.inspect {lease_id}
+launcher.mount.reconcile {
+  ticket_id,
+  resolution=cancelled_before_start|orphan_stopped,
+  note
+}
+```
+
+Claim returns a short-lived one-time ticket, owner role, broker-private
+`host_path`, configured `container_path`, workspace version, expected directory
+device/inode, expiry, and all four build pins. This is the only API projection
+that returns the host path, and only to the launcher service: role tokens,
+`/api/self`, snapshots, events, and the TUI never receive a ticket or host path.
+
+Only one live ticket may exist for a lease. A repeated claim from the same
+launcher under a new command request id recovers the same unconsumed ticket
+without extending its TTL; replaying an old request id always returns its
+original immutable command receipt. A peer launcher is denied. `start` consumes
+it after revalidating that the lease is
+still active and unexpired and that version, paths, inode/device, and build pins
+are unchanged. `start`, `landed`, and `indeterminate` acknowledgements are
+idempotent for the issuing launcher. Version change or expiry invalidates an
+unconsumed ticket.
+
+The launcher must fsync `ticket_id`, lease/version, and its container launch id
+before `start`. If it crashes after consumption, `inspect` or a repeated claim
+with a fresh request id by that exact service subject recovers the ticket id and
+state but never the host/container paths. After stopping the exact labelled
+orphan it records an
+indeterminate landing, then explicitly reconciles `orphan_stopped`; an
+unstarted ticket instead uses `cancelled_before_start`. Reconciliation is
+launcher-subject scoped (or available to an `operator` service), requires an
+audit note, and is the only way to leave quarantine and claim again. The
+launcher mounts exactly `host_path` at `container_path`; it never mounts the
+worktree parent.
 
 ## Workspace broker
 
@@ -145,12 +230,18 @@ identifiers. The broker offers:
 - `workspace.status`
 - `workspace.diff`
 - `workspace.commit`
-- `workspace.release`
+
+`workspace.release` is deliberately absent from role-token vocabulary. Only a
+`launcher` or `operator` service may invoke it, after the worker/container has
+stopped. The release-intent CAS and mount claim/start share the same SQLite
+write boundary: an `issued`, `started`, or `indeterminate` ticket blocks
+release, and a committed release intent blocks any later claim/start before the
+exact worktree directory is removed.
 
 Commit requires the inspected head and workspace version. It rejects a
 pre-staged index, special files, nested `.git`, quota overflow, unsafe Git
-filters/textconv, hooks/signing, and a moved head. Release requires an exact
-workspace version and a clean tree whose HEAD equals the broker ledger.
+filters/textconv, hooks/signing, and a moved head. Service-only release requires
+an exact workspace version and a clean tree whose HEAD equals the broker ledger.
 
 The broker never pushes or merges. A human or separately authorized release
 service reviews and publishes the resulting commit.
@@ -247,4 +338,3 @@ is retained in `/api/self` for audit.
 | Wrong role or private event | 403 for reads/commands; cursor-only redaction for SSE |
 | Stale/mismatched workspace CAS | Reject; require a new inspect/status |
 | Artifact DB commit lost | Reuse verified content digest; orphan may be GC'd after grace |
-

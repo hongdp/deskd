@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import stat
@@ -16,7 +17,7 @@ from deskd import mailbox, meetings, orchestration as orch
 from deskd.config import CONFIG
 from deskd.control import commands, store
 from deskd.control.auth import ControlAuthError, Principal, TokenStore
-from deskd.web.app import create_app
+from deskd.web.app import _BoundedControlBody, create_app
 
 
 ALPHA_TOKEN = "alpha-token-000000000000000000000001"
@@ -53,6 +54,18 @@ def post(client: TestClient, request_id: str, verb: str, params: dict,
     return client.post(
         "/api/commands", headers=headers(token, request_id),
         json={"request_id": request_id, "verb": verb, "params": params})
+
+
+def session_start_params(session_id: str, *, mode: str = "spawn") -> dict:
+    return {
+        "session_id": session_id,
+        "mode": mode,
+        "provider": "claude",
+        "image_digest": CONFIG.image_digest,
+        "build_revision": CONFIG.build_revision,
+        "config_version": CONFIG.config_version,
+        "prompt_version": CONFIG.prompt_version,
+    }
 
 
 def test_native_command_receipt_mutation_and_event_are_atomic(desk):
@@ -356,6 +369,113 @@ def test_operator_landed_reconciliation_delivers_claimed_inbox(desk):
     assert row["delivered_at"] is not None
 
 
+def test_rollover_is_durable_bounded_and_opens_a_fresh_session(desk):
+    """The durable DB claim, not a scheduler response, is the worker queue."""
+    alpha = role_principal("alpha")
+    beta = role_principal("beta")
+    scheduler = service_principal("scheduler")
+    commands.execute(alpha, "roll-start-alpha", "agent.session.start",
+                     session_start_params("alpha-yesterday"))
+    commands.execute(beta, "roll-start-beta0", "agent.session.start",
+                     session_start_params("beta-yesterday"))
+    with orch.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE agent_sessions SET session_day='2000-01-01' "
+            "WHERE role IN ('alpha','beta')")
+
+    # Simulate callback completion followed by loss of the scheduler response.
+    # The command receipt is indeterminate, but rollover requests are committed.
+    with pytest.raises(RuntimeError, match="scheduler response lost"):
+        commands.execute(
+            scheduler, "scheduler-rollover-loss", "scheduler.tick", {},
+            before_complete=lambda: (_ for _ in ()).throw(
+                RuntimeError("scheduler response lost")))
+    with orch.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM control_rollover_requests").fetchone()[0] == 2
+
+    beta_claimed = commands.execute(
+        beta, "roll-claim-beta1", "agent.wake.claim", {})["result"]
+    claim = beta_claimed["claim"]
+    assert beta_claimed["resume_session_id"] == "beta-yesterday"
+    assert claim["reason_kind"] == "session_rollover"
+    assert claim["mode"] == "resume"
+    assert claim["resume_session_id"] == "beta-yesterday"
+    assert claim["attempt_number"] == 1
+    assert "SESSION_DONE" in claim["prompt"]
+    assert commands.execute(
+        beta, "roll-claim-beta2", "agent.wake.claim", {}
+    )["result"]["claim"]["claim_id"] == claim["claim_id"]
+
+    with pytest.raises(commands.CommandConflict, match="only after.*stopped"):
+        commands.execute(beta, "roll-land-too-early", "agent.wake.land", {
+            "claim_id": claim["claim_id"], "outcome": "landed",
+            "session_id": "beta-yesterday",
+        })
+    first_stop = commands.execute(
+        beta, "roll-stop-beta01", "agent.session.stop",
+        {"session_id": "beta-yesterday"})["result"]
+    repeated_stop = commands.execute(
+        beta, "roll-stop-beta02", "agent.session.stop",
+        {"session_id": "beta-yesterday"})["result"]
+    assert first_stop["recovered"] is False
+    assert repeated_stop["recovered"] is True
+    commands.execute(beta, "roll-land-beta001", "agent.wake.land", {
+        "claim_id": claim["claim_id"], "outcome": "landed",
+        "session_id": "beta-yesterday",
+    })
+    fresh = commands.execute(
+        beta, "roll-start-beta1", "agent.session.start",
+        session_start_params("beta-today"))["result"]["presence"]
+    assert fresh["session_id"] == "beta-today"
+    assert fresh["phase"] == "active"
+    assert fresh["ended_at"] is None and fresh["stale_day"] is False
+    assert commands.self_projection("beta")["rollover_requests"][0][
+        "state"] == "completed"
+
+    # Alpha never emits the independently observed sentinel.  Each worker
+    # reports failure without stopping the session; automatic claims stop at
+    # the configured bound and leave a visible operator escalation.
+    rollover_request_id = None
+    for attempt in range(1, CONFIG.rollover_max_attempts + 1):
+        failed_claim = commands.execute(
+            alpha, f"roll-claim-alpha{attempt}", "agent.wake.claim", {}
+        )["result"]["claim"]
+        assert failed_claim["attempt_number"] == attempt
+        rollover_request_id = failed_claim["rollover_request_id"]
+        commands.execute(
+            alpha, f"roll-fail-alpha0{attempt}", "agent.wake.land", {
+                "claim_id": failed_claim["claim_id"], "outcome": "failed",
+                "error": "provider exited without independent SESSION_DONE",
+            })
+    assert commands.execute(
+        alpha, "roll-claim-exhausted", "agent.wake.claim", {}
+    )["result"]["claim"] is None
+    self_view = commands.self_projection("alpha")
+    assert self_view["rollover_requests"][0]["state"] == "escalated"
+    assert self_view["presence"]["phase"] == "draining"
+    client = TestClient(create_app(token_store=tokens()))
+    snap = client.get("/api/snapshot", headers=headers()).json()
+    assert snap["wake"]["rollovers"][0]["state"] == "escalated"
+
+    # Only an operator can explicitly open another bounded retry batch.
+    operator = service_principal("operator")
+    assert "rollover.retry" in commands.allowed_verbs(operator)
+    with pytest.raises(commands.ControlAuthError):
+        commands.execute(alpha, "roll-retry-denied", "rollover.retry", {
+            "request_id": rollover_request_id, "note": "not my authority"})
+    retried = commands.execute(
+        operator, "roll-retry-operator", "rollover.retry", {
+            "request_id": rollover_request_id,
+            "note": "provider incident resolved; authorize another batch",
+        })["result"]
+    assert retried["state"] == "pending"
+    assert retried["max_attempts"] == 2 * CONFIG.rollover_max_attempts
+    assert commands.execute(
+        alpha, "roll-claim-after-op", "agent.wake.claim", {}
+    )["result"]["claim"]["attempt_number"] == CONFIG.rollover_max_attempts + 1
+
+
 def test_external_duplicate_has_one_live_execution(desk):
     entered = threading.Event()
     release = threading.Event()
@@ -447,6 +567,89 @@ def test_http_snapshot_command_scoping_and_idempotency(desk):
     assert replay.json() == made.json()
     cross = client.get("/api/inbox?role=beta", headers=headers())
     assert cross.status_code == 403
+
+
+def test_control_body_limit_counts_chunked_and_forged_lengths(desk):
+    async def exercise(raw_headers, chunks, *, max_bytes=8,
+                       receive_must_not_run=False):
+        called = []
+        sent = []
+
+        async def inner(scope, receive, send):
+            body = bytearray()
+            while True:
+                message = await receive()
+                body.extend(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            called.append(bytes(body))
+            await send({"type": "http.response.start", "status": 204,
+                        "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        messages = [
+            {"type": "http.request", "body": chunk,
+             "more_body": index < len(chunks) - 1}
+            for index, chunk in enumerate(chunks)
+        ]
+
+        async def receive():
+            if receive_must_not_run:
+                raise AssertionError("oversized Content-Length was not pre-rejected")
+            if messages:
+                return messages.pop(0)
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"},
+            "http_version": "1.1", "method": "POST", "scheme": "http",
+            "path": "/api/commands", "raw_path": b"/api/commands",
+            "query_string": b"", "headers": raw_headers,
+            "client": ("test", 1), "server": ("test", 80),
+        }
+        await _BoundedControlBody(inner, max_bytes=max_bytes)(
+            scope, receive, send)
+        status = next(message["status"] for message in sent
+                      if message["type"] == "http.response.start")
+        return status, called
+
+    # No length at all models chunked transport; a forged small length is not
+    # trusted either.  In both cases the ninth actual byte is rejected.
+    assert asyncio.run(exercise(
+        [(b"transfer-encoding", b"chunked")], [b"1234", b"56789"])) == (413, [])
+    assert asyncio.run(exercise(
+        [(b"content-length", b"1")], [b"1234", b"56789"])) == (413, [])
+    assert asyncio.run(exercise(
+        [(b"content-length", b"8")], [b"1234", b"5678"])) == (
+            204, [b"12345678"])
+    assert asyncio.run(exercise(
+        [(b"content-length", b"9")], [],
+        receive_must_not_run=True)) == (413, [])
+    assert asyncio.run(exercise(
+        [(b"content-length", b"+8")], [],
+        receive_must_not_run=True)) == (400, [])
+    assert asyncio.run(exercise(
+        [(b"content-length", b"8"), (b"content-length", b"8")], [],
+        receive_must_not_run=True)) == (400, [])
+
+    # The exact configured boundary also reaches the real FastAPI command
+    # parser; one extra JSON whitespace byte is rejected before Pydantic.
+    payload = json.dumps({
+        "request_id": "body-limit-0001", "verb": "task.add",
+        "params": {"title": "fits exactly"},
+    }, separators=(",", ":")).encode()
+    CONFIG.control_max_request_body_bytes = len(payload)
+    client = TestClient(create_app(token_store=tokens()))
+    exact_headers = headers(request_id="body-limit-0001") | {
+        "Content-Type": "application/json"}
+    assert client.post(
+        "/api/commands", headers=exact_headers, content=payload).status_code == 202
+    overflow = client.post(
+        "/api/commands", headers=exact_headers, content=payload + b" ")
+    assert overflow.status_code == 413
 
 
 def test_api_only_disables_legacy_and_scopes_detail(desk):

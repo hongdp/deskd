@@ -47,6 +47,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .. import auth, channels, mailbox
 from .. import config as config_mod
@@ -59,6 +60,94 @@ from ..control.auth import (ControlAuthError, Principal,
                             TokenStore as ControlTokenStore)
 
 STATIC = Path(__file__).parent / "static"
+
+_BODY_CONTROL_PATHS = frozenset({
+    "/api/commands",
+    "/api/runtime",
+    "/api/meetings/supervisor-apply",
+    "/api/meetings/supervisor-action",
+})
+
+
+class _BoundedControlBody:
+    """Bound mutation bodies at the ASGI receive boundary.
+
+    FastAPI resolves a body model before it invokes an endpoint, which means an
+    endpoint-level check is too late: a chunked request can already have forced
+    the sole control process to buffer arbitrary bytes.  Content-Length is used
+    only for a cheap early rejection.  Every actual ``http.request`` chunk is
+    counted and replayed to FastAPI only after the complete body is known to fit.
+    """
+
+    def __init__(self, app: ASGIApp, *, max_bytes: int,
+                 paths: frozenset[str] = _BODY_CONTROL_PATHS) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+        self.paths = paths
+
+    async def _error(self, scope: Scope, receive: Receive, send: Send,
+                     status: int, detail: str) -> None:
+        await JSONResponse({"detail": detail}, status_code=status)(
+            scope, receive, send)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (scope["type"] != "http" or scope.get("path") not in self.paths
+                or scope.get("method") not in {"POST", "PUT", "PATCH"}):
+            await self.app(scope, receive, send)
+            return
+
+        lengths = [value for name, value in scope.get("headers", [])
+                   if name.lower() == b"content-length"]
+        if lengths:
+            # Reject duplicate lengths even when equal.  Intermediaries do not
+            # agree universally on how to collapse them, so accepting one here
+            # would reopen request-smuggling ambiguity at the security boundary.
+            try:
+                if len(lengths) != 1:
+                    raise ValueError
+                raw_length = lengths[0].decode("ascii")
+                if not raw_length.isdigit():
+                    raise ValueError
+                declared = int(raw_length)
+            except (UnicodeDecodeError, ValueError):
+                await self._error(
+                    scope, receive, send, 400, "invalid Content-Length")
+                return
+            if declared > self.max_bytes:
+                await self._error(
+                    scope, receive, send, 413,
+                    f"request body exceeds {self.max_bytes} bytes")
+                return
+
+        buffered: list[Message] = []
+        received = 0
+        while True:
+            message = await receive()
+            buffered.append(message)
+            if message["type"] == "http.disconnect":
+                break
+            if message["type"] != "http.request":
+                continue
+            received += len(message.get("body", b""))
+            if received > self.max_bytes:
+                await self._error(
+                    scope, receive, send, 413,
+                    f"request body exceeds {self.max_bytes} bytes")
+                return
+            if not message.get("more_body", False):
+                break
+
+        position = 0
+
+        async def replay() -> Message:
+            nonlocal position
+            if position < len(buffered):
+                message = buffered[position]
+                position += 1
+                return message
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await self.app(scope, replay, send)
 
 
 class SupervisorAssertionRequest(BaseModel):
@@ -166,6 +255,10 @@ def create_app(config: EngineConfig | None = None, *,
               "port acts as supervisor. Bind to a host you trust.")
 
     app = FastAPI(title=f"{config_mod.PROJECT_NAME} console")
+    max_body_bytes = int(cfg.control_max_request_body_bytes)
+    if max_body_bytes <= 0:
+        raise RuntimeError("control_max_request_body_bytes must be positive")
+    app.add_middleware(_BoundedControlBody, max_bytes=max_body_bytes)
 
     if cfg.control_api_only:
         control_paths = {
@@ -314,6 +407,18 @@ def create_app(config: EngineConfig | None = None, *,
                     "SELECT claim_id,role,state,channel,mode,claimed_at,error "
                     f"FROM control_wake_claims {claim_where} ORDER BY claimed_at",
                     claim_params).fetchall()]
+                rollover_where = ""
+                rollover_params: list[str] = []
+                if role:
+                    rollover_where = "WHERE role=?"
+                    rollover_params.append(role)
+                wake["rollovers"] = [dict(row) for row in conn.execute(
+                    """SELECT request_id,role,resume_session_id,from_day,to_day,
+                              state,attempt_count,max_attempts,claim_id,last_error,
+                              created_at,updated_at,completed_at
+                       FROM control_rollover_requests """
+                    f"{rollover_where} ORDER BY created_at DESC LIMIT 200",
+                    rollover_params).fetchall()]
                 # Some historical "read" projections materialize durable
                 # delivery state.  Capture the cursor after those writes, in
                 # this same transaction, so the returned state is exactly at N.
