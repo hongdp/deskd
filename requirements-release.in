@@ -1,0 +1,7 @@
+# Hashed, reproducible tooling for the PyPI artifact job.
+# Regenerate deliberately with:
+#   uv pip compile requirements-release.in --python-version 3.13 \
+#     --generate-hashes --output-file requirements-release.lock
+build==1.5.0
+hatchling==1.32.0
+twine==7.0.0

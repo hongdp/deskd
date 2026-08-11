@@ -12,6 +12,9 @@ index you can read in one screen beats navigation you have to maintain.
 - [`control-plane.md`](control-plane.md) — the optional isolated deployment:
   authenticated principals, atomic command receipts, snapshot/SSE recovery,
   shared/private state, workspace leases and operational boundaries.
+- [`container-deployment.md`](container-deployment.md) — the production runbook:
+  immutable image provenance, UID/mount/network boundaries, secret projection,
+  startup, backup, reconciliation, rolling upgrade and rollback gates.
 - [`glossary.md`](glossary.md) — the vocabulary, and the two words that name two
   different things: `escalation` (a per-meeting queue **and** the wake ladder's
   human-rung outbox) and `store` (one module per subpackage, with two

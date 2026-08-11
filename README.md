@@ -345,6 +345,7 @@ deliberately unlike a trading desk, you are the second host we're looking for.
 - [`docs/design.md`](docs/design.md) — architecture and the decisions behind it
 - [`docs/security.md`](docs/security.md) — threat model and the supervisor boundary
 - [`docs/control-plane.md`](docs/control-plane.md) — isolated deployment, command receipts, SSE and workspace leases
+- [`docs/container-deployment.md`](docs/container-deployment.md) — production image, mounts, network, backup, rollout and rollback gates
 - [`docs/glossary.md`](docs/glossary.md) — the vocabulary, including the two words that name two different things
 - [`docs/roadmap.md`](docs/roadmap.md) — where this is going, in dependency order
 - [`docs/tui.md`](docs/tui.md) — realtime terminal interface and HTTP/SSE contract

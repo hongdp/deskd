@@ -127,8 +127,12 @@ single-control-service deployment contract.
 
 ## Release workflow ownership
 
-Use one release workflow as the sole writer of GHCR version tags and `latest`.
-That workflow should configure QEMU before a multi-architecture build, emit SBOM
-and provenance attestations, push immutable revision/version tags, and only then
-advance a mutable convenience tag. A second branch-push workflow must not race
-the release workflow for the same tags.
+Use one release workflow as the sole writer of GHCR release tags. It configures
+QEMU before a multi-architecture build, emits SBOM and provenance attestations,
+and publishes only full version, release-tag and source-revision tags. Production
+still resolves and records the resulting digest; a tag is never session identity.
+
+The release workflow deliberately does not write `latest` or a floating
+major/minor tag. If a project adds convenience tags, promote them only in a
+separate post-verification operation with an explicit monotonic-version guard;
+never let a prerelease or rerun of an older release move them backwards.
