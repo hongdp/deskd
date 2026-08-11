@@ -217,10 +217,12 @@ jobs:
           verify_or_upload() {
             asset="$1"
             if gh release download "${GITHUB_REF_NAME}" \
+                --repo "${GITHUB_REPOSITORY}" \
                 --pattern "${asset}" --dir "${existing}"; then
               cmp "${asset}" "${existing}/${asset}"
             else
-              gh release upload "${GITHUB_REF_NAME}" "${asset}"
+              gh release upload "${GITHUB_REF_NAME}" "${asset}" \
+                --repo "${GITHUB_REPOSITORY}"
             fi
           }
           verify_or_upload release-SHA256SUMS
