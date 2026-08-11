@@ -6,6 +6,8 @@ import os
 import threading
 import urllib.error
 import urllib.parse
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,20 @@ from deskd.tui.client import (APIError, ClientError, ConnectionNotice,
 CURSOR_1 = "evt_0123456789abcdef_0000000000000001"
 CURSOR_2 = "evt_0123456789abcdef_0000000000000002"
 TOKEN = "s" * 32
+
+
+@contextmanager
+def _http_server(handler):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 class FakeResponse:
@@ -131,6 +147,59 @@ def test_remote_http_refuses_to_leak_bearer_token():
     ControlPlaneClient("http://127.0.0.2:8000", token=TOKEN)
     ControlPlaneClient("http://deskd.internal:8000", token=TOKEN,
                        allow_insecure_http=True)
+
+
+@pytest.mark.parametrize("target_scheme", ["http", "https"])
+def test_protocol_redirects_fail_without_forwarding_bearer(target_scheme):
+    captured: list[str | None] = []
+
+    class Sink(BaseHTTPRequestHandler):
+        def do_GET(self):
+            captured.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        do_POST = do_GET
+
+        def log_message(self, *_args):
+            pass
+
+    class Redirect(BaseHTTPRequestHandler):
+        target = ""
+
+        def _reply(self):
+            self.send_response(302)
+            self.send_header("Location", self.target)
+            self.end_headers()
+
+        do_GET = _reply
+        do_POST = _reply
+
+        def log_message(self, *_args):
+            pass
+
+    with _http_server(Sink) as sink:
+        sink_port = sink.server_address[1]
+        # `localhost` also changes the URL host spelling; the independently
+        # allocated sink changes the authority port.  HTTPS proves that a
+        # scheme upgrade cannot become an implicit credential transfer either.
+        Redirect.target = (
+            f"{target_scheme}://localhost:{sink_port}/capture")
+        with _http_server(Redirect) as redirect:
+            base = f"http://127.0.0.1:{redirect.server_address[1]}"
+            client = ControlPlaneClient(base, token=TOKEN)
+            calls = [
+                lambda: client.request_json("GET", "/api/snapshot"),
+                lambda: client.fetch_meeting("meeting-1"),
+                lambda: client.fetch_agent_feed("analyst"),
+                lambda: client.submit_command("task.list", {}),
+                lambda: client._open_stream(None),
+            ]
+            for call in calls:
+                with pytest.raises(APIError) as caught:
+                    call()
+                assert caught.value.status == 302
+    assert captured == []
 
 
 def test_url_must_not_embed_credentials():

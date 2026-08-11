@@ -138,12 +138,26 @@ class Transport(Protocol):
     def open(self, request: urllib.request.Request, *, timeout: float) -> Response: ...
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Fail closed instead of forwarding control credentials to a new URL.
+
+    ``urllib`` normally copies ``Authorization`` while following redirects,
+    including redirects to another host, port, or scheme. A deskd protocol
+    endpoint has no legitimate redirect contract, so even same-origin 30x
+    responses are errors rather than an ambient authority transfer.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class UrllibTransport:
     """Default stdlib transport with normal system TLS verification."""
 
     def __init__(self, *, ca_file: str | Path | None = None):
         context = ssl.create_default_context(cafile=str(ca_file) if ca_file else None)
         self._opener = urllib.request.build_opener(
+            _RejectRedirects(),
             urllib.request.HTTPSHandler(context=context))
 
     def open(self, request: urllib.request.Request, *, timeout: float) -> Response:
