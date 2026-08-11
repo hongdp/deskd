@@ -426,6 +426,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_sv.add_argument("--port", type=int, default=int(env("PORT") or 8000))
     p_sv.add_argument("--reload", action="store_true", help="development autoreload")
 
+    # --- tui ----------------------------------------------------------------
+    p_tui = sub.add_parser(
+        "tui",
+        help="realtime terminal interface for a remote deskd control plane")
+    p_tui.add_argument(
+        "--url", default=env("API_URL") or "http://127.0.0.1:8000",
+        help="control-plane base URL (default: DESKD_API_URL or loopback:8000)")
+    auth_group = p_tui.add_mutually_exclusive_group()
+    auth_group.add_argument(
+        "--token-file",
+        help="owner-only bearer-token file; alternatively set DESKD_API_TOKEN")
+    auth_group.add_argument(
+        "--no-auth", action="store_true",
+        help="do not use DESKD_API_TOKEN (read-only/open development servers)")
+    p_tui.add_argument(
+        "--role",
+        help="default target for unprefixed composer text; never claims identity")
+    p_tui.add_argument("--ca-file", help="custom TLS CA bundle")
+    p_tui.add_argument(
+        "--allow-insecure-http", action="store_true",
+        help="allow a bearer token over non-loopback HTTP (trusted network only)")
+    p_tui.add_argument("--timeout", type=float, default=10.0,
+                       help="HTTP request timeout seconds (default: 10)")
+    p_tui.add_argument("--stale-after", type=float, default=20.0,
+                       help="mark the stream stale after N seconds (default: 20)")
+    p_tui.add_argument("--refresh", type=float, default=30.0,
+                       help="fallback full-refresh interval seconds (default: 30)")
+
     return parser
 
 
@@ -651,6 +679,26 @@ def _cmd_runtime(args: argparse.Namespace) -> None:
     _emit(rt.set_role_runtime(args.role, key, value, actor="operator_cli"))
 
 
+def _cmd_tui(args: argparse.Namespace) -> None:
+    """Run the optional terminal client without importing it for other verbs."""
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        _reject(f"the terminal interface needs the optional extra: "
+                f"pip install {PROJECT_NAME}[tui]")
+    from .tui.client import ClientError, ControlPlaneClient, load_api_token
+    from .tui.app import run_tui
+    try:
+        token = load_api_token(args.token_file, no_auth=args.no_auth)
+        client = ControlPlaneClient(
+            args.url, token=token, timeout=args.timeout, ca_file=args.ca_file,
+            allow_insecure_http=args.allow_insecure_http)
+    except (ClientError, OSError) as exc:
+        _reject(str(exc))
+    run_tui(client, default_role=args.role, stale_after=args.stale_after,
+            refresh_seconds=args.refresh)
+
+
 def _agent_prompt(args: argparse.Namespace) -> str:
     if args.prompt is not None:
         return args.prompt
@@ -693,6 +741,7 @@ _DISPATCH = {
     "meeting": _cmd_meeting,
     "review": _cmd_review,
     "serve": _cmd_serve,
+    "tui": _cmd_tui,
 }
 
 

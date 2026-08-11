@@ -58,6 +58,25 @@ public API; if a plain Python loop can play every part, the orchestration you
 are watching is all engine. Beat-by-beat script:
 [`examples/support_desk/README.md`](examples/support_desk/README.md).
 
+### Realtime terminal control
+
+Install the optional TUI next to any machine that can reach the deskd control
+plane — it is a remote client and never opens the engine's SQLite database:
+
+```bash
+pip install "deskd[tui]"
+DESKD_API_TOKEN="$(your-secret-provider read deskd/operator)" \
+  deskd tui --url https://desk.example.net
+```
+
+The interface tails an SSE event cursor, reconnects without skipping committed
+state, marks stale data visibly, and shows agents/current activity, tasks,
+inbox, meetings, hooks/wake history, runtime versions and live session feeds.
+Its fast composer routes durable instructions and desk commands through the
+control plane, whose bearer scope — never a role typed into the UI — determines
+what the caller may do. See [`docs/tui.md`](docs/tui.md) for the screen, command
+grammar, API contract and credential rules.
+
 ### Wire your own desk
 
 Describe your desk in a module that defines `configure_deskd()`:
@@ -249,8 +268,10 @@ LangGraph app can be one deskd role). Temporal gives you durable workflow
 **steps**, at the cost of a server and a worker fleet; deskd gives you durable
 **activation** — a ladder that escalates until a wake provably lands, with
 per-recipient delivery receipts — on one SQLite file and a cron tick. And what
-deskd deliberately does not do: run agents, in-graph control flow, streaming,
-memory, RAG, distribution. It guarantees at-least-once with idempotent acks,
+deskd deliberately does not do: run agents, in-graph control flow, LLM token
+streaming, memory, RAG, or distributed workflow execution. Its SSE surface
+streams committed orchestration invalidations and session narration, not model
+execution. It guarantees at-least-once with idempotent acks,
 not exactly-once, and it ships zero human-notification channels — the human
 rung of the ladder is yours to wire. If you want durable workflow steps and can
 run a cluster, use Temporal; if you want an in-process agent graph, use
@@ -307,6 +328,7 @@ deliberately unlike a trading desk, you are the second host we're looking for.
 - [`docs/security.md`](docs/security.md) — threat model and the supervisor boundary
 - [`docs/glossary.md`](docs/glossary.md) — the vocabulary, including the two words that name two different things
 - [`docs/roadmap.md`](docs/roadmap.md) — where this is going, in dependency order
+- [`docs/tui.md`](docs/tui.md) — realtime terminal interface and HTTP/SSE contract
 - [`examples/support_desk/`](examples/support_desk/README.md) — the runnable demo
 - [`skills/agent-orchestration/`](skills/agent-orchestration/) — a skill teaching an agent to operate and evolve a deskd desk
 

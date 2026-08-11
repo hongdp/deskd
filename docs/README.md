@@ -17,6 +17,9 @@ index you can read in one screen beats navigation you have to maintain.
   each item says what it unlocks, what it must wait for, and which claims are
   still untested. Ends with the known structural debt and why each piece is
   not being fixed yet.
+- [`tui.md`](tui.md) — the remote realtime terminal interface, its fast
+  multi-agent command composer, HTTP/SSE contract, reconnect semantics and
+  credential boundaries.
 - [`images/`](images/) — console screenshots (light/dark pairs), captured from
   the seeded demo desk in
   [`examples/support_desk/`](../examples/support_desk/README.md) — never from
