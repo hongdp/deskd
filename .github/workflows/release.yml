@@ -119,6 +119,64 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           skip-existing: true
+      - name: Verify the complete published PyPI file set and identity
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION#v}" python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import time
+          import urllib.error
+          import urllib.request
+
+          expected = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in pathlib.Path("dist").iterdir() if path.is_file()
+          }
+          endpoint = f"https://pypi.org/pypi/deskd/{os.environ['VERSION']}/json"
+          observed = {}
+          for attempt in range(12):
+              request = urllib.request.Request(
+                  f"{endpoint}?refresh={time.time_ns()}",
+                  headers={"Cache-Control": "no-cache"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      payload = json.load(response)
+              except urllib.error.HTTPError as exc:
+                  if exc.code != 404:
+                      raise
+                  payload = {"urls": []}
+              observed = {
+                  item["filename"]: item["digests"]["sha256"]
+                  for item in payload.get("urls", [])
+              }
+              unexpected = sorted(set(observed) - set(expected))
+              mismatched = sorted(
+                  name for name in set(observed) & set(expected)
+                  if observed[name] != expected[name]
+              )
+              if unexpected or mismatched:
+                  raise SystemExit(
+                      f"published PyPI identity conflict: "
+                      f"unexpected={unexpected}, mismatched={mismatched}"
+                  )
+              if observed == expected:
+                  print("PyPI file set and hashes match the release artifacts")
+                  break
+              if attempt != 11:
+                  time.sleep(5)
+          else:
+              missing = sorted(set(expected) - set(observed))
+              raise SystemExit(
+                  f"PyPI did not converge to the complete release file set; "
+                  f"missing={missing}"
+              )
+          PY
 
   attach-checksums:
     needs: [publish, publish-container]
@@ -227,6 +285,31 @@ jobs:
           FINAL_TAGS: ${{ steps.names.outputs.final_tags }}
         run: |
           set -euo pipefail
+          inspect_digest() {
+            target="$1"
+            error_file="$(mktemp)"
+            if output="$(docker buildx imagetools inspect "${target}" \
+                2>"${error_file}")"; then
+              digest="$(printf '%s\n' "${output}" \
+                | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
+              rm -f "${error_file}"
+              if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "registry returned no valid digest for ${target}" >&2
+                return 2
+              fi
+              printf '%s\n' "${digest}"
+              return 0
+            fi
+            if grep -Eqi '(manifest unknown|name unknown|(^|[^[:alpha:]])not found([^[:alpha:]]|$))' \
+                "${error_file}"; then
+              rm -f "${error_file}"
+              return 1
+            fi
+            echo "registry inspection failed for ${target}:" >&2
+            cat "${error_file}" >&2
+            rm -f "${error_file}"
+            return 2
+          }
           [[ "${BUILT_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           candidate_digest="$(docker buildx imagetools inspect "${CANDIDATE}" \
             | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
@@ -235,9 +318,7 @@ jobs:
           selected=''
           while IFS= read -r target; do
             [ -n "${target}" ] || continue
-            if current="$(docker buildx imagetools inspect "${target}" 2>/dev/null \
-                | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"; then
-              [[ "${current}" =~ ^sha256:[0-9a-f]{64}$ ]]
+            if current="$(inspect_digest "${target}")"; then
               if [ -n "${selected}" ]; then
                 test "${current}" = "${selected}" || {
                   echo "existing release tags disagree on their digest" >&2
@@ -246,6 +327,9 @@ jobs:
               else
                 selected="${current}"
               fi
+            else
+              status=$?
+              [ "${status}" -eq 1 ] || exit "${status}"
             fi
           done <<< "${FINAL_TAGS}"
           if [ -z "${selected}" ]; then
@@ -422,16 +506,43 @@ jobs:
           FINAL_TAGS: ${{ steps.names.outputs.final_tags }}
         run: |
           set -euo pipefail
+          inspect_digest() {
+            target="$1"
+            error_file="$(mktemp)"
+            if output="$(docker buildx imagetools inspect "${target}" \
+                2>"${error_file}")"; then
+              digest="$(printf '%s\n' "${output}" \
+                | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
+              rm -f "${error_file}"
+              if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "registry returned no valid digest for ${target}" >&2
+                return 2
+              fi
+              printf '%s\n' "${digest}"
+              return 0
+            fi
+            if grep -Eqi '(manifest unknown|name unknown|(^|[^[:alpha:]])not found([^[:alpha:]]|$))' \
+                "${error_file}"; then
+              rm -f "${error_file}"
+              return 1
+            fi
+            echo "registry inspection failed for ${target}:" >&2
+            cat "${error_file}" >&2
+            rm -f "${error_file}"
+            return 2
+          }
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker buildx imagetools inspect "${IMAGE}@${DIGEST}" >/dev/null
           while IFS= read -r target; do
             [ -n "${target}" ] || continue
-            if current="$(docker buildx imagetools inspect "${target}" 2>/dev/null \
-                | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"; then
+            if current="$(inspect_digest "${target}")"; then
               test "${current}" = "${DIGEST}" || {
                 echo "refusing to move existing release tag ${target}" >&2
                 exit 1
               }
+            else
+              status=$?
+              [ "${status}" -eq 1 ] || exit "${status}"
             fi
           done <<< "${FINAL_TAGS}"
           promote=()
