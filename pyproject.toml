@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deskd"
-description = "Between-turn orchestration for headless AI agents: a durable wake ladder, per-message delivery receipts, bounded meetings, and a supervisor boundary — one SQLite file, no daemons."
+description = "Between-turn orchestration for headless AI agents: durable wakes, delivery receipts, bounded meetings, and an optional isolated control plane."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -28,6 +28,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Topic :: System :: Distributed Computing",

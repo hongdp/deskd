@@ -14,11 +14,7 @@ name as authority. Those boundaries stay in the control plane.
 ```bash
 pip install "deskd[tui]"
 
-# Interactive agent tools: HTTPS plus one injected role bearer token.
-DESKD_API_TOKEN="$(secret-tool lookup service deskd role engineer)" \
-  deskd tui --url https://desk.example.net
-
-# A file is also accepted if it is a regular owner-only file (chmod 600).
+# The bearer token must be a regular owner-only file (chmod 600).
 deskd tui --url https://desk.example.net --token-file /run/secrets/deskd-token
 ```
 
@@ -28,7 +24,7 @@ secret stores), no credential-in-URL support, and no on-disk token cache. A
 bearer token over non-loopback plain HTTP is rejected unless the operator
 explicitly chooses `--allow-insecure-http` for a trusted network.
 
-`DESKD_API_TOKEN` is a control-plane API credential. It is **not** the simple
+The token file contains a control-plane API credential. It is **not** the simple
 supervisor access code. The TUI never reads or sends that code and cannot use
 the private supervisor endpoints. Supervisor mutations continue through the
 authenticated Web/signed adapter; an API token receives only its server-issued

@@ -7,9 +7,12 @@
 [![tests](https://github.com/hongdp/deskd/actions/workflows/ci.yml/badge.svg)](https://github.com/hongdp/deskd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-deskd never runs your agents. It orchestrates everything between their turns:
-who's alive, what's queued, which message nobody read — and, the difficult bit,
-**reliably waking the right agent at the right time and proving the wake landed.**
+deskd orchestrates everything between agent turns: who's alive, what's queued,
+which message nobody read — and, the difficult bit, **reliably waking the right
+agent at the right time and proving the wake landed.** Its embedded engine stays
+an ordinary library. Its optional isolated deployment adds an authenticated
+control process and one independently supervised runner per role; the control
+process never speaks as a role or inherits that role's provider credentials.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/board-escalation-dark.png">
@@ -65,8 +68,8 @@ plane — it is a remote client and never opens the engine's SQLite database:
 
 ```bash
 pip install "deskd[tui]"
-DESKD_API_TOKEN="$(your-secret-provider read deskd/operator)" \
-  deskd tui --url https://desk.example.net
+deskd tui --url https://desk.example.net \
+  --token-file /run/secrets/deskd-operator-token
 ```
 
 The interface tails an SSE event cursor, reconnects without skipping committed
@@ -207,8 +210,11 @@ flowchart LR
     L --- DB
 ```
 
-Storage is SQLite (WAL) and it is the only source of truth — no broker, no
-daemon holding state. Every tick rebuilds its decisions from the database, so a
+Storage is SQLite (WAL) and it is the only source of truth — there is no message
+broker and no in-memory authority. Embedded mode opens it locally. In isolated
+mode exactly one control process owns it; role runners use bearer-scoped HTTP
+commands, an atomic snapshot and resumable SSE invalidations, and never mount
+the database. Every tick rebuilds its decisions from committed state, so a
 crashed orchestrator self-heals on the next tick. SQLite can't wake a dormant
 process, and the engine doesn't pretend otherwise: it makes every wake attempt
 an auditable row with a closed loop and an escalation path.
@@ -245,26 +251,37 @@ silently lost.
 | **Session lifecycle** | Intraday continuity, cross-day rollover: wind the old session down with a handoff, start fresh the next day. |
 | **Supervisor console** | Seven views over one shell: the board (every number links to the view that explains it), the office floor (who is at a desk, who is in which room and with whom), per-agent detail (wake history, delivery ledger, full event log), meetings, the wake ladder, escalation ledgers, and tasks & hooks — behind an access-code or Ed25519 trusted-device gate. |
 
-## Works with headless Claude Code
+## Headless and isolated runtimes
 
-Built for [Claude Code](https://claude.com/claude-code) agents (`claude -p`),
-tied to no runtime. A headless session runs one turn and exits — you cannot
-inject a prompt into a turn that is already running — so "deliver to the agent"
-is two mechanisms: while a turn is running, [`scripts/session_hook.py`](scripts/session_hook.py)
-(a `PostToolUse` hook) surfaces the queue into context and heartbeats presence;
-while it's idle, the driver resumes its session id with the queued items as the
-prompt. [`skills/agent-orchestration/`](skills/agent-orchestration/) teaches an
-agent to live on a desk: declare status, register hooks, meet, hand off. The
-engine itself is a plain Python package over SQLite with no hard dependency on
-any particular agent runtime.
+Built for headless harnesses such as [Claude Code](https://claude.com/claude-code)
+and Codex, but tied to neither. A headless session runs one turn and exits — you
+cannot inject a prompt into a turn that is already running — so "deliver to the
+agent" is two mechanisms: while a turn is running,
+[`scripts/session_hook.py`](scripts/session_hook.py) surfaces the queue into
+context and heartbeats presence; while it is idle, a runner resumes its session
+id with the queued items as the prompt.
+
+The default embedded deployment uses the reference driver and a role-scoped
+host lock. The optional isolated deployment gives every role a private provider
+home, credential set, session journal and source mount. A bearer token derives
+identity at the control boundary; committed commands carry idempotency receipts;
+SSE is only an invalidation channel and an atomic snapshot remains truth. The
+workspace broker alone owns writable Git metadata and can acquire, inspect,
+diff, commit and release a bounded lease — agents cannot push, merge, fetch or
+reuse another task's branch. See [`docs/control-plane.md`](docs/control-plane.md).
+
+[`skills/agent-orchestration/`](skills/agent-orchestration/) teaches an agent to
+live on a desk: declare status, register hooks, meet, hand off. The core remains
+a plain Python package over SQLite with no hard dependency on a provider.
 
 ## How it compares
 
 LangGraph, CrewAI, and AG2 orchestrate what happens **inside** a running
-process: the framework runs your agent code and manages its state. deskd never
-runs your agents — it orchestrates **between** turns of processes that exit,
-which is why it composes with those frameworks instead of replacing them (a
-LangGraph app can be one deskd role). Temporal gives you durable workflow
+process: the framework runs your agent code and manages its state. deskd
+orchestrates **between** turns of processes that exit. Its optional role runner
+only starts or resumes the configured harness; it does not own the model loop or
+act as the role. That is why it composes with those frameworks instead of
+replacing them (a LangGraph app can be one deskd role). Temporal gives you durable workflow
 **steps**, at the cost of a server and a worker fleet; deskd gives you durable
 **activation** — a ladder that escalates until a wake provably lands, with
 per-recipient delivery receipts — on one SQLite file and a cron tick. And what
@@ -316,7 +333,8 @@ Threat model and the `open`-mode surrender: [`docs/security.md`](docs/security.m
 
 ## Status
 
-0.1.x, alpha. deskd runs one production desk daily — an automated trading desk
+0.4.x, alpha. The isolated control-plane, workspace-broker and TUI contracts are
+new in 0.4. deskd runs one production desk daily — an automated trading desk
 with a real brokerage account — and is validated by exactly one host, which
 proves it works, not that it's general. The roadmap is written in dependency
 order and says which claims are untested; if you're building a desk that is
@@ -326,6 +344,7 @@ deliberately unlike a trading desk, you are the second host we're looking for.
 
 - [`docs/design.md`](docs/design.md) — architecture and the decisions behind it
 - [`docs/security.md`](docs/security.md) — threat model and the supervisor boundary
+- [`docs/control-plane.md`](docs/control-plane.md) — isolated deployment, command receipts, SSE and workspace leases
 - [`docs/glossary.md`](docs/glossary.md) — the vocabulary, including the two words that name two different things
 - [`docs/roadmap.md`](docs/roadmap.md) — where this is going, in dependency order
 - [`docs/tui.md`](docs/tui.md) — realtime terminal interface and HTTP/SSE contract

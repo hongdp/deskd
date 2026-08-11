@@ -8,7 +8,10 @@ index you can read in one screen beats navigation you have to maintain.
   delivery ledger, bounded meetings, and what deskd deliberately does not do.
 - [`security.md`](security.md) — threat model, the supervisor boundary
   (`simple` / `signed` / `hybrid` / the `open`-mode surrender), probes, and
-  one-session-per-role.
+  one-session-per-role, plus role/service tokens and container isolation.
+- [`control-plane.md`](control-plane.md) — the optional isolated deployment:
+  authenticated principals, atomic command receipts, snapshot/SSE recovery,
+  shared/private state, workspace leases and operational boundaries.
 - [`glossary.md`](glossary.md) — the vocabulary, and the two words that name two
   different things: `escalation` (a per-meeting queue **and** the wake ladder's
   human-rung outbox) and `store` (one module per subpackage, with two

@@ -175,6 +175,8 @@ def _is_loopback(host: str) -> bool:
 def _valid_token(value: str | None) -> str | None:
     if value is None:
         return None
+    if not 24 <= len(value) <= 4096:
+        raise ClientError("API token must contain 24-4096 characters")
     if any(char.isspace() or unicodedata.category(char) in {"Cc", "Cf"}
            for char in value):
         raise ClientError("API token must not contain whitespace or control characters")
@@ -197,29 +199,44 @@ def _list_of_dicts(value: object, name: str) -> list[dict[str, Any]]:
     return [dict(v) for v in value]
 
 
-def load_api_token(path: str | Path | None, *, environ: Mapping[str, str] | None = None,
-                   no_auth: bool = False) -> str | None:
+def load_api_token(path: str | Path | None, *, no_auth: bool = False) -> str | None:
     """Load a bearer token without ever accepting it on the command line.
 
-    Explicit token files must be regular, owner-only files.  Environment
-    injection is useful for containers and avoids credentials in process
-    listings.  The value is held in memory and never persisted by deskd.
+    Token files must be regular, owner-only files.  Raw token environment
+    variables are deliberately unsupported: process environments are not a
+    secret store and make accidental inheritance easy.  Callers must choose a
+    token file or explicitly request the unauthenticated read-only mode.
     """
 
     if no_auth:
         return None
-    env = os.environ if environ is None else environ
     if path is None:
-        return _valid_token(_optional_text(env.get("DESKD_API_TOKEN")))
+        raise ClientError("--token-file is required unless --no-auth is selected")
     token_path = Path(path).expanduser()
-    info = token_path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise ClientError("API token path must be a regular, non-symlink file")
-    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
-        raise ClientError("API token file must be owned by the current user")
-    if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise ClientError("API token file must not be accessible by group or others (chmod 600)")
-    token = token_path.read_text(encoding="utf-8").strip()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(token_path, flags)
+    except OSError as exc:
+        raise ClientError(
+            f"API token path must be a readable regular, non-symlink file: {exc}"
+        ) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ClientError("API token path must be a regular, non-symlink file")
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise ClientError("API token file must be owned by the current user")
+        if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise ClientError(
+                "API token file must not be accessible by group or others (chmod 600)"
+            )
+        if info.st_size > 4097:  # 4096 token bytes plus one trailing newline
+            raise ClientError("API token file is too large")
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as handle:
+            token = handle.read(4097).strip()
+    finally:
+        os.close(descriptor)
     if not token:
         raise ClientError("API token file is empty")
     return _valid_token(token)

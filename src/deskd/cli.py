@@ -436,10 +436,10 @@ def build_parser() -> argparse.ArgumentParser:
     auth_group = p_tui.add_mutually_exclusive_group()
     auth_group.add_argument(
         "--token-file",
-        help="owner-only bearer-token file; alternatively set DESKD_API_TOKEN")
+        help="owner-only bearer-token file (required unless --no-auth)")
     auth_group.add_argument(
         "--no-auth", action="store_true",
-        help="do not use DESKD_API_TOKEN (read-only/open development servers)")
+        help="explicit unauthenticated mode (read-only/open development servers)")
     p_tui.add_argument(
         "--role",
         help="default target for unprefixed composer text; never claims identity")

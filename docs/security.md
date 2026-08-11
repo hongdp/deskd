@@ -14,6 +14,44 @@ same OS user is *not* isolated from the engine. It defends against:
 It does **not** claim to defend a `simple`-mode desk against malicious code
 running as the same user (see below).
 
+The optional isolated deployment strengthens that assumption: role runners are
+separate containers with private provider homes and credentials, no coordination
+database mount, no Docker socket, a read-only root filesystem and a narrowly
+scoped source mount. The control process is still a high-value component and
+the design is intentionally single-host; a compromised kernel, container
+runtime or control process is outside this boundary.
+
+## Role and service identity
+
+The control API's bearer identity is separate from supervisor authentication.
+A role token maps to one configured role and receives only that role's private
+projection. A service token has explicit `read`, `directive`, `orchestrator` or
+`scheduler` scopes but no role, so it cannot attend, speak, vote or own a
+provider session. Neither token form inherits supervisor authority.
+
+Raw tokens are loaded from regular non-symlink secret files with private modes,
+hashed in memory and never stored in SQLite. Put operator/TUI tokens in a
+mode-0600 file or an OS secret store; do not place them in shell history, URLs
+or Compose environment metadata. Bind the full supervisor console to loopback
+unless its read projections are protected by an external trusted boundary.
+
+Every command is idempotent under `(principal, request_id, request body)`.
+Changing the body under an existing id is rejected. In-database commands commit
+their receipt, mutation and event together. External commands use a durable
+execution lease; if the system cannot prove whether a non-recoverable operation
+ran, it reports `indeterminate` instead of replaying it.
+
+## Workspace broker
+
+An isolated agent never receives the shared repository's writable `.git`
+metadata. The broker allocates one allowlisted worktree/branch per role and
+task, validates the exact base SHA and version provenance, bounds output and
+tree size, rejects nested `.git` entries and special files, disables hooks,
+filters, text conversion, signing, credentials and network protocols, and owns
+commit identity. Its public vocabulary deliberately omits fetch, push, merge,
+checkout and reset. Container mounts must keep the lease parent and broker lock
+outside the role's writable namespace.
+
 ## The supervisor boundary
 
 The supervisor is a human, not a role. Agent-facing APIs reject it. Supervisor

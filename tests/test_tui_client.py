@@ -17,6 +17,7 @@ from deskd.tui.client import (APIError, ClientError, ConnectionNotice,
 
 CURSOR_1 = "evt_0123456789abcdef_0000000000000001"
 CURSOR_2 = "evt_0123456789abcdef_0000000000000002"
+TOKEN = "s" * 32
 
 
 class FakeResponse:
@@ -101,26 +102,34 @@ def test_token_file_must_be_private_regular_file(tmp_path: Path):
     token_file = tmp_path / "token"
     token_file.write_text(" secret \n")
     token_file.chmod(0o600)
-    assert load_api_token(token_file, environ={}) == "secret"
+    token_file.write_text("s" * 32 + "\n")
+    assert load_api_token(token_file) == "s" * 32
 
     token_file.chmod(0o640)
     with pytest.raises(ClientError, match="chmod 600"):
-        load_api_token(token_file, environ={})
+        load_api_token(token_file)
+
+    token_file.chmod(0o600)
+    link = tmp_path / "token-link"
+    link.symlink_to(token_file)
+    with pytest.raises(ClientError, match="non-symlink"):
+        load_api_token(link)
 
 
-def test_no_auth_ignores_environment_token():
-    assert load_api_token(None, environ={"DESKD_API_TOKEN": "secret"}, no_auth=True) is None
-    with pytest.raises(ClientError, match="whitespace"):
-        load_api_token(None, environ={"DESKD_API_TOKEN": "bad token"})
+def test_auth_choice_is_explicit_and_environment_tokens_are_unsupported(monkeypatch):
+    monkeypatch.setenv("DESKD_API_TOKEN", "x" * 32)
+    assert load_api_token(None, no_auth=True) is None
+    with pytest.raises(ClientError, match="--token-file"):
+        load_api_token(None)
 
 
 def test_remote_http_refuses_to_leak_bearer_token():
     with pytest.raises(ClientError, match="remote HTTP"):
-        ControlPlaneClient("http://deskd.internal:8000", token="secret")
+        ControlPlaneClient("http://deskd.internal:8000", token=TOKEN)
     # Loopback and an explicit trusted-network override remain available.
-    ControlPlaneClient("http://127.0.0.1:8000", token="secret")
-    ControlPlaneClient("http://127.0.0.2:8000", token="secret")
-    ControlPlaneClient("http://deskd.internal:8000", token="secret",
+    ControlPlaneClient("http://127.0.0.1:8000", token=TOKEN)
+    ControlPlaneClient("http://127.0.0.2:8000", token=TOKEN)
+    ControlPlaneClient("http://deskd.internal:8000", token=TOKEN,
                        allow_insecure_http=True)
 
 
@@ -199,7 +208,7 @@ def test_authenticated_control_rejection_never_downgrades_to_legacy(status):
         ("GET", "/api/snapshot"): http_error(status, "invalid bearer token"),
     })
     client = ControlPlaneClient(
-        "https://deskd.example", token="present", transport=transport)
+        "https://deskd.example", token=TOKEN, transport=transport)
     with pytest.raises(APIError) as caught:
         client.fetch_snapshot()
     assert caught.value.status == status
@@ -211,7 +220,7 @@ def test_command_has_idempotency_but_never_client_claimed_actor():
         ("POST", "/api/commands"): response(
             {"request_id": "req-1", "accepted": True, "event_cursor": "evt_2"}),
     })
-    client = ControlPlaneClient("https://deskd.example", token="secret",
+    client = ControlPlaneClient("https://deskd.example", token=TOKEN,
                                 transport=transport)
     answer = client.submit_command(
         "directive.send", {"target_role": "engineer", "body": "work"},
@@ -222,7 +231,7 @@ def test_command_has_idempotency_but_never_client_claimed_actor():
     assert set(body) == {"request_id", "verb", "params"}
     assert "actor" not in body and "role" not in body
     assert request.get_header("Idempotency-key") == "req-1"
-    assert request.get_header("Authorization") == "Bearer secret"
+    assert request.get_header("Authorization") == f"Bearer {TOKEN}"
 
 
 def test_http_errors_are_bounded_and_cursor_conflict_is_typed():
