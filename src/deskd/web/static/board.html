@@ -183,7 +183,17 @@ function queueSummaryHtml(a) {
       hk = (a.hooks && a.hooks.length) || 0;
   var next = hk ? a.hooks.map(function (h) { return h.next_fire_at; }).filter(Boolean).sort()[0] : null;
   var nx = next && (new Date(next) - Date.now() > 0) ? " · next in " + ago((new Date(next) - Date.now()) / 1000) : "";
-  return '<div class="qsum"><span><b>Queue</b></span><span>inbox <b>' + ib + "</b></span><span>open tasks <b>" + pend
+  // When a queued inbox wakes somebody. Without it a batching seat and a stuck
+  // one are the same picture: "idle" beside a non-empty inbox, for minutes.
+  // The instant comes from the engine (inbox.wake_due_at), which is the same
+  // call the wake planner decides on — a countdown computed here from a window
+  // this page happened to know would drift from the thing it counts down to.
+  var due = a.inbox && a.inbox.wake_due_at, wk = "";
+  if (ib && due) {
+    var left = (new Date(due) - Date.now()) / 1000;
+    wk = left > 0 ? " · waking in " + ago(left) : " · wake due";
+  }
+  return '<div class="qsum"><span><b>Queue</b></span><span>inbox <b>' + ib + "</b>" + wk + "</span><span>open tasks <b>" + pend
     + "</b></span><span>next steps <b>" + t.pending.length + "</b></span><span>hooks <b>" + hk + "</b>" + nx + "</span></div>";
 }
 function workBreakdownHtml(a) {
