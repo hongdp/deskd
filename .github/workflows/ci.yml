@@ -11,7 +11,18 @@ name: tests
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+# Without the branch filter above, a push to a PR branch triggers this
+# twice -- once as `push`, once as `pull_request` -- and the two are not
+# even the same test: `push` builds the branch tip, `pull_request` builds
+# it merged into main. The merge result is the one worth gating on, so
+# branches are covered by the PR event and `push` is left to keep main
+# (and the README badge) honest.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
