@@ -6,7 +6,7 @@ import pytest
 
 textual = pytest.importorskip("textual", reason="tui extra not installed")
 
-from textual.widgets import DataTable, Input  # noqa: E402
+from textual.widgets import DataTable, Input, Label  # noqa: E402
 
 from deskd.tui.app import DeskTUI  # noqa: E402
 from deskd.tui.app import _literal_text  # noqa: E402
@@ -160,3 +160,38 @@ def test_untrusted_rich_markup_is_literal_and_controls_are_removed():
     rendered = _literal_text("[bold red]fake outage[/]\x1b[2J\u202elive")
     assert rendered.plain == "[bold red]fake outage[/][2Jlive"
     assert rendered.spans == []
+
+
+def test_connection_tick_survives_an_unmounted_label():
+    # The one-second interval outlives the widget it writes to: it can fire
+    # before compose has mounted the label and after unmount has removed it.
+    # An exception in a timer tick is not contained -- it propagates out of
+    # run_test and, in real use, kills the app on the way out. So the tick has
+    # to tolerate an empty DOM rather than assume its label is there.
+    async def scenario():
+        app = DeskTUI(FakeClient(), stale_after=20, refresh_seconds=30)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(0.3)
+            # The exact state CI hit: the screen is alive, the label is not.
+            await app.query_one("#connection", Label).remove()
+            app._update_connection()
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_render_survives_widgets_removed_under_it():
+    # The refresh worker reaches the same window from the other side: it is
+    # still in flight when teardown removes the widgets, and _render then
+    # queries a screen that no longer holds them. A worker exception is not
+    # contained either -- it surfaces out of the app, which is how CI failed.
+    # Removing the widget up front pins this without depending on shutdown
+    # timing, which only turns hostile on a loaded machine.
+    async def scenario():
+        app = DeskTUI(FakeClient(), stale_after=20, refresh_seconds=30)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(0.3)
+            await app.query_one("#composer-help", Label).remove()
+            app.action_refresh()
+            await pilot.pause(0.3)
+
+    asyncio.run(scenario())

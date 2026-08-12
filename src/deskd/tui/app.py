@@ -15,6 +15,7 @@ from typing import Any
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static
 from textual.widgets import TabbedContent, TabPane
 
@@ -171,7 +172,16 @@ class DeskTUI(App[None]):
             self.snapshot = snapshot
             self.cursor = snapshot.cursor if snapshot.consistent else None
             self._last_contact = time.monotonic()
-            self._render(snapshot)
+            try:
+                self._render(snapshot)
+            except NoMatches:
+                # Same window as the connection tick, entered from the other
+                # side: this runs in a worker, so teardown can remove the
+                # widgets while a snapshot is still in flight, and there is
+                # nothing left to draw on. A genuinely wrong widget id does not
+                # hide here -- every id _render touches is asserted by the
+                # mount tests, which fail loudly instead.
+                return
             if (snapshot.consistent and snapshot.cursor
                     and (self._stream_thread is None
                          or not self._stream_thread.is_alive())):
@@ -283,7 +293,14 @@ class DeskTUI(App[None]):
         self._update_connection()
 
     def _update_connection(self) -> None:
-        label = self.query_one("#connection", Label)
+        # This runs on a one-second interval, so it can fire in the two windows
+        # where the label is not in the DOM: before compose finishes, and after
+        # unmount begins. query_one raises there, and an exception inside a
+        # timer tick takes the whole app down -- on exit, in ordinary use.
+        try:
+            label = self.query_one("#connection", Label)
+        except NoMatches:
+            return
         elapsed = time.monotonic() - self._last_contact if self._last_contact else float("inf")
         version = self.snapshot.server_version if self.snapshot else None
         suffix = f"  server {version}" if version else ""
