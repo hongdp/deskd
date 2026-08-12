@@ -172,7 +172,16 @@ class DeskTUI(App[None]):
             self.snapshot = snapshot
             self.cursor = snapshot.cursor if snapshot.consistent else None
             self._last_contact = time.monotonic()
-            self._render(snapshot)
+            try:
+                self._render(snapshot)
+            except NoMatches:
+                # Same window as the connection tick, entered from the other
+                # side: this runs in a worker, so teardown can remove the
+                # widgets while a snapshot is still in flight, and there is
+                # nothing left to draw on. A genuinely wrong widget id does not
+                # hide here -- every id _render touches is asserted by the
+                # mount tests, which fail loudly instead.
+                return
             if (snapshot.consistent and snapshot.cursor
                     and (self._stream_thread is None
                          or not self._stream_thread.is_alive())):

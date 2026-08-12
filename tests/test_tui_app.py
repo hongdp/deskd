@@ -171,9 +171,27 @@ def test_connection_tick_survives_an_unmounted_label():
     async def scenario():
         app = DeskTUI(FakeClient(), stale_after=20, refresh_seconds=30)
         async with app.run_test(size=(150, 45)) as pilot:
-            await pilot.pause(0.1)
+            await pilot.pause(0.3)
             # The exact state CI hit: the screen is alive, the label is not.
             await app.query_one("#connection", Label).remove()
             app._update_connection()
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_render_survives_widgets_removed_under_it():
+    # The refresh worker reaches the same window from the other side: it is
+    # still in flight when teardown removes the widgets, and _render then
+    # queries a screen that no longer holds them. A worker exception is not
+    # contained either -- it surfaces out of the app, which is how CI failed.
+    # Removing the widget up front pins this without depending on shutdown
+    # timing, which only turns hostile on a loaded machine.
+    async def scenario():
+        app = DeskTUI(FakeClient(), stale_after=20, refresh_seconds=30)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(0.3)
+            await app.query_one("#composer-help", Label).remove()
+            app.action_refresh()
+            await pilot.pause(0.3)
 
     asyncio.run(scenario())
