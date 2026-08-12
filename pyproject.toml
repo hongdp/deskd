@@ -47,7 +47,7 @@ dynamic = ["version"]
 # escalations, tasks & hooks — plus the supervisor adapter).
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
 tui = ["textual>=1.0,<8"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pytest-xdist>=3"]
 
 [project.urls]
 Homepage = "https://github.com/hongdp/deskd"
@@ -85,3 +85,12 @@ include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 697 tests across 8 processes: 175s -> 44s on a 24-core host. Measured, and
+# 8 rather than `auto` for the same reason the host project pins it -- past the
+# knee the worker startup costs more than it saves.
+#
+# It does not go lower than ~44s by adding workers: one test
+# (test_support_desk_scenario_beats) takes 29.6s on its own, because it walks
+# the demo's real wake ladder at a 4x scale factor. That is time it is supposed
+# to spend; parallelism can only overlap it with everything else.
+addopts = "-n 8"
