@@ -15,6 +15,7 @@ from typing import Any
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static
 from textual.widgets import TabbedContent, TabPane
 
@@ -283,7 +284,14 @@ class DeskTUI(App[None]):
         self._update_connection()
 
     def _update_connection(self) -> None:
-        label = self.query_one("#connection", Label)
+        # This runs on a one-second interval, so it can fire in the two windows
+        # where the label is not in the DOM: before compose finishes, and after
+        # unmount begins. query_one raises there, and an exception inside a
+        # timer tick takes the whole app down -- on exit, in ordinary use.
+        try:
+            label = self.query_one("#connection", Label)
+        except NoMatches:
+            return
         elapsed = time.monotonic() - self._last_contact if self._last_contact else float("inf")
         version = self.snapshot.server_version if self.snapshot else None
         suffix = f"  server {version}" if version else ""
