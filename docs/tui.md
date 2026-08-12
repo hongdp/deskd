@@ -9,6 +9,54 @@ It is a **client**, not another engine process. It never opens the desk's SQLite
 file, mounts an agent's private state, starts a provider, or interprets a role
 name as authority. Those boundaries stay in the control plane.
 
+## Who it is for (ruling 2026-08-12)
+
+**The TUI is the human's operating panel. Agents use the CLI.**
+
+That is the intent this document already opens with — "the remote companion to
+the supervisor Web console" — and the split the host constitution assumes: the
+human enters through an authenticated control client, Web *or* TUI, and never
+as an agent.
+
+The implementation does not reach it yet, and the gap points the wrong way:
+
+| principal | scopes it can hold | meetings, tasks, review |
+|---|---|---|
+| role token (one agent) | `agent` | yes — it *is* that agent |
+| service token (operator, orchestrator, scheduler, launcher) | `read`, `directive`, `operator`, … | no: `principal lacks required scope: agent` |
+| **the supervisor** | **none — the control plane has no such principal** | — |
+
+Every control-plane command verb defaults to scope `agent` and none declares
+another. `control/auth.py` states the disjointness deliberately: neither token
+form may mint, inherit or invoke supervisor authority, a role token may not
+name the supervisor, and a service token may carry neither a role nor a
+supervisor scope. The supervisor's own actions
+(`/api/meetings/supervisor-action`, `/api/meetings/supervisor-apply`) exist
+only on the Web console's access-code path.
+
+So a human at the TUI can act only by holding some *agent's* token — the one
+thing the constitution forbids. The refusal an operator token receives is not
+the boundary working; it is the absence of the principal the boundary was
+drawn for.
+
+### What closing it must preserve
+
+A supervisor principal for the control plane, not a widening of the existing
+ones. Both halves of the wall stay standing:
+
+- an agent must not mint, inherit, or simulate supervisor authority;
+- the supervisor must not acquire an agent seat — no role token, no `agent`
+  scope, no speaking *as* analyst or trader.
+
+So supervisor-scoped verbs are the human's own actions (convene, rule,
+force-close, apply an approved change, speak as the supervisor), and the agent
+verbs stay where they are, reached by role tokens from agent CLIs. A supervisor
+able to call `meeting.send` as another role would erase the same line from the
+other side.
+
+This section records a ruling and a gap. It does not describe shipped
+behaviour: as of deskd 0.4.2 the supervisor principal does not exist.
+
 ## Install and connect
 
 ```bash
