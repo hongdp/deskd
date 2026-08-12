@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install -e ".[web,tui]" pytest httpx httpx2
+      - run: python -m pip install -e ".[web,tui]" pytest pytest-xdist httpx httpx2
       - run: python -m pytest -q
 
   container:

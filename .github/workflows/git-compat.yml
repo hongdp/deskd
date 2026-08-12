@@ -33,7 +33,7 @@ jobs:
             NO_TCLTK=YesPlease NO_GETTEXT=YesPlease NO_PERL=YesPlease \
             NO_CURL=YesPlease install
           echo '/tmp/git-2.54/bin' >> "$GITHUB_PATH"
-      - run: python -m pip install -e ".[web]" pytest httpx httpx2
+      - run: python -m pip install -e ".[web]" pytest pytest-xdist httpx httpx2
       - name: Verify broker against Git 2.54
         run: |
           test "$(git --version)" = 'git version 2.54.0'
