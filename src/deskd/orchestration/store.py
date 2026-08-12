@@ -482,6 +482,28 @@ _WAKE_HOOKS_DDL = """
 """
 
 
+def _add_column(conn: sqlite3.Connection, statement: str) -> None:
+    """ADD COLUMN that tolerates having lost a race to another process.
+
+    Every caller here guards with a PRAGMA table_info check first, and that
+    guard is not atomic: two processes opening a FRESH database can both read
+    "column absent" and both run the ALTER, and the loser dies with
+    `duplicate column name`. Nothing about that is hypothetical -- it is how a
+    CI matrix failed once the suite began running across eight workers, and
+    the same window is open in production, where control, launcher, scheduler
+    and orchestrator all connect at once on a first deployment.
+
+    Swallowing exactly this one error is safe because the outcome the caller
+    wanted has happened: the column exists. Any other OperationalError still
+    raises.
+    """
+    try:
+        conn.execute(statement)
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing DB up to the current schema. Idempotent."""
     # agent_inbox_reads first shipped keyed on a timestamp and settled on an id
@@ -496,27 +518,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # this role had already seen", and the old row cannot say. 0 is the
         # honest value — it claims nothing was seen, so the worst case is one
         # extra wake, never a notice acked that nobody read.
-        conn.execute(
-            "ALTER TABLE agent_inbox_reads ADD COLUMN last_id INTEGER NOT NULL "
+        _add_column(conn, "ALTER TABLE agent_inbox_reads ADD COLUMN last_id INTEGER NOT NULL "
             "DEFAULT 0")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_sessions)")}
     if "session_day" not in cols:
-        conn.execute("ALTER TABLE agent_sessions ADD COLUMN session_day TEXT")
+        _add_column(conn, "ALTER TABLE agent_sessions ADD COLUMN session_day TEXT")
     if "phase" not in cols:
-        conn.execute("ALTER TABLE agent_sessions ADD COLUMN phase TEXT")
+        _add_column(conn, "ALTER TABLE agent_sessions ADD COLUMN phase TEXT")
     if "last_tool" not in cols:
         # Live tool trace (2026-08-09): the board's answer to "what is it
         # doing RIGHT NOW" between the coarse, agent-authored activity lines.
-        conn.execute("ALTER TABLE agent_sessions ADD COLUMN last_tool TEXT")
-        conn.execute("ALTER TABLE agent_sessions ADD COLUMN last_tool_at TEXT")
+        _add_column(conn, "ALTER TABLE agent_sessions ADD COLUMN last_tool TEXT")
+        _add_column(conn, "ALTER TABLE agent_sessions ADD COLUMN last_tool_at TEXT")
     if "source_generation" not in {r["name"] for r in conn.execute(
             "PRAGMA table_info(wake_attempts)")}:
         # A durable demand key may be reused after its previous request was
         # acknowledged (meeting resume is the canonical case). Without the
         # request generation, a still-pending old attempt is mistaken for the
         # new work and its ladder position/SLA are inherited.
-        conn.execute(
-            "ALTER TABLE wake_attempts ADD COLUMN source_generation TEXT")
+        _add_column(conn, "ALTER TABLE wake_attempts ADD COLUMN source_generation TEXT")
     if "resolved_at" not in {r["name"] for r in conn.execute(
             "PRAGMA table_info(wake_escalations)")}:
         # A page that reached a person could not be taken back. `status` only
@@ -526,9 +546,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # the only retraction available to the human was to go and query the
         # database. Kept as separate columns rather than a new `status` value
         # precisely because they are different questions.
-        conn.execute("ALTER TABLE wake_escalations ADD COLUMN resolved_at TEXT")
-        conn.execute(
-            "ALTER TABLE wake_escalations ADD COLUMN resolved_reason TEXT")
+        _add_column(conn, "ALTER TABLE wake_escalations ADD COLUMN resolved_at TEXT")
+        _add_column(conn, "ALTER TABLE wake_escalations ADD COLUMN resolved_reason TEXT")
     # NOTE: only agent_* tables belong here. A migration for a lower layer's
     # table must live in that layer — `meetings.closed_at` was briefly added
     # here, which made it unreachable for a host that uses meetings without
@@ -555,7 +574,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # fails on a column-count mismatch.
     if "blocked_on" not in {r["name"] for r in
                             conn.execute("PRAGMA table_info(agent_tasks)")}:
-        conn.execute("ALTER TABLE agent_tasks ADD COLUMN blocked_on TEXT")
+        _add_column(conn, "ALTER TABLE agent_tasks ADD COLUMN blocked_on TEXT")
     # Legacy DBs (including one adopted from a host that predates deskd) may
     # still enumerate roles/sources/kinds in CHECK constraints. Drop them so the
     # host's own vocabulary works; Python validates instead.

@@ -700,3 +700,78 @@ def test_a_wake_hook_body_keeps_its_paragraphs(desk):
         assert c.execute(
             "SELECT body FROM wake_hooks WHERE owner_role='alpha'"
         ).fetchone()["body"] == PROSE_STORED
+
+
+def test_concurrent_first_connections_do_not_race_the_migration(tmp_path):
+    """Two processes opening a FRESH database at the same moment.
+
+    The PRAGMA guards in _migrate are not atomic: both can read "column
+    absent" and both run the ALTER, and the loser dies with `duplicate column
+    name`. This is the CI matrix failure that appeared once the suite began
+    running across eight workers, and the same window is open on a first
+    deployment, where control, launcher, scheduler and orchestrator all
+    connect at once.
+
+    Threads rather than processes because the race is between two sqlite
+    connections, not two interpreters; a barrier lines them up on the ALTER.
+    """
+    import threading
+
+    # Rounds, each on its own fresh database: the window is narrow, and a
+    # single round reproduced the unfixed bug only about a third of the time.
+    # A test for a race that usually passes anyway is not a regression guard.
+    errors: list[BaseException] = []
+    for attempt in range(6):
+        db = tmp_path / f"race-{attempt}.db"
+        ready = threading.Barrier(8)
+
+        def open_it() -> None:
+            try:
+                ready.wait(timeout=10)
+                with orch.connect(db) as conn:
+                    conn.execute("SELECT 1").fetchone()
+            except BaseException as exc:   # noqa: BLE001 - recorded below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=open_it) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+    # Assert on the failure this guards, not on "nothing went wrong at all".
+    # Eight connections racing to create a fresh database also surface plain
+    # lock contention ("database is locked"), which is a real and SEPARATE
+    # question about the engine's first-connect behaviour -- folding it in here
+    # would make this guard flaky and would let a genuine migration regression
+    # hide inside an unrelated flake.
+    duplicates = [e for e in errors if "duplicate column" in str(e).lower()]
+    assert not duplicates, f"migration raced itself: {duplicates[:2]}"
+
+
+def test_add_column_swallows_only_the_lost_race(tmp_path):
+    """The deterministic half of the guard above.
+
+    A race reproduces about one run in eight, so the concurrency test alone
+    would let a regression back in seven times out of eight. This states the
+    contract directly: the column already existing is the one error that means
+    the caller's intent was satisfied by somebody else, and nothing else may be
+    swallowed with it.
+    """
+    import sqlite3
+
+    from deskd.orchestration.store import _add_column
+
+    conn = sqlite3.connect(tmp_path / "cols.db")
+    conn.execute("CREATE TABLE t (a TEXT)")
+
+    _add_column(conn, "ALTER TABLE t ADD COLUMN b TEXT")
+    assert "b" in {r[1] for r in conn.execute("PRAGMA table_info(t)")}
+
+    # The lost race: the column is already there. This must be a no-op.
+    _add_column(conn, "ALTER TABLE t ADD COLUMN b TEXT")
+
+    # Anything else still raises -- a typo'd migration must not pass silently.
+    with pytest.raises(sqlite3.OperationalError):
+        _add_column(conn, "ALTER TABLE missing_table ADD COLUMN c TEXT")
+    conn.close()
