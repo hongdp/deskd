@@ -196,6 +196,49 @@ def runtime_rows(snapshot: DeskSnapshot) -> list[tuple[str, ...]]:
     return rows
 
 
+#: Desk health as tiles rather than one run-on sentence. The third element is
+#: the tone a view should use once the value is non-zero: some of these are
+#: simply facts (open tasks, inbox) and some are always bad news (overdue,
+#: stalled, unroutable). Rendering them all at one weight, as the single line
+#: below does, hides that difference completely.
+HEALTH_TILES: tuple[tuple[str, str, str], ...] = (
+    ("open", "total_open_tasks", "neutral"),
+    ("overdue", "total_overdue", "bad"),
+    ("stalled", "stalled_tasks", "bad"),
+    ("inbox", "inbox_total", "neutral"),
+    ("wakes", "pending_wakes", "neutral"),
+    ("rung", "wakes_at_human_level", "warn"),
+    ("unroutable", "unroutable_demands", "bad"),
+)
+
+
+def health_metrics(snapshot: DeskSnapshot) -> list[tuple[str, int, str]]:
+    """(label, value, tone) per tile; tone falls back to neutral at zero."""
+
+    health = snapshot.board.get("health") or {}
+    metrics: list[tuple[str, int, str]] = []
+    for label, key, tone in HEALTH_TILES:
+        raw = health.get(key, 0)
+        value = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+        metrics.append((label, value, tone if value else "neutral"))
+    return metrics
+
+
+def health_alerts(snapshot: DeskSnapshot) -> list[str]:
+    """Conditions that deserve a banner rather than a counter."""
+
+    alerts: list[str] = []
+    health = snapshot.board.get("health") or {}
+    if health.get("human_rung_unwired"):
+        alerts.append("human rung unwired")
+    quarantine = snapshot.wake.get("quarantine") or []
+    if isinstance(quarantine, list) and quarantine:
+        alerts.append(f"{len(quarantine)} wake(s) quarantined")
+    if not snapshot.consistent:
+        alerts.append("compatibility snapshot — not atomic")
+    return alerts
+
+
 def health_text(snapshot: DeskSnapshot) -> str:
     health = snapshot.board.get("health") or {}
     keys = (
