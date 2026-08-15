@@ -6,9 +6,9 @@ import pytest
 
 textual = pytest.importorskip("textual", reason="tui extra not installed")
 
-from textual.widgets import DataTable, Input, Label  # noqa: E402
+from textual.widgets import DataTable, Input, Label, TabbedContent  # noqa: E402
 
-from deskd.tui.app import DeskTUI  # noqa: E402
+from deskd.tui.app import DeskTUI, DetailScreen  # noqa: E402
 from deskd.tui.app import _literal_text  # noqa: E402
 from deskd.tui.client import ConnectionNotice, DeskSnapshot, SSEEvent  # noqa: E402
 
@@ -193,5 +193,77 @@ def test_snapshot_render_survives_widgets_removed_under_it():
             await app.query_one("#composer-help", Label).remove()
             app.action_refresh()
             await pilot.pause(0.3)
+
+    asyncio.run(scenario())
+
+
+def test_number_keys_jump_straight_to_a_view():
+    # Seven views reachable only by walking the tab strip is the whole
+    # interaction budget spent on getting to the row.
+    async def scenario():
+        app = DeskTUI(FakeClient(), stale_after=20, refresh_seconds=30)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(0.3)
+            await pilot.press("3")
+            await pilot.pause(0.1)
+            assert app.query_one(TabbedContent).active == "inbox-tab"
+            await pilot.press("1")
+            await pilot.pause(0.1)
+            assert app.query_one(TabbedContent).active == "overview"
+
+    asyncio.run(scenario())
+
+
+def test_filter_narrows_the_active_table_and_clears_back():
+    async def scenario():
+        app = DeskTUI(FakeClient(), stale_after=20, refresh_seconds=30)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(0.3)
+            table = app.query_one("#agents", DataTable)
+            assert table.row_count == 1
+            app.query_one("#filter", Input).value = "no-such-role"
+            await pilot.pause(0.2)
+            assert table.row_count == 0
+            app.query_one("#filter", Input).value = ""
+            await pilot.pause(0.2)
+            assert table.row_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_open_row_shows_the_columns_the_table_cannot_fit():
+    # The agents table carries ten columns and shows six; the rest are not
+    # dropped, they open with the row.
+    async def scenario():
+        app = DeskTUI(FakeClient(), stale_after=20, refresh_seconds=30)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(0.3)
+            assert len(app.query_one("#agents", DataTable).columns) == 6
+            await pilot.press("o")
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, DetailScreen)
+            names = [name for name, _ in app.screen._fields]
+            assert "Heartbeat" in names and "Version" in names
+            assert len(names) == 10
+
+    asyncio.run(scenario())
+
+
+def test_enter_still_loads_the_agent_feed():
+    # `o` was given its own key precisely because Enter already means
+    # something here. A second method of the same name would have replaced
+    # this silently -- Python accepts the redefinition without a word.
+    async def scenario():
+        client = FakeClient()
+        loaded: list[str] = []
+        client.fetch_agent_feed = lambda key: (  # type: ignore[attr-defined]
+            loaded.append(key) or {"lines": []})
+        app = DeskTUI(client, stale_after=20, refresh_seconds=30)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(0.3)
+            app.query_one("#agents", DataTable).focus()
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            assert loaded == ["engineer"]
 
     asyncio.run(scenario())

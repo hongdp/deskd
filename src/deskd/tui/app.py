@@ -16,6 +16,10 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
+from textual.binding import Binding
+from textual.containers import Vertical as _Vertical  # noqa: F401
+from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static
 from textual.widgets import TabbedContent, TabPane
 
@@ -23,7 +27,7 @@ from .client import (ClientError, ConnectionNotice, ControlPlaneClient,
                      DeskSnapshot, SSEEvent)
 from .commands import (CommandRequest, LocalAction, capabilities_from_meta,
                        command_help, command_hint, parse_command)
-from .model import (agent_rows, health_text, hook_rows, inbox_rows, meeting_rows,
+from .model import (HEALTH_TILES, agent_rows, health_alerts, health_metrics, health_text, hook_rows, inbox_rows, meeting_rows,
                     runtime_rows, safe_text, task_rows, transcript_lines, wake_rows)
 
 
@@ -46,10 +50,106 @@ _TABLES: dict[str, tuple[tuple[str, ...], Callable[[DeskSnapshot], list[tuple[st
 }
 
 
+#: The default palette leans orange, which put a brown wash under the row
+#: cursor and left every state word the same colour as ordinary text. This one
+#: keeps a single cool accent for "where you are" and reserves green/amber/red
+#: for what a state actually means.
+DESK_THEME = Theme(
+    name="deskd",
+    primary="#4c8bf5",
+    secondary="#7aa2f7",
+    accent="#4c8bf5",
+    foreground="#c9d1d9",
+    background="#0d1117",
+    surface="#161b22",
+    panel="#1c2128",
+    success="#3fb950",
+    warning="#d29922",
+    error="#f85149",
+    dark=True,
+    variables={
+        "text-muted": "#8b949e",
+        "scrollbar": "#30363d",
+        "scrollbar-hover": "#484f58",
+        "scrollbar-active": "#58a6ff",
+        "scrollbar-background": "#161b22",
+        "scrollbar-background-hover": "#161b22",
+        "scrollbar-background-active": "#161b22",
+    },
+)
+
+#: Words whose meaning should be visible before the word is read. Keyed by
+#: table id and column index so only the state-bearing columns are painted --
+#: colouring a title or an activity string would be noise, not signal.
+_CELL_TONES: dict[tuple[str, int], dict[str, str]] = {
+    ("agents", 1): {"working": "bold #4c8bf5", "booting": "bold #d29922",
+                    "idle_standby": "#8b949e", "ended": "#8b949e"},
+    ("agents", 2): {"online": "#3fb950", "offline": "bold #f85149",
+                    "stale": "#d29922"},
+    ("tasks", 2): {"blocked": "bold #f85149", "stalled": "bold #f85149",
+                   "open": "#c9d1d9", "done": "#8b949e"},
+    ("tasks", 3): {"high": "bold #d29922", "urgent": "bold #f85149"},
+    ("inbox", 2): {"urgent": "bold #f85149", "high": "bold #d29922"},
+    ("meetings", 1): {"open": "bold #3fb950", "closed": "#8b949e"},
+    ("wake", 4): {"failed": "bold #f85149", "quarantined": "bold #f85149",
+                  "delivered": "#3fb950"},
+    ("hooks", 2): {"error": "bold #f85149", "active": "#3fb950"},
+}
+
+
+def _tone_for(table_id: str, column: int, value: str) -> str | None:
+    return _CELL_TONES.get((table_id, column), {}).get(value.strip().lower())
+
+
+#: Columns a table shows at 150 characters. The agents table carried ten and
+#: was cut off mid-header while the pane beside it sat empty; the rest are not
+#: lost, they open with the row. Absent here means "show every column".
+_VISIBLE_COLUMNS: dict[str, tuple[int, ...]] = {
+    "agents": (0, 1, 2, 3, 4, 5),
+    "tasks": (0, 1, 2, 3, 4, 5, 7),
+    "hooks": (0, 1, 2, 3, 5, 6),
+}
+
+
+#: Tab ids in strip order, so a number key and the strip cannot disagree.
+_TAB_ORDER = ("overview", "tasks-tab", "inbox-tab", "meetings-tab",
+              "wake-tab", "runtime-tab", "activity-tab")
+
+#: Which table a view filters and opens details for, keyed by tab id.
+_TAB_TABLES = {"overview": "agents", "tasks-tab": "tasks",
+               "inbox-tab": "inbox", "meetings-tab": "meetings",
+               "wake-tab": "wake", "runtime-tab": "runtime"}
+
+
 def _literal_text(value: object, *, style: str | None = None) -> Text:
     """Render untrusted remote text literally, never as Rich markup/ANSI."""
 
     return Text(safe_text(value, multiline=True), style=style)
+
+
+class DetailScreen(ModalScreen[None]):
+    """One row, in full, instead of squeezed into a truncated column.
+
+    The tables carry more than fits: a 150-column terminal cut the agents
+    table off mid-header while the pane beside it sat empty. Rather than
+    fight for width, a row opens here with every column on its own line.
+    """
+
+    BINDINGS = [Binding("escape", "dismiss", "Close"),
+                Binding("q", "dismiss", "Close", show=False)]
+
+    def __init__(self, title: str, fields: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self._title = title
+        self._fields = fields
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="detail-card"):
+            yield Label(_literal_text(self._title), id="detail-title")
+            for name, value in self._fields:
+                yield Label(Text.assemble(
+                    (f"{name}  ", "dim"), _literal_text(value)))
+            yield Label("esc to close", id="detail-hint")
 
 
 class DeskTUI(App[None]):
@@ -58,25 +158,88 @@ class DeskTUI(App[None]):
     TITLE = "deskd"
     SUB_TITLE = "realtime multi-agent control"
     CSS = """
-    Screen { layout: vertical; }
-    #connection { height: 1; padding: 0 1; background: $panel; }
-    #health { height: 2; padding: 0 1; }
+    Screen { layout: vertical; background: $background; }
+
+    /* Status strip: state first, as a pill, then the facts that qualify it.
+       The old line put LIVE, a URL, a cursor and a version at one weight,
+       so the one word that changes meaning read like the rest. */
+    #statusbar { height: 1; padding: 0 1; background: $panel; }
+    #connection { width: auto; padding: 0 1; text-style: bold; }
+    #connection.-live { background: $success; color: $panel; }
+    #connection.-stale { background: $warning; color: $panel; }
+    #connection.-error { background: $error; color: $panel; }
+    #connection.-starting { background: $surface; color: $text-muted; }
+    #connection-detail { width: 1fr; padding: 0 1; color: $text-muted; }
+
+    /* Health as tiles. A number the eye can land on, a label beneath it,
+       and colour only where a non-zero value is bad news. */
+    #tiles { height: 4; padding: 0 1; }
+    .tile {
+      width: 1fr; height: 4; margin: 0 1 0 0; padding: 0 1;
+      border: round $surface-lighten-1; color: $text-muted;
+      content-align: center middle; text-align: center;
+    }
+    .tile.-warn { border: round $warning; color: $warning; }
+    .tile.-bad { border: round $error; color: $error; }
+    #alerts { height: auto; max-height: 2; padding: 0 2; color: $warning; }
+    #alerts.-empty { display: none; }
+
     TabbedContent { height: 1fr; }
-    TabPane { padding: 0 1; }
-    DataTable { height: 1fr; border: round $primary-darken-2; }
+    Tabs { background: $panel; }
+    TabPane { padding: 1 1 0 1; }
+
+    DataTable {
+      height: 1fr; border: round $surface-lighten-1; background: $surface;
+      scrollbar-size: 1 1;
+    }
+    DataTable:focus { border: round $accent; }
+    DataTable > .datatable--header {
+      background: $surface; color: $text-muted; text-style: bold;
+    }
+    DataTable > .datatable--cursor { background: $primary 30%; }
+
     .split { height: 1fr; }
     .split DataTable { width: 2fr; }
-    .split RichLog { width: 1fr; border: round $primary-darken-2; padding: 0 1; }
+    .split .side {
+      width: 1fr; height: 1fr; margin: 0 0 0 1;
+      border: round $surface-lighten-1; padding: 0 1; scrollbar-size: 1 1;
+    }
+    /* An empty pane used to be an empty box with a full-height scrollbar in
+       it. Say what would appear here instead. */
+    .placeholder {
+      width: 1fr; height: 1fr; margin: 0 0 0 1; padding: 2 2;
+      border: round $surface-lighten-1; color: $text-muted;
+    }
     #wake-stack DataTable { height: 1fr; }
-    #composer-help { height: 1; padding: 0 1; color: $text-muted; }
-    #composer { dock: bottom; height: 3; border: tall $accent; }
-    #events { border: round $primary-darken-2; }
+
+    #composer-help { height: 1; padding: 0 2; color: $text-muted; }
+    #composer { dock: bottom; height: 3; border: round $accent; }
+    #filter { dock: bottom; height: 3; border: round $warning; display: none; }
+    #filter.-open { display: block; }
+    #events { border: round $surface-lighten-1; scrollbar-size: 1 1; }
+
+    /* Dim the board rather than replacing it: the row you opened should
+       still be visible behind its own detail. */
+    DetailScreen { align: center middle; background: $background 55%; }
+    DetailScreen > #detail-card {
+      width: 80%; max-width: 96; height: auto; max-height: 80%;
+      border: round $accent; background: $surface; padding: 1 2;
+    }
+    DetailScreen #detail-title { text-style: bold; color: $accent; }
+    DetailScreen #detail-hint { color: $text-muted; padding: 1 0 0 0; }
     """
     BINDINGS = [
-        ("ctrl+r", "refresh", "Refresh"),
-        ("ctrl+l", "focus_composer", "Command"),
-        ("f1", "show_help", "Help"),
-        ("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+l", "focus_composer", "Command"),
+        Binding("slash", "open_filter", "Filter"),
+        Binding("o", "open_row", "Open row"),
+        Binding("question_mark", "show_help", "Help", key_display="?"),
+        Binding("ctrl+r", "refresh", "Refresh"),
+        Binding("ctrl+q", "quit", "Quit"),
+        # Jumping straight to a view is what an operator does most; make it
+        # one keystroke instead of walking the tab strip with arrows.
+        *(Binding(str(index), f"show_tab('{pane}')", "", show=False)
+          for index, pane in enumerate(_TAB_ORDER, start=1)),
+        Binding("f1", "show_help", "Help", show=False),
     ]
 
     def __init__(self, client: ControlPlaneClient, *, default_role: str | None = None,
@@ -96,39 +259,71 @@ class DeskTUI(App[None]):
         self._connection_state = "starting"
         self._connection_message = "loading initial snapshot"
         self._refresh_scheduled = False
+        self._filter = ""
+        self._full_rows: dict[tuple[str, str], tuple[str, ...]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Label("STARTING — loading snapshot", id="connection")
+        with Horizontal(id="statusbar"):
+            yield Label("STARTING", id="connection", classes="-starting")
+            yield Label("loading snapshot", id="connection-detail")
         with TabbedContent(initial="overview"):
             with TabPane("Overview", id="overview"):
-                yield Static("", id="health")
+                with Horizontal(id="tiles"):
+                    for label, _key, _tone in HEALTH_TILES:
+                        yield Static("—\n" + label, id=f"tile-{_key}",
+                                     classes="tile")
+                yield Static("", id="alerts", classes="-empty")
                 with Horizontal(classes="split"):
-                    yield DataTable(id="agents", cursor_type="row", zebra_stripes=True)
-                    yield RichLog(id="agent-feed", wrap=True, markup=True)
+                    yield DataTable(id="agents", cursor_type="row")
+                    yield RichLog(id="agent-feed", wrap=True, markup=True,
+                                  classes="side", auto_scroll=True)
             with TabPane("Tasks", id="tasks-tab"):
-                yield DataTable(id="tasks", cursor_type="row", zebra_stripes=True)
-            with TabPane("Inbox / mail", id="inbox-tab"):
-                yield DataTable(id="inbox", cursor_type="row", zebra_stripes=True)
+                yield DataTable(id="tasks", cursor_type="row")
+            with TabPane("Inbox", id="inbox-tab"):
+                yield DataTable(id="inbox", cursor_type="row")
             with TabPane("Meetings", id="meetings-tab"):
                 with Horizontal(classes="split"):
-                    yield DataTable(id="meetings", cursor_type="row", zebra_stripes=True)
-                    yield RichLog(id="meeting-detail", wrap=True, markup=True)
-            with TabPane("Wake / hooks", id="wake-tab"):
+                    yield DataTable(id="meetings", cursor_type="row")
+                    yield RichLog(id="meeting-detail", wrap=True, markup=True,
+                                  classes="side")
+            with TabPane("Wake", id="wake-tab"):
                 with Vertical(id="wake-stack"):
-                    yield DataTable(id="wake", cursor_type="row", zebra_stripes=True)
-                    yield DataTable(id="hooks", cursor_type="row", zebra_stripes=True)
+                    yield DataTable(id="wake", cursor_type="row")
+                    yield DataTable(id="hooks", cursor_type="row")
             with TabPane("Runtime", id="runtime-tab"):
-                yield DataTable(id="runtime", cursor_type="row", zebra_stripes=True)
+                yield DataTable(id="runtime", cursor_type="row")
             with TabPane("Activity", id="activity-tab"):
                 yield RichLog(id="events", wrap=True, markup=True, highlight=True)
         yield Label(command_hint(allowed_verbs=()), id="composer-help")
+        yield Input(placeholder="filter rows — Esc to clear", id="filter")
         yield Input(placeholder="@role instruction or /command", id="composer")
         yield Footer()
 
     def on_mount(self) -> None:
+        self.register_theme(DESK_THEME)
+        self.theme = "deskd"
+        # A pane that is empty because nothing has happened yet looks exactly
+        # like a pane that is broken. Say which one it is.
+        for line in ("Command results and stream",
+                     "notices appear here.",
+                     "",
+                     "enter  load agent feed",
+                     "o      open row in full",
+                     "/      filter rows",
+                     "^p     command palette"):
+            self.query_one("#agent-feed", RichLog).write(f"[dim]{line}[/dim]")
+        self.query_one("#meeting-detail", RichLog).write(
+            "[dim]Select a meeting to read its transcript.[/dim]")
         for table_id, (columns, _) in _TABLES.items():
-            self.query_one(f"#{table_id}", DataTable).add_columns(*columns)
+            visible = _VISIBLE_COLUMNS.get(table_id)
+            shown = ([columns[i] for i in visible] if visible else list(columns))
+            self.query_one(f"#{table_id}", DataTable).add_columns(*shown)
+        # Reading the board is the primary activity and typing a command is
+        # the occasional one, but focus started in the composer -- so Enter,
+        # the most obvious key on a highlighted row, submitted an empty
+        # command instead of opening the row. ^L still reaches the composer.
+        self.query_one("#agents", DataTable).focus()
         self.set_interval(1.0, self._update_connection)
         self.set_interval(self.refresh_seconds, self.action_refresh)
         self.action_refresh()
@@ -138,6 +333,84 @@ class DeskTUI(App[None]):
 
     def action_focus_composer(self) -> None:
         self.query_one("#composer", Input).focus()
+
+    # -- navigation and filtering -------------------------------------------
+    #
+    # The old surface offered exactly one way to reach anything: walk the tab
+    # strip, then scroll. With seven views and tables that grow without bound,
+    # that is the whole interaction budget spent on getting to the row.
+
+    def action_show_tab(self, pane: str) -> None:
+        self.query_one(TabbedContent).active = pane
+        table = _TAB_TABLES.get(pane)
+        if table is not None:
+            try:
+                self.query_one(f"#{table}", DataTable).focus()
+            except NoMatches:
+                pass
+
+    def _active_table(self) -> DataTable | None:
+        table_id = _TAB_TABLES.get(self.query_one(TabbedContent).active)
+        if table_id is None:
+            return None
+        try:
+            return self.query_one(f"#{table_id}", DataTable)
+        except NoMatches:
+            return None
+
+    def action_open_filter(self) -> None:
+        if self._active_table() is None:
+            self.notify("This view has no table to filter.", severity="warning")
+            return
+        field = self.query_one("#filter", Input)
+        field.add_class("-open")
+        field.focus()
+
+    def _close_filter(self) -> None:
+        field = self.query_one("#filter", Input)
+        field.value = ""
+        field.remove_class("-open")
+        self._filter = ""
+        if self.snapshot is not None:
+            self._render(self.snapshot)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "filter":
+            self._filter = event.value.strip().lower()
+            if self.snapshot is not None:
+                self._render(self.snapshot)
+
+    def action_open_row(self) -> None:
+        """Open the highlighted row in full.
+
+        Enter already means something on two tables -- it loads the agent
+        session feed and the meeting transcript into their side panes -- so
+        this takes its own key rather than quietly replacing that. On the
+        tables with no side pane it is the only way to see the columns the
+        150-column layout cannot show.
+        """
+        table = self._active_table()
+        if table is None or table.row_count == 0:
+            self.notify("No row to open here.", severity="warning")
+            return
+        table_id = table.id or ""
+        columns = _TABLES.get(table_id, ((), None))[0]
+        try:
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        except Exception:
+            return
+        values = self._full_rows.get((table_id, str(row_key.value)))
+        if values is None:
+            try:
+                values = tuple(str(cell) for cell in table.get_row(row_key))
+            except Exception:
+                return
+        fields = [(name, str(value)) for name, value
+                  in zip(columns, values, strict=False)]
+        if not fields:
+            return
+        self.push_screen(DetailScreen(
+            f"{table_id.title()} · {fields[0][1]}", fields))
 
     def _composer_capabilities(self) -> tuple[frozenset[str] | None, str | None]:
         if self.snapshot is None or not self.snapshot.consistent:
@@ -201,15 +474,40 @@ class DeskTUI(App[None]):
         allowed, principal_role = self._composer_capabilities()
         self.query_one("#composer-help", Label).update(command_hint(
             allowed_verbs=allowed, principal_role=principal_role))
-        self.query_one("#health", Static).update(health_text(snapshot))
+        # health_metrics preserves HEALTH_TILES order, so the pairing is
+        # positional rather than a lookup by display label.
+        for (label, value, tone), (_, key, _tone) in zip(
+                health_metrics(snapshot), HEALTH_TILES, strict=True):
+            tile = self.query_one(f"#tile-{key}", Static)
+            tile.set_classes(f"tile -{tone}" if tone != "neutral" else "tile")
+            tile.update(Text.assemble(
+                (f"{value}", "bold"), ("\n", ""), (label, "dim")))
+        alerts = health_alerts(snapshot)
+        banner = self.query_one("#alerts", Static)
+        banner.update("  ".join(f"▲ {alert}" for alert in alerts))
+        banner.set_classes("" if alerts else "-empty")
         for table_id, (_, row_builder) in _TABLES.items():
             table = self.query_one(f"#{table_id}", DataTable)
             table.clear()
             rows = row_builder(snapshot)
+            if self._filter and table_id == _TAB_TABLES.get(
+                    self.query_one(TabbedContent).active):
+                rows = [row for row in rows
+                        if self._filter in " ".join(map(str, row)).lower()]
             for row in rows:
                 row_key = row[0] if table_id in {"agents", "tasks", "inbox", "meetings",
                                                      "hooks", "wake", "runtime"} else None
-                cells = tuple(_literal_text(cell) for cell in row)
+                visible = _VISIBLE_COLUMNS.get(table_id)
+                if row_key is not None:
+                    # Keep every column for the detail view, including the ones
+                    # the table cannot afford to show.
+                    self._full_rows[(table_id, str(row_key))] = tuple(
+                        str(cell) for cell in row)
+                cells = tuple(
+                    _literal_text(cell,
+                                  style=_tone_for(table_id, index, str(cell)))
+                    for index, cell in enumerate(row)
+                    if visible is None or index in visible)
                 try:
                     table.add_row(*cells, key=row_key)
                 except Exception:
@@ -302,27 +600,38 @@ class DeskTUI(App[None]):
         except NoMatches:
             return
         elapsed = time.monotonic() - self._last_contact if self._last_contact else float("inf")
-        version = self.snapshot.server_version if self.snapshot else None
-        suffix = f"  server {version}" if version else ""
-        cursor = f"  cursor {self.cursor}" if self.cursor else ""
+        # State is the one word here that changes what an operator should do,
+        # so it gets a pill of its own; the URL, cursor and version are what
+        # qualify it and belong in the muted half. The old line set all four
+        # at the same weight, which is why none of them read as important.
         if elapsed > self.stale_after:
-            detail = (f" {int(elapsed) if elapsed != float('inf') else '?'}s  "
-                      f"{self._connection_message}{cursor}{suffix}")
-            label.update(Text.assemble(("STALE", "bold yellow"), _literal_text(detail)))
+            age = int(elapsed) if elapsed != float("inf") else "?"
+            state, tone = f"STALE {age}s", "-stale"
+            detail = self._connection_message
         elif self._connection_state == "connected":
-            label.update(Text.assemble(("LIVE", "bold green"),
-                                       _literal_text(f"  {self.client.base_url}{cursor}{suffix}")))
+            state, tone = "LIVE", "-live"
+            detail = str(self.client.base_url)
         elif self._connection_state in {"reconnecting", "connecting"}:
-            label.update(Text.assemble(
-                (self._connection_state.upper(), "bold yellow"),
-                _literal_text(f"  {self._connection_message}{cursor}{suffix}")))
+            state, tone = self._connection_state.upper(), "-stale"
+            detail = self._connection_message
         elif self._connection_state == "error":
-            label.update(Text.assemble(("ERROR", "bold red"),
-                                       _literal_text(f"  {self._connection_message}{suffix}")))
+            state, tone = "ERROR", "-error"
+            detail = self._connection_message
         else:
-            label.update(Text.assemble(
-                (self._connection_state.upper(), "bold cyan"),
-                _literal_text(f"  {self._connection_message}{suffix}")))
+            state, tone = self._connection_state.upper(), "-starting"
+            detail = self._connection_message
+        label.update(_literal_text(state))
+        label.set_classes(tone)
+        version = self.snapshot.server_version if self.snapshot else None
+        trailing = "   ".join(part for part in (
+            detail,
+            f"server {version}" if version else "",
+            f"cursor {self.cursor}" if self.cursor else "") if part)
+        try:
+            self.query_one("#connection-detail", Label).update(
+                _literal_text(trailing))
+        except NoMatches:
+            return
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         event.input.clear()
