@@ -570,6 +570,85 @@ def test_nonrecoverable_external_lost_receipt_is_terminal_indeterminate(desk):
     assert calls == 1
 
 
+def test_failed_idempotent_tick_retries_under_stable_request_id(desk, monkeypatch):
+    calls = 0
+
+    def plan_wakes(record=False):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("wake planner probe timed out")
+        return {"ticked": calls}
+
+    monkeypatch.setattr(orch, "plan_wakes", plan_wakes)
+    principal = service_principal("orchestrator")
+    with pytest.raises(RuntimeError, match="probe timed out"):
+        commands.execute(principal, "tick-retry-000001", "orchestrator.tick", {})
+    jobs = store.command_jobs(principal_id=principal.subject)
+    assert jobs[0]["status"] == "failed"
+    done = commands.execute(principal, "tick-retry-000001",
+                            "orchestrator.tick", {})
+    assert done["result"] == {"ticked": 2}
+    assert calls == 2
+    jobs = store.command_jobs(principal_id=principal.subject)
+    assert jobs[0]["status"] == "completed"
+    assert jobs[0]["error"] is None
+
+
+def test_failed_recoverable_broker_verb_retries_not_replays(desk, monkeypatch):
+    """The engineer wedge: workspace.acquire fails pre-effect at the broker
+    (base moved), the launcher resubmits under its stable request id, and the
+    control plane must re-execute — not replay the stale failure forever."""
+    calls = 0
+
+    def acquire(repo, *, owner_role, task_key, base_ref, branch=None,
+                expected_base_sha=None, lease_seconds=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("base moved: expected abc123")
+        return {"workspace": "ws_1"}
+
+    monkeypatch.setattr(commands.workspaces, "acquire", acquire)
+    principal = role_principal()
+    params = {"repo": "parlay", "task_key": "t1", "base_ref": "main"}
+    with pytest.raises(RuntimeError, match="base moved"):
+        commands.execute(
+            principal, "ws-acquire-000001", "workspace.acquire", params)
+    done = commands.execute(
+        principal, "ws-acquire-000001", "workspace.acquire", params)
+    assert done["result"] == {"workspace": "ws_1"}
+    assert calls == 2
+
+
+def test_idempotent_tick_reclaims_stale_lease_and_reexecutes(desk, monkeypatch):
+    """A control crash mid-tick leaves a running row with an expired lease.
+    Ticks reconcile desired state, so the next resubmit takes over and re-runs
+    instead of wedging the scheduler as indeterminate."""
+    calls = 0
+
+    def plan_wakes(record=False):
+        nonlocal calls
+        calls += 1
+        return {"ticked": calls}
+
+    monkeypatch.setattr(orch, "plan_wakes", plan_wakes)
+    principal = service_principal("orchestrator")
+    store.ensure_schema()
+    with orch.connect(write=True) as conn:
+        store.insert_command(
+            conn, principal.subject, "tick-stale-000001", "orchestrator.tick",
+            commands._fingerprint("orchestrator.tick", {}), "running",
+            execution_token="lost-by-crashed-control",
+            lease_expires_at="2000-01-01T00:00:00+00:00")
+    done = commands.execute(principal, "tick-stale-000001",
+                            "orchestrator.tick", {})
+    assert done["result"] == {"ticked": 1}
+    assert calls == 1
+    jobs = store.command_jobs(principal_id=principal.subject)
+    assert jobs[0]["status"] == "completed"
+
+
 def test_cursor_rejects_future_and_retention_gap(desk):
     store.ensure_schema()
     current = store.current_cursor()

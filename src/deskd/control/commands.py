@@ -1687,7 +1687,12 @@ _BUILTIN_VERBS = frozenset({
 _RECOVERABLE_EXTERNAL = frozenset({
     "workspace.acquire", "workspace.commit", "workspace.release",
 })
-_NONRECOVERABLE_EXTERNAL = frozenset({"orchestrator.tick", "scheduler.tick"})
+# Ticks are reconciliation loops: re-running one after a crash or lost receipt
+# converges to the same desired state, so a stale lease may be reclaimed and a
+# failed attempt retried under its stable request id.  Generic non-transactional
+# host commands do NOT get this treatment — their side effects cannot be
+# inferred from a missing receipt, so they stay terminal-indeterminate.
+_IDEMPOTENT_EXTERNAL = frozenset({"orchestrator.tick", "scheduler.tick"})
 
 
 def verbs() -> list[str]:
@@ -1789,9 +1794,11 @@ def _execute_external(principal: Principal, request_id: str, verb: str,
 
     A token + expiry is an execution lease, not a retry timer.  A duplicate
     inside the live lease receives the existing running job and cannot enter
-    the callback.  Only a stale, explicitly recoverable broker verb may take
-    over; non-recoverable work becomes indeterminate because its side effect
-    cannot honestly be inferred from a missing receipt.
+    the callback.  Only a stale, explicitly recoverable verb (broker verbs,
+    idempotent ticks) may take over; non-recoverable work becomes indeterminate
+    because its side effect cannot honestly be inferred from a missing receipt.
+    A "failed" row is a clean pre-effect failure, so a resubmit under the same
+    request id reclaims it and re-executes instead of replaying the failure.
     """
     store.ensure_schema()
     execution_token = uuid.uuid4().hex
@@ -1805,24 +1812,27 @@ def _execute_external(principal: Principal, request_id: str, verb: str,
         if old is not None:
             if old["request_fingerprint"] != fingerprint:
                 raise CommandConflict("request_id was reused with different content")
-            if old["status"] == "completed":
+            if old["status"] in {"completed", "indeterminate"}:
                 return _stored(old)
-            if old["status"] in {"failed", "indeterminate"}:
-                return _stored(old)
-            live_until = old["lease_expires_at"]
-            if live_until and live_until > store.now_iso():
-                return {
-                    "request_id": request_id, "accepted": True,
-                    "event_cursor": store.current_cursor(conn),
-                    "job": {"status": old["status"],
-                            "lease_expires_at": live_until},
-                }
-            if not recoverable:
-                store.finish_command(
-                    conn, principal.subject, request_id, "indeterminate",
-                    error="previous external execution lost its result; not retried")
-                raise CommandConflict(
-                    "external command outcome is indeterminate; not retried")
+            if old["status"] != "failed":
+                live_until = old["lease_expires_at"]
+                if live_until and live_until > store.now_iso():
+                    return {
+                        "request_id": request_id, "accepted": True,
+                        "event_cursor": store.current_cursor(conn),
+                        "job": {"status": old["status"],
+                                "lease_expires_at": live_until},
+                    }
+                if not recoverable:
+                    store.finish_command(
+                        conn, principal.subject, request_id, "indeterminate",
+                        error="previous external execution lost its result; "
+                              "not retried")
+                    raise CommandConflict(
+                        "external command outcome is indeterminate; not retried")
+            # A "failed" row records a clean pre-effect failure and a stale
+            # recoverable lease records a receipt we may re-derive; either way
+            # this attempt takes over the row and re-executes.
             conn.execute(
                 "UPDATE control_commands SET status='running',execution_token=?,"
                 "lease_expires_at=?,updated_at=?,error=NULL WHERE principal_id=? "
@@ -1908,11 +1918,12 @@ def execute(principal: Principal, request_id: str, verb: str, params: dict, *,
     fingerprint = _fingerprint(verb, params)
     host = _host_commands().get(verb)
     external = (verb in _RECOVERABLE_EXTERNAL
-                or verb in _NONRECOVERABLE_EXTERNAL
+                or verb in _IDEMPOTENT_EXTERNAL
                 or (host is not None and not host.transactional))
     if external:
         return _execute_external(
             principal, request_id, verb, params, fingerprint, before_complete,
-            recoverable=verb in _RECOVERABLE_EXTERNAL)
+            recoverable=(verb in _RECOVERABLE_EXTERNAL
+                         or verb in _IDEMPOTENT_EXTERNAL))
     return _execute_atomic(
         principal, request_id, verb, params, fingerprint, before_complete)
