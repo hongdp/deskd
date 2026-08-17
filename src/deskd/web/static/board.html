@@ -209,7 +209,7 @@ function cardHtml(a) {
   var tasks = a.tasks && a.tasks.length ? '<div class="tasks">' + a.tasks.map(taskHtml).join("") + "</div>"
     : S.empty("No open tasks.", "deskd task add --for " + a.role + " --title \"…\"");
   var c = a.task_counts || {};
-  var counts = '<div class="chips" style="margin-top:8px">'
+  var counts = '<div class="chips" style="margin-bottom:8px">'
     + '<a class="chip" href="/tasks?role=' + encodeURIComponent(a.role) + '">pending <b>' + (c.pending || 0) + "</b></a>"
     + '<a class="chip" href="/tasks?role=' + encodeURIComponent(a.role) + '">in progress <b>' + (c.in_progress || 0) + "</b></a>"
     + '<a class="chip' + (c.blocked ? " bad" : "") + '" href="/tasks?role=' + encodeURIComponent(a.role) + '">blocked <b>' + (c.blocked || 0) + "</b></a>"
@@ -227,7 +227,10 @@ function cardHtml(a) {
     + '<div class="section"><h3>Meeting obligations &amp; wakes</h3>' + meetingHtml(a.meeting, a.role)
     + (wakeChip(a.wake) ? '<div class="chips" style="margin-top:6px">' + wakeChip(a.wake) + "</div>" : "") + "</div>"
     + hooksHtml(a.hooks)
-    + '<div class="section"><h3>Tasks' + (a.overdue_count ? ' · <span style="color:var(--bad)">' + a.overdue_count + " overdue</span>" : "") + "</h3>" + tasks + counts + "</div>"
+    // Counts render ABOVE the list (supervisor request 2026-08-17): the chips
+    // are the summary a reader scans first, and below a long list they were
+    // effectively invisible.
+    + '<div class="section"><h3>Tasks' + (a.overdue_count ? ' · <span style="color:var(--bad)">' + a.overdue_count + " overdue</span>" : "") + "</h3>" + counts + tasks + "</div>"
     + workBreakdownHtml(a)
     + "</div>";
 }
