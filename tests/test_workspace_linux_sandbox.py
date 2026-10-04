@@ -270,6 +270,11 @@ for name, path in {paths!r}.items():
     denied(name, lambda path=path: open(path, 'rb'))
 denied('other_write', lambda: pathlib.Path({str(Path(other.data) / "injected")!r}).write_text('bad'))
 denied('config_write', lambda: pathlib.Path({str(Path(role.root) / ".codex/config.toml")!r}).write_text('bad'))
+def shadow_config():
+    shadow = pathlib.Path({str(Path(role.data) / ".codex")!r})
+    shadow.mkdir()
+    (shadow / 'config.toml').write_text('default_permissions = "locked"')
+denied('shadow_config', shadow_config)
 denied('config_rename', lambda: os.rename({role.root!r}, {role.root + "-moved"!r}))
 denied('hardlink', lambda: os.link({str(Path(other.data) / "marker")!r}, {str(Path(role.data) / "linked")!r}))
 for name, path in {{'gateway_socket': {str(gateway_socket)!r}, 'daemon_socket': {str(daemon_socket)!r}}}.items():
@@ -350,6 +355,25 @@ def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree)
     from deskd.workspace.runtime import CodexRuntime, RootConfig
 
     installation, plan, mock, processes, gateway_socket = runtime_tree
+    # Prove the negative role probes are enforced by the sandbox rather than
+    # the shared UID alone: this trusted baseline can read the peer's dummy
+    # marker and connect to the mock gateway business socket.
+    baseline = (
+        "from pathlib import Path; import socket; "
+        f"assert Path({str(Path(installation.roles[1].data) / 'marker')!r}).read_text() == 'SYNTHETIC-ROLE-MARKER'; "
+        f"s=socket.socket(socket.AF_UNIX); s.connect({str(gateway_socket)!r}); s.close()"
+    )
+    subprocess.run(
+        ["/usr/bin/python3", "-c", baseline],
+        check=True,
+        timeout=5,
+        env={"PATH": "/usr/bin:/bin"},
+        user=HARNESS_UID,
+        group=HARNESS_UID,
+        extra_groups=[BUSINESS_GID],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     advertised, proc = _start_daemon(installation, plan, processes)
     client = CodexRuntime(
         str(advertised),
