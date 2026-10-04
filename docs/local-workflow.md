@@ -208,6 +208,23 @@ output directories, HTML escaping, and failure of a negative installation
 manifest before a service database is created. They do not start an installed
 gateway or claim to validate its two-UID boundary.
 
+A separate `gateway-boundary` workflow runs `tests/test_gateway_linux_ids.py`
+on an ephemeral GitHub-hosted Linux runner. It creates temporary numeric UID
+processes with two distinct non-root service identities and root administration,
+then exercises the public transport and stdio bridge entry points against a
+synthetic memo application. No system accounts or services are installed. The
+privileged command starts with an empty environment, and the job rejects a
+skipped or empty acceptance run. All fixtures live in a fresh `scratchpad`
+subdirectory; local unprivileged test runs skip this acceptance test.
+
+This test distinguishes service isolation from role isolation. Both bridge
+processes deliberately share the harness UID, and an unsandboxed process with
+that UID can reach the business socket. Synthetic root metadata and manual
+management bindings do not prove official-runtime root authenticity. A passing
+run therefore establishes only the tested UID/DAC, peer/channel and independent
+memo authorization boundaries. It does not establish the role sandbox,
+process/network isolation, protected runtime configuration or automatic recovery.
+
 | Area | Available in this increment | Remaining acceptance |
 | --- | --- | --- |
 | Multi-principal action loop | Bound principals, independent approval, one-shot SQLite memo effect, durable receipts and local board. | Complete integration into a persistent user workspace. |
