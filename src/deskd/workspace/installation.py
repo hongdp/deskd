@@ -129,6 +129,9 @@ class Installation:
         if mock_port is not None:
             lines.append('model_provider = "deskd_mock"')
         lines += [
+            "[shell_environment_policy]",
+            'inherit = "none"',
+            'set = { PATH = "/usr/bin:/bin" }',
             "[analytics]",
             "enabled = false",
             "[features]",

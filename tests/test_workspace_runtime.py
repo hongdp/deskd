@@ -158,6 +158,10 @@ class MockDaemon:
                         "thread/start": settings(),
                         "thread/resume": settings(),
                         "thread/read": {"thread": thread_info()},
+                        "thread/turns/list": {
+                            "data": thread_info()["turns"],
+                            "nextCursor": None,
+                        },
                         "turn/start": {
                             "turn": {"id": "turn-1", "status": "inProgress"}
                         },
@@ -519,3 +523,150 @@ def test_oversized_turn_input_does_not_reach_daemon():
         with pytest.raises(RuntimeUnavailable):
             client.start_turn("root-1", "x" * MAX_MESSAGE)
         assert not any(m.get("method") == "turn/start" for m in server.messages)
+
+
+def test_missing_root_identity_field_fails_closed():
+    def handler(conn, message):
+        if message["method"] == "thread/start":
+            result = settings()
+            del result["thread"]["parentThreadId"]
+            conn.sendall(frame({"id": message["id"], "result": result}))
+            return True
+        return False
+
+    with daemon(handler) as (client, _):
+        client.connect()
+        with pytest.raises(RuntimePolicyError, match="incomplete_root_identity"):
+            client.start_root(config())
+        assert client._socket is None
+
+
+def test_read_root_rejects_changed_cwd():
+    def handler(conn, message):
+        if message["method"] == "thread/read":
+            conn.sendall(
+                frame(
+                    {
+                        "id": message["id"],
+                        "result": {"thread": thread_info(cwd="/foreign")},
+                    }
+                )
+            )
+            return True
+        return False
+
+    with daemon(handler) as (client, _):
+        client.connect()
+        client.start_root(config())
+        with pytest.raises(RuntimePolicyError):
+            client.read_root("root-1")
+        assert client._socket is None
+
+
+def test_resume_does_not_accept_a_different_root():
+    with daemon() as (client, _):
+        client.connect()
+        with pytest.raises(RuntimePolicyError):
+            client.resume_root("root-2", config())
+        assert client._socket is None
+
+
+def test_backlog_has_a_hard_bound():
+    def handler(conn, message):
+        if message["method"] == "thread/start":
+            conn.sendall(frame({"method": "test/event", "params": {}}) * 257)
+            return True
+        return False
+
+    with daemon(handler) as (client, _):
+        client.connect()
+        with pytest.raises(RuntimeUnavailable, match="event_backlog_exceeded"):
+            client.start_root(config())
+
+
+def test_invalid_settings_notification_is_not_an_uncaught_type_error():
+    def handler(conn, message):
+        if message["method"] == "thread/start":
+            conn.sendall(
+                frame({"method": "thread/settings/updated", "params": {"threadId": []}})
+            )
+            return True
+        return False
+
+    with daemon(handler) as (client, _):
+        client.connect()
+        with pytest.raises(RuntimeUnavailable, match="invalid_settings_notification"):
+            client.start_root(config())
+
+
+def test_invalid_turn_identity_is_an_unknown_transport_outcome():
+    def handler(conn, message):
+        if message["method"] == "turn/start":
+            conn.sendall(frame({"id": message["id"], "result": {"turn": {"id": []}}}))
+            return True
+        return False
+
+    with daemon(handler) as (client, _):
+        client.connect()
+        client.start_root(config())
+        with pytest.raises(RuntimeUnavailable, match="invalid_turn_identity"):
+            client.start_turn("root-1", [])
+        assert client._socket is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"sandbox": "danger-full-access"},
+        {"permissions": "role"},
+        {"config": []},
+    ],
+)
+def test_unrestricted_or_ambiguous_trusted_config_is_rejected(kwargs):
+    with pytest.raises(ValueError):
+        config(**kwargs)
+
+
+def test_turn_status_paginates_without_loading_items():
+    def handler(conn, message):
+        if message["method"] == "thread/turns/list":
+            params = message["params"]
+            assert params["itemsView"] == "notLoaded"
+            assert params["limit"] == 100 and params["sortDirection"] == "desc"
+            result = {
+                "data": [{"id": "newer", "status": "completed"}],
+                "nextCursor": "next",
+            }
+            if params.get("cursor") == "next":
+                result = {
+                    "data": [{"id": "historical", "status": "failed"}],
+                    "nextCursor": None,
+                }
+            conn.sendall(frame({"id": message["id"], "result": result}))
+            return True
+        return False
+
+    with daemon(handler) as (client, server):
+        client.connect()
+        client.start_root(config())
+        assert client.read_turn("root-1", "historical") == "failed"
+        reads = [m for m in server.messages if m.get("method") == "thread/read"]
+        assert reads[-1]["params"]["includeTurns"] is False
+
+
+def test_repeating_history_cursor_fails_closed():
+    def handler(conn, message):
+        if message["method"] == "thread/turns/list":
+            conn.sendall(
+                frame(
+                    {"id": message["id"], "result": {"data": [], "nextCursor": "cycle"}}
+                )
+            )
+            return True
+        return False
+
+    with daemon(handler) as (client, _):
+        client.connect()
+        client.start_root(config())
+        with pytest.raises(RuntimeUnavailable, match="invalid_turn_cursor"):
+            client.read_turn("root-1", "historical")

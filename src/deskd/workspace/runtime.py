@@ -591,17 +591,54 @@ class CodexRuntime:
         raise AssertionError("unreachable")
 
     def read_turn(self, root_id: str, turn_id: str) -> str:
+        """Read bounded turn metadata without hydrating a lifetime of messages.
+
+        Up to 100 pages (10,000 turns) are inspected. Absence, an exhausted
+        bound, or unsupported history never proves that dispatch did not occur.
+        """
         _identifier(turn_id)
-        thread = self.read_root(root_id, include_turns=True)
-        turns = thread.get("turns")
-        if not isinstance(turns, list):
-            self._fail("missing_turn_history")
-        for turn in turns:
-            if isinstance(turn, dict) and turn.get("id") == turn_id:
-                status = turn.get("status")
-                if status not in {"inProgress", "completed", "interrupted", "failed"}:
-                    self._fail("invalid_turn_status")
-                return status
+        self.read_root(root_id)
+        cursor = None
+        seen = set()
+        for _ in range(100):
+            params = {
+                "threadId": root_id,
+                "limit": 100,
+                "itemsView": "notLoaded",
+                "sortDirection": "desc",
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = self._request("thread/turns/list", params)
+            turns = result.get("data")
+            if not isinstance(turns, list) or len(turns) > 100:
+                self._fail("invalid_turn_page")
+            for turn in turns:
+                if not isinstance(turn, dict):
+                    self._fail("invalid_turn_page")
+                if turn.get("id") == turn_id:
+                    status = turn.get("status")
+                    if status not in {
+                        "inProgress",
+                        "completed",
+                        "interrupted",
+                        "failed",
+                    }:
+                        self._fail("invalid_turn_status")
+                    return status
+            if "nextCursor" not in result:
+                self._fail("invalid_turn_cursor")
+            cursor = result["nextCursor"]
+            if cursor is None:
+                return "unknown"
+            if (
+                not isinstance(cursor, str)
+                or not cursor
+                or len(cursor) > 4096
+                or cursor in seen
+            ):
+                self._fail("invalid_turn_cursor")
+            seen.add(cursor)
         return "unknown"
 
     def interrupt(self, root_id: str, turn_id: str) -> None:

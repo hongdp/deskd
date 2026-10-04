@@ -176,6 +176,11 @@ def runtime_tree():
         marker.write_text("SYNTHETIC-ROLE-MARKER")
         os.chown(marker, HARNESS_UID, HARNESS_UID)
         os.chmod(marker, 0o600)
+    for parent in ("harness", "tmp"):
+        marker = tree / parent / "synthetic-private"
+        marker.write_text("SYNTHETIC-PARENT-PRIVATE")
+        os.chown(marker, HARNESS_UID, HARNESS_UID)
+        os.chmod(marker, 0o600)
     fake_secret = tree / "gateway/fake-secret"
     fake_secret.write_text("PUBLIC-MOCK-NOT-A-CREDENTIAL")
     os.chown(fake_secret, GATEWAY_UID, GATEWAY_UID)
@@ -219,6 +224,7 @@ def _start_daemon(installation, plan, processes):
             "NO_PROXY": "127.0.0.1,localhost",
             "TERM": "dumb",
             "RUST_LOG": "off",
+            "DESKD_SYNTHETIC_PARENT_ONLY": "PUBLIC-MOCK-MARKER",
         }
     )
     log = Path(installation.prefix) / f"daemon-{len(processes)}.log"
@@ -250,15 +256,18 @@ def _start_daemon(installation, plan, processes):
 
 
 def _probe_command(
-    installation, role, other, gateway_socket, daemon_socket, port, suffix
+    installation, role, other, gateway_socket, daemon_socket, daemon_pid, port, suffix
 ):
     paths = {
         "other_read": str(Path(other.data) / "marker"),
         "secret_read": installation.path("gateway/fake-secret"),
+        "harness_read": installation.path("harness/synthetic-private"),
+        "shared_tmp_read": installation.path("tmp/synthetic-private"),
+        "owned_daemon_proc": f"/proc/{daemon_pid}/environ",
     }
     script = f"""
 import json, os, pathlib, socket
-results = {{}}
+results = {{"parent_environment": os.environ.get("DESKD_SYNTHETIC_PARENT_ONLY") is None}}
 def denied(name, action):
     try:
         value = action()
@@ -315,6 +324,7 @@ def _run_probe(
         other,
         gateway_socket,
         daemon_socket,
+        client.peer_pid,
         mock.server.server_port,
         suffix,
     )
@@ -355,6 +365,22 @@ def _run_probe(
     assert (Path(role.data) / f"own-{suffix}").read_text() == "allowed"
 
 
+def _observe_mock_errors(client):
+    # Temporary diagnosis of this newly created credential-free mock daemon.
+    # The original decoder, peer checks, validation and public calls are intact;
+    # only an error string is captured by pytest and shown when a test fails.
+    original = client._message
+
+    def receive(deadline):
+        value = original(deadline)
+        error = value.get("error")
+        if isinstance(error, dict):
+            print("SYNTHETIC-DAEMON-ERROR:", str(error.get("message", ""))[:2000])
+        return value
+
+    client._message = receive
+
+
 def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree):
     # Imported after the opt-in fixture: ordinary developer runs do not need a
     # daemon, privileges, a downloaded runtime, or network access.
@@ -388,6 +414,8 @@ def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree)
         expected_codex_home=installation.path("harness"),
         timeout=10,
     ).connect()
+    assert client.peer_pid == proc.pid
+    _observe_mock_errors(client)
     bindings = []
     configs = []
     try:
@@ -426,13 +454,15 @@ def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree)
         client.close()
     proc.terminate()
     proc.wait(timeout=15)
-    advertised, _ = _start_daemon(installation, plan, processes)
+    advertised, proc = _start_daemon(installation, plan, processes)
     client = CodexRuntime(
         str(advertised),
         expected_uid=HARNESS_UID,
         expected_codex_home=installation.path("harness"),
         timeout=10,
     ).connect()
+    assert client.peer_pid == proc.pid
+    _observe_mock_errors(client)
     try:
         for i, role in enumerate(installation.roles):
             resumed = client.resume_root(bindings[i].thread_id, configs[i])
