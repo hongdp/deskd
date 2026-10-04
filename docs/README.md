@@ -12,6 +12,9 @@ index you can read in one screen beats navigation you have to maintain.
 - [`control-plane.md`](control-plane.md) — the optional isolated deployment:
   authenticated principals, atomic command receipts, snapshot/SSE recovery,
   shared/private state, workspace leases and operational boundaries.
+- [`gateway-foundation.md`](gateway-foundation.md) — experimental overlay
+  primitives: root identity bindings, lifecycle fencing, durable outbox and
+  consumer receipts; the deployment boundary is not yet implemented.
 - [`container-deployment.md`](container-deployment.md) — the production runbook:
   immutable image provenance, UID/mount/network boundaries, secret projection,
   startup, backup, reconciliation, rolling upgrade and rollback gates.
