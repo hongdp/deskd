@@ -14,7 +14,12 @@ index you can read in one screen beats navigation you have to maintain.
   shared/private state, workspace leases and operational boundaries.
 - [`gateway-foundation.md`](gateway-foundation.md) — experimental overlay
   primitives: root identity bindings, lifecycle fencing, durable outbox and
-  consumer receipts; the deployment boundary is not yet implemented.
+  consumer receipts.
+- [`local-workflow.md`](local-workflow.md) — runnable credential-free memo
+  workflow, independent approval, offline responsibility board, fixed MCP bridge
+  and memo-only Unix service; actual harness isolation remains unverified.
+- [`local-workflow-install.md`](local-workflow-install.md) — two-service-user
+  host preparation, read-only metadata preflight and outstanding release gates.
 - [`container-deployment.md`](container-deployment.md) — the production runbook:
   immutable image provenance, UID/mount/network boundaries, secret projection,
   startup, backup, reconciliation, rolling upgrade and rollback gates.

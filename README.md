@@ -45,6 +45,13 @@ it, fake it, or vote with it.
 
 ## 60 seconds to a live board
 
+For the experimental native-harness overlay, see the
+[local workflow](docs/local-workflow.md): three synthetic seats propose,
+independently authorize and publish one local memo, with an offline responsibility
+board. The memo gateway and fixed MCP bridge are implemented; two-service-user
+installation and official-harness isolation still require separate acceptance.
+The demonstration needs no model or credentials and is not a trading system.
+
 ```bash
 pip install "deskd[web]"                     # the engine + the web console
 git clone https://github.com/hongdp/deskd    # the demo ships in the repo, not the wheel

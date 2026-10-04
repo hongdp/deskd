@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "harness_uid": 21001,
+  "gateway_uid": 21002,
+  "business_gid": 21003,
+  "paths": {
+    "installation": "/opt/deskd-local",
+    "policy": "/etc/deskd-local",
+    "runtime": "/run/deskd-local",
+    "daemon": "/run/deskd-local/daemon",
+    "gateway": "/run/deskd-local/business",
+    "admin": "/run/deskd-local/admin",
+    "harness_state": "/var/lib/deskd-local/harness",
+    "gateway_state": "/var/lib/deskd-local/gateway",
+    "secrets": "/var/lib/deskd-local/secrets",
+    "controller": "/opt/deskd-local/bin/controller",
+    "harness_binary": "/opt/deskd-local/bin/codex",
+    "bridge": "/opt/deskd-local/bin/bridge",
+    "runtime_config": "/etc/deskd-local/runtime.json"
+  },
+  "roles": [
+    {
+      "seat": "analyst",
+      "root": "/srv/deskd-local/roles/analyst",
+      "config": "/srv/deskd-local/roles/analyst/.codex/config.toml",
+      "data": "/srv/deskd-local/roles/analyst/data",
+      "network": "off",
+      "sandbox": "local-restricted",
+      "deny_read": [
+        "/run/deskd-local/daemon",
+        "/run/deskd-local/business",
+        "/run/deskd-local/admin",
+        "/var/lib/deskd-local/harness",
+        "/var/lib/deskd-local/gateway",
+        "/var/lib/deskd-local/secrets",
+        "/srv/deskd-local/roles/trader"
+      ]
+    },
+    {
+      "seat": "trader",
+      "root": "/srv/deskd-local/roles/trader",
+      "config": "/srv/deskd-local/roles/trader/.codex/config.toml",
+      "data": "/srv/deskd-local/roles/trader/data",
+      "network": "off",
+      "sandbox": "local-restricted",
+      "deny_read": [
+        "/run/deskd-local/daemon",
+        "/run/deskd-local/business",
+        "/run/deskd-local/admin",
+        "/var/lib/deskd-local/harness",
+        "/var/lib/deskd-local/gateway",
+        "/var/lib/deskd-local/secrets",
+        "/srv/deskd-local/roles/analyst"
+      ]
+    }
+  ],
+  "runtime": {
+    "kind": "official-codex",
+    "version": "0.0.0",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}
