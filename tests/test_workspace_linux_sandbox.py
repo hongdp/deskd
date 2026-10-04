@@ -70,7 +70,7 @@ class ModelMock:
                             "arguments": json.dumps(
                                 {
                                     "cmd": owner.command,
-                                    "yield_time_ms": 1000,
+                                    "yield_time_ms": 10000,
                                     "max_output_tokens": 500,
                                 }
                             ),
@@ -183,6 +183,7 @@ def runtime_tree():
     channel_dir = tree / "business"
     channel_dir.mkdir(mode=0o750)
     os.chown(channel_dir, GATEWAY_UID, BUSINESS_GID)
+    os.chmod(channel_dir, 0o750)
     channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     channel.bind(str(channel_dir / "s"))
     channel.listen(8)
@@ -277,6 +278,9 @@ def shadow_config():
 denied('shadow_config', shadow_config)
 denied('config_rename', lambda: os.rename({role.root!r}, {role.root + "-moved"!r}))
 denied('hardlink', lambda: os.link({str(Path(other.data) / "marker")!r}, {str(Path(role.data) / "linked")!r}))
+link = pathlib.Path({str(Path(role.data) / ("peer-link-" + suffix))!r})
+link.symlink_to({str(Path(other.data) / "marker")!r})
+denied('symlink_read', lambda: link.open('rb'))
 for name, path in {{'gateway_socket': {str(gateway_socket)!r}, 'daemon_socket': {str(daemon_socket)!r}}}.items():
     def connect(path=path):
         with socket.socket(socket.AF_UNIX) as sock:
@@ -336,9 +340,11 @@ def _run_probe(
                 params.get("threadId") == binding.thread_id
                 and params.get("turn", {}).get("id") == turn_id
             ):
+                assert params["turn"].get("status") == "completed"
                 completed = True
                 break
     assert completed, "official sandbox turn did not complete"
+    assert client.read_turn(binding.thread_id, turn_id) == "completed"
     assert mock.failure is None and mock.calls >= before + 2 and mock.sent
     result = Path(role.data) / f"result-{suffix}.json"
     assert result.exists(), (
@@ -368,6 +374,7 @@ def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree)
         check=True,
         timeout=5,
         env={"PATH": "/usr/bin:/bin"},
+        cwd=installation.path("base"),
         user=HARNESS_UID,
         group=HARNESS_UID,
         extra_groups=[BUSINESS_GID],
@@ -487,3 +494,31 @@ def test_installation_plan_is_inert_and_rejects_boundary_overlap():
         Installation("/opt/desk\nInjected=true", 26002, 26001, 26003, roles)
     with pytest.raises(ValueError):
         RoleInstallation("bad", "/opt/desk/bad", "/opt/desk/bad/.codex")
+
+
+def test_fixed_bridge_config_is_present_only_in_role_project_layers():
+    import tomllib
+
+    roles = (
+        RoleInstallation(
+            "operator", "/opt/desk/roles/operator", "/opt/desk/roles/operator/data"
+        ),
+        RoleInstallation(
+            "reviewer", "/opt/desk/roles/reviewer", "/opt/desk/roles/reviewer/data"
+        ),
+    )
+    installation = Installation("/opt/desk", 26002, 26001, 26003, roles)
+    plan = installation.plan(with_gateway_bridge=True)
+    base = tomllib.loads(plan["files"][0]["content"])
+    assert base["mcp_servers"]["deskd"]["enabled"] is False
+    for entry in plan["files"][1:]:
+        role = tomllib.loads(entry["content"])
+        transport = role["mcp_servers"]["deskd"]
+        assert transport == {
+            "command": "/opt/desk/bin/deskd-bridge",
+            "args": ["--socket", "/opt/desk/business/s", "--gateway-uid", "26001"],
+            "enabled": True,
+            "required": True,
+        }
+        assert entry["sha256"] == hashlib.sha256(entry["content"].encode()).hexdigest()
+    assert "deskd" not in tomllib.loads(installation.configuration())["mcp_servers"]

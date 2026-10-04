@@ -24,6 +24,14 @@ also renders a loopback-only provider when given `mock_port`; that provider is
 only for acceptance and has no API key. Rendering never reads an existing
 credential or user configuration.
 
+`plan(with_gateway_bridge=True)` renders a complete fixed stdio MCP transport
+for the protected `bin/deskd-bridge` wrapper: it is disabled in the base layer
+and enabled and required in each role's immutable project layer. A missing
+project layer therefore provides no bridge. The wrapper receives only the
+installation's fixed business socket and gateway UID. The CLI bundle renderer
+must supply this executable; the generic plan does not install it. Each emitted
+configuration includes its own SHA-256 for the manager's artifact checks.
+
 The generated profiles permit minimal system reads, their own role root and
 writes only to their own data. Other roles, harness state, gateway state, shared
 temporary state and daemon rendezvous paths are explicitly denied. Command
@@ -52,8 +60,8 @@ policy, sysctl, account or existing host service is changed.
 
 The acceptance checks two roots under the same harness UID, before and after
 restarting only its own daemon. Each role must write its own data while failing
-to read or write the other role, read a synthetic gateway secret, replace policy
-or a role ancestor, create a cross-role hardlink, connect to gateway/daemon Unix
+to read or write the other role, read a synthetic gateway secret, replace policy, create a shadow project configuration
+or replace a role ancestor, create a cross-role hardlink, connect to gateway/daemon Unix
 sockets, or reach the loopback model server from its shell. There is no
 unrestricted fallback. Missing kernel support, no actual shell invocation, a
 missing receipt, a failed check or a skipped test fails the privileged job.
