@@ -27,6 +27,7 @@ import pytest
 from deskd.workspace.installation import (
     Installation,
     OFFICIAL_LINUX_X64_SHA256,
+    OFFICIAL_BWRAP_SHA256,
     RoleInstallation,
 )
 
@@ -171,6 +172,13 @@ def runtime_tree():
         os.chmod(path, int(entry["mode"], 8))
     shutil.copyfile(binary, installation.binary)
     os.chmod(installation.binary, 0o755)
+    helper = root / "official/codex-resources/bwrap"
+    assert hashlib.sha256(helper.read_bytes()).hexdigest() == OFFICIAL_BWRAP_SHA256
+    resources = tree / "bin/codex-resources"
+    resources.mkdir()
+    resources.chmod(0o755)
+    shutil.copyfile(helper, resources / "bwrap")
+    (resources / "bwrap").chmod(0o755)
     for role in roles:
         marker = Path(role.data) / "marker"
         marker.write_text("SYNTHETIC-ROLE-MARKER")

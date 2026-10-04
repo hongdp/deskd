@@ -94,6 +94,19 @@ jobs:
           with destination.open("xb") as output:
               output.write(data)
           destination.chmod(0o755)
+          with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+              member = archive.getmember("package/vendor/x86_64-unknown-linux-musl/codex-resources/bwrap")
+              if not member.isfile() or member.size > 2 * 1024 * 1024:
+                  raise SystemExit("Unexpected official bubblewrap member")
+              helper = archive.extractfile(member).read()
+          if hashlib.sha256(helper).hexdigest() != "01fb705f067bd5365b63d8ad2323a61c8d007733ca5e649437e086f3fb9935d8":
+              raise SystemExit("Official bubblewrap integrity mismatch")
+          resources = destination.parent / "codex-resources"
+          resources.mkdir(mode=0o755)
+          resources.chmod(0o755)
+          with (resources / "bwrap").open("xb") as output:
+              output.write(helper)
+          (resources / "bwrap").chmod(0o755)
           print("Verified official Codex 0.160.0 Linux x64 artifact.")
           FETCH_OFFICIAL
           cd "$workspace"

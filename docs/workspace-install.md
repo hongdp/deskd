@@ -4,7 +4,11 @@ The workspace installation planner produces an **inert plan** for the official
 Codex 0.160.0 Linux x64 executable. It creates no users, copies no credentials,
 changes no services and starts no daemon. It pins the executable SHA-256 to
 `12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad`.
-The npm archive integrity is independently fixed in the isolation workflow.
+The bundled bubblewrap helper is pinned to SHA-256
+`01fb705f067bd5365b63d8ad2323a61c8d007733ca5e649437e086f3fb9935d8`.
+Both executables come from the same npm archive, whose SHA-512 integrity is
+independently fixed in the isolation workflow. Copying the Codex executable
+alone is insufficient: keep the helper at `bin/codex-resources/bwrap`.
 
 An administrator owns the installation prefix, executable, role roots and their
 `.codex` policy directories. Only each role's `data` child is writable. The
@@ -35,7 +39,8 @@ configuration includes its own SHA-256 for the manager's artifact checks.
 The generated profiles permit minimal system reads, their own role root and
 writes only to their own data. Other roles, harness state, gateway state, shared
 temporary state and daemon rendezvous paths are explicitly denied. Command
-networking is disabled. Browser/computer integration, plugins, apps, model
+networking is disabled. Shells inherit no parent environment except an explicit
+`PATH`; model-provider configuration stays in the trusted harness. Browser/computer integration, plugins, apps, model
 discovery, nested agents, shell snapshots, JavaScript REPL and code mode are
 turned off in the baseline. The `codex_tui` namespace is reserved with a disabled
 stub. Enabling any of those execution surfaces needs its own isolation review.
@@ -62,7 +67,10 @@ The acceptance checks two roots under the same harness UID, before and after
 restarting only its own daemon. Each role must write its own data while failing
 to read or write the other role, read a synthetic gateway secret, replace policy, create a shadow project configuration
 or replace a role ancestor, create a cross-role hardlink, connect to gateway/daemon Unix
-sockets, or reach the loopback model server from its shell. There is no
+sockets, or reach the loopback model server from its shell. It also checks synthetic
+harness/temp markers, non-inheritance of a synthetic parent environment marker
+and denial of opening only its own newly created daemon’s `/proc/.../environ`;
+it never reads an existing process environment. There is no
 unrestricted fallback. Missing kernel support, no actual shell invocation, a
 missing receipt, a failed check or a skipped test fails the privileged job.
 
