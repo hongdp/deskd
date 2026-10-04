@@ -1,5 +1,9 @@
 # Gateway foundation
 
+This page describes the storage and authorization primitives. The next
+[local workflow](local-workflow.md) adds a runnable mock demonstration and
+memo-only transport without changing their transaction contract.
+
 This is an experimental library stage of deskd's overlay work. It adds no
 installed service, network listener, model call, broker adapter, or trading
 command. The existing 0.4.x CLI and coordination database keep their behavior.

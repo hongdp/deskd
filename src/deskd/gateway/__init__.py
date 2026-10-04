@@ -1,13 +1,14 @@
-"""Experimental, credential-free gateway building blocks.
+"""Experimental, credential-free gateway and local memo workflow.
 
-These modules are internal primitives, not a network service or an installed
-security boundary. They require explicit database paths and do not register
-tools, start processes, read credentials, or connect to a broker. Existing
-deskd configuration, CLI commands, and coordination databases are unchanged.
+Importing this package does not load host configuration, start services, read
+credentials, or connect to a broker. Explicit ``python -m deskd.gateway``
+commands offer a mock demo, metadata preflight, memo-only Unix service and
+fixed stdio bridge. Existing deskd entry points and databases are unchanged.
 
 ``registry`` owns binding and channel authorization state. ``events`` owns
 transactional command receipts, an outbox, and independent consumer receipts.
 ``commands`` composes authorization with fixed handlers in one local transaction.
-Transport authentication and controller isolation must be implemented and
-validated before these primitives can guard real capabilities.
+``transport`` authenticates Linux peer credentials and separates administration
+from business calls. Full official-harness sandbox and controller lifecycle
+acceptance remain required before guarding credentials or external effects.
 """
