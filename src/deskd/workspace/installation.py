@@ -144,7 +144,9 @@ class Installation:
             # a marker the official loader stops at cwd and never sees it.
             # Reuse protected metadata: a new arbitrary marker in writable data
             # could redirect project discovery away from the trusted policy.
-            'project_root_markers = [".codex"]',
+            # Require the policy file, not the empty metadata mount targets
+            # temporarily created by the official sandbox during tool setup.
+            'project_root_markers = [".codex/config.toml"]',
             f"model = {_quote(model)}",
         ]
         if provider == "api":
@@ -152,6 +154,9 @@ class Installation:
         elif mock_port is not None:
             lines.append('model_provider = "deskd_mock"')
         lines += [
+            "[memories]",
+            "generate_memories = false",
+            "use_memories = false",
             "[shell_environment_policy]",
             'inherit = "none"',
             'set = { PATH = "/usr/bin:/bin" }',
@@ -162,6 +167,9 @@ class Installation:
             "apps = false",
             "hooks = false",
             "image_generation = false",
+            "goals = false",
+            "memories = false",
+            "external_agent_memory_import = false",
             "browser_use = false",
             "computer_use = false",
             "remote_models = false",

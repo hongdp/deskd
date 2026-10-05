@@ -161,14 +161,15 @@ is in `workspace/service.py` and `workspace/store.py`.
 
 An administrator owns the prefix, executables, role roots and `.codex` policy
 layers. Only each role's `data` child is writable. Roles share the harness UID;
-the official project loader uses `.codex` as its root marker, so a thread whose
+the official project loader uses `.codex/config.toml` as its root marker, so a thread whose
 working directory is `data` loads the protected parent policy. The native sandbox
 also prevents creating a shadow `.codex` directory in writable data.
-roles use separate named permissions with their own writable data, minimal system
+Roles use separate named permissions with their own writable data, minimal system
 reads, no shell network and explicit denial of peer roles, management, gateway,
 harness state and shared temporary state. Shells inherit no parent environment
 except an explicit `PATH`. Browser/computer integration, plugins, apps, model
-discovery, nested agents, hooks, hosted image generation, shell snapshots,
+discovery, nested agents, hooks, hosted image generation, automatic goals,
+shared memory generation/import, shell snapshots,
 JavaScript REPL and code mode are off.
 Enabling another execution surface requires its own isolation acceptance.
 

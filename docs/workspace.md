@@ -58,6 +58,9 @@ snapshot as a live observation only after both requests succeed. Either gateway
 fencing or an inactive workspace is shown as fenced; a failed check or lost
 connection returns unavailable and marks the previous display as stale. A live
 observation describes the most recent poll, not a continuous health guarantee.
+Seat states describe scheduled dispatches. An administrator's native terminal
+turn is not included in this ledger state, so `idle` does not prove that no model
+turn is running.
 The HTTP interface remains read-only and exposes only public status fields; it
 does not request model credentials, display private contents or grant authority.
 
@@ -115,9 +118,11 @@ python -m deskd.workspace control --socket /opt/deskd/admin/s --gateway-uid 2600
 
 `workspace.status` returns the current versioned state. `workspace.pause` takes
 `principal`, `paused` and `expected_version`; it stops new scheduled wakes, while
-an already running turn may finish. `workspace.budget` sets a lifetime turn-start
-budget with a version check. This budget is not token, dollar or calendar-day
-accounting, and resets only through an explicit management action.
+an already running turn may finish. `workspace.budget` limits lifetime
+scheduler-initiated turn starts, with a version check. Administrator-initiated
+native terminal turns are not counted. This is not a hard limit on all inference,
+tokens, dollars or calendar-day spending; it changes only through an explicit
+management action.
 `workspace.revoke` takes `principal`, `expected_binding_generation` and
 `expected_version`. It removes gateway authority first, then disables scheduling;
 an interrupted operation can only be repaired toward the revoked state. Revoked
@@ -153,7 +158,8 @@ without repository credentials in the root test environment. The official
 runtime archive, executable and bundled sandbox helper are hash-pinned.
 
 The supported role configuration disables optional execution surfaces such as
-plugins, apps, hooks, hosted image generation, browser/computer tools, JS REPL,
+plugins, apps, hooks, hosted image generation, automatic goals, shared memory
+generation/import, browser/computer tools, JS REPL,
 Code Mode and same-tree helpers.
 Adding one changes the trusted computing base and requires its own isolation
 acceptance. The kernel, the pinned interpreter and its standard library, the

@@ -33,11 +33,15 @@ def test_fixed_profiles_disable_hook_discovery_and_hosted_image_generation(provi
     }
     features = configs["/synthetic/deskd/harness/config.toml"]["features"]
     base = configs["/synthetic/deskd/harness/config.toml"]
-    assert base["project_root_markers"] == [".codex"]
+    assert base["project_root_markers"] == [".codex/config.toml"]
+    assert base["memories"] == {"generate_memories": False, "use_memories": False}
     for role in installation.roles:
         assert base["projects"][role.root]["trust_level"] == "trusted"
     assert features["hooks"] is False
     assert features["image_generation"] is False
+    assert features["goals"] is False
+    assert features["memories"] is False
+    assert features["external_agent_memory_import"] is False
     assert features["plugins"] is False and features["apps"] is False
     # Role layers cannot re-enable these surfaces. Image reading remains a
     # separate native capability whose filesystem path is tested by real CI.
