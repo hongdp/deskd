@@ -179,6 +179,10 @@ class Installation:
             for old, new in OFFICIAL_MODEL_MIGRATIONS.items()
         ]
         lines += [
+            # The official terminal otherwise persists this first-run flag even
+            # when Linux screen-reader detection returns false.
+            "[tui]",
+            "screen_reader_detection_done = true",
             "[memories]",
             "generate_memories = false",
             "use_memories = false",

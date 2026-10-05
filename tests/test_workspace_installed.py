@@ -480,6 +480,7 @@ def _native_attach(deployment, manager, mock, roots):
         while time.monotonic() < deadline and process.poll() is None:
             read_terminal()
         assert process.poll() == 0, "native /quit did not exit cleanly"
+        deployment.attest()
         assert manager.pids["daemon"] == daemon_pid and mock.calls == before_calls
         assert json.loads(deployment.roots_path.read_text()) == roots
         assert deployment.admin("workspace.status")["result"]["service"]["active"]
@@ -783,6 +784,10 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
             after = tomllib.loads(config_path.read_text())
 
             def changed_keys(left, right, stem=""):
+                if left is None and isinstance(right, dict):
+                    left = {}
+                if right is None and isinstance(left, dict):
+                    right = {}
                 if isinstance(left, dict) and isinstance(right, dict):
                     return [
                         key

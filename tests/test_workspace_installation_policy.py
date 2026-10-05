@@ -54,6 +54,7 @@ def test_fixed_profiles_disable_hook_discovery_and_hosted_image_generation(provi
     expected_reads = {"inbox.read", "tasks.read", "workspace.receipt"}
     assert base["approval_policy"] == "never"
     assert base["model"] == "gpt-5.5"
+    assert base["tui"] == {"screen_reader_detection_done": True}
     assert base["notice"]["model_migrations"] == {
         "gpt-5.6-sol": "gpt-6-sol",
         "gpt-5.6-terra": "gpt-6-sol",
