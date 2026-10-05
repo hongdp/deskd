@@ -15,7 +15,7 @@ import threading
 from deskd.gateway.actions import MemoWorkflow, WORKFLOW_ACTIONS
 from deskd.gateway.commands import GatewayCommands
 from deskd.gateway.events import GatewayEventStore
-from deskd.gateway.identity import ActionPolicy, IdentityError, PrincipalId
+from deskd.gateway.identity import ActionPolicy, IdentityError, PrincipalId, identifier
 from deskd.gateway.registry import Registry
 from deskd.gateway.transport import GatewayTransport
 from .exchange import ACTIONS, WorkspaceExchange
@@ -221,6 +221,127 @@ class WorkspaceGateway:
             self._fields(params, ())
             return self.store.snapshot()
 
+        def console_snapshot(params):
+            self._fields(params, ())
+            result = self.store.console_snapshot()
+            observed = {row["principal"]: row for row in bindings({})}
+            for seat in result["seats"]:
+                binding = observed.get(seat["principal"], {})
+                seat["capabilities"] = binding.get("capabilities", [])
+                seat["binding_status"] = binding.get("status", "unknown")
+            workflow = self.memos.summary(limit=101)
+            fields = {
+                "proposals": (
+                    "proposal_id", "desk_id", "author_principal", "executor_principal",
+                    "body", "body_sha256", "created_at", "status",
+                ),
+                "approvals": (
+                    "approval_id", "proposal_id", "issuer_principal", "executor_principal",
+                    "body_sha256", "issued_at", "expires_at", "status", "revoked_by",
+                    "revoked_at", "consumed_at",
+                ),
+                "memos": (
+                    "memo_id", "proposal_id", "approval_id", "author_principal",
+                    "issuer_principal", "executor_principal", "body", "body_sha256",
+                    "published_at",
+                ),
+            }
+            for name, allowed in fields.items():
+                result[name] = [
+                    {key: row[key] for key in allowed if key in row}
+                    for row in workflow[name][:100]
+                ]
+                result["truncated"][name] = len(workflow[name]) > 100
+            # A bounded management response containing whole records. Long
+            # prose is never silently cut mid-result. Flags explicitly report
+            # both row-count and byte-limit omissions to the operator UI.
+            sections = ("tasks", "messages", "events", "proposals", "approvals", "memos")
+
+            def size(value):
+                return len(json.dumps(
+                    value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8"))
+
+            sizes = {name: [size(row) for row in result[name]] for name in sections}
+            total = size(result)
+            while total > 768 * 1024:
+                candidates = [
+                    name for name in sections if result[name] and not (
+                        name == "messages" and len(result[name]) == 1
+                        and result[name][0].get("state") == "unread"
+                    )
+                ]
+                if not candidates:
+                    raise WorkspaceError("console_snapshot_too_large")
+                name = max(candidates, key=lambda key: sum(sizes[key]))
+                result[name].pop()
+                total -= sizes[name].pop() + bool(result[name])
+                result["truncated"][name] = True
+            return result
+
+        def console_task(params):
+            self._fields(params, ("assignee", "title", "body", "request_id"))
+            return self.store.trusted_add_task(
+                params["assignee"], params["title"], params["body"],
+                request_id=params["request_id"],
+            )
+
+        def console_cancel(params):
+            self._fields(params, ("task_id", "expected_version"))
+            return self.store.trusted_cancel_task(
+                params["task_id"], expected_version=params["expected_version"]
+            )
+
+        def console_read(params):
+            self._fields(params, ("message_ids",))
+            return self.store.trusted_read_messages(params["message_ids"])
+
+        def console_review(params):
+            self._fields(params, ("proposal_id", "body_sha256", "reviewer", "request_id"))
+            proposal_id = identifier(params["proposal_id"], "proposal_id")
+            reviewer = params["reviewer"]
+            if type(reviewer) is not str or reviewer.count("/") != 1:
+                raise IdentityError("invalid_reviewer")
+            identity = PrincipalId(*reviewer.split("/"))
+            old = self.store.trusted_review_receipt(
+                reviewer, proposal_id, params["body_sha256"], request_id=params["request_id"]
+            )
+            if old is not None:
+                # Observing a receipt grants nothing. A later execution or
+                # revocation must not turn a lost response into duplicate work.
+                return old
+            with sqlite3.connect(
+                self.registry.db_path.as_uri() + "?mode=ro", uri=True
+            ) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("BEGIN")
+                proposal = conn.execute(
+                    "SELECT p.desk_id,p.executor_principal,p.body,p.body_sha256, "
+                    "EXISTS(SELECT 1 FROM memo_published m WHERE m.proposal_id=p.proposal_id) AS executed "
+                    "FROM memo_proposals p WHERE p.proposal_id=?", (proposal_id,),
+                ).fetchone()
+                candidate = conn.execute(
+                    "SELECT status,capabilities FROM bindings WHERE principal=?", (reviewer,),
+                ).fetchone()
+            if proposal is None:
+                raise IdentityError("proposal_not_found")
+            if params["body_sha256"] != proposal["body_sha256"]:
+                raise IdentityError("proposal_content_mismatch")
+            if proposal["executed"]:
+                raise IdentityError("proposal_already_executed")
+            if reviewer == proposal["executor_principal"]:
+                raise IdentityError("independent_reviewer_required")
+            if (
+                identity.desk_id != proposal["desk_id"]
+                or candidate is None or candidate["status"] != "bound"
+                or "approval.issue" not in json.loads(candidate["capabilities"])
+            ):
+                raise IdentityError("reviewer_not_authorized")
+            return self.store.trusted_review_request(
+                reviewer, proposal_id, proposal["body_sha256"], proposal["body"],
+                request_id=params["request_id"],
+            )
+
         def pause(params):
             self._fields(params, ("principal", "paused", "expected_version"))
             return self.store.set_paused(
@@ -305,6 +426,12 @@ class WorkspaceGateway:
 
         return {
             "workspace.status": guarded(status),
+            "workspace.console.snapshot": guarded(console_snapshot),
+            "workspace.console.task": guarded(console_task),
+            "workspace.console.message": guarded(enqueue),
+            "workspace.console.cancel": guarded(console_cancel),
+            "workspace.console.read": guarded(console_read),
+            "workspace.console.review": guarded(console_review),
             "workspace.pause": guarded(pause),
             "workspace.enqueue": guarded(enqueue),
             "workspace.budget": guarded(budget),

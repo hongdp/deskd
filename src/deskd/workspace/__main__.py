@@ -30,6 +30,11 @@ def main(argv=None):
         "--deployment", type=Path, help="observe the installed gateway and workspace"
     )
     board.add_argument("--port", type=int, default=0)
+    console = sub.add_parser("console", help="paired human workspace: tasks, correspondence and results")
+    console_source = console.add_mutually_exclusive_group(required=True)
+    console_source.add_argument("--deployment", type=Path, help="protected installed workspace")
+    console_source.add_argument("--demo", type=Path, help="new scratchpad directory for a synthetic interactive demo")
+    console.add_argument("--port", type=int, default=0)
     control = sub.add_parser(
         "control", help="independent administrative socket request"
     )
@@ -144,6 +149,24 @@ def main(argv=None):
                 server.serve_forever(poll_interval=0.2)
             finally:
                 server.server_close()
+        elif args.command == "console":
+            from .console import ConsoleBackend, serve_console
+
+            if args.deployment is not None:
+                from .deployment import Deployment
+
+                installation = Deployment(args.deployment)
+                installation.attest_console()
+                backend = ConsoleBackend(
+                    installation.admin,
+                    attest=installation.attest_console,
+                    static_root=installation.prefix / "lib/deskd/workspace/static",
+                )
+            else:
+                from .console_demo import create_demo
+
+                backend = create_demo(args.demo)
+            serve_console(backend, port=args.port)
         elif args.command == "demo":
             from .demo import run_demo
 

@@ -26,6 +26,7 @@ from .installation import (
     RoleInstallation,
     OFFICIAL_LINUX_X64_SHA256,
     OFFICIAL_BWRAP_SHA256,
+    CONSOLE_ASSETS,
 )
 
 
@@ -49,6 +50,43 @@ def _json_write(path, value):
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+
+
+def _copy_package(package, library, inventory):
+    """Copy only executable modules and the three fixed console assets.
+
+    Every copied file belongs to the protected installation inventory. A new
+    file appearing in a source static directory is not implicitly published.
+    """
+    relative_paths = (
+        Path("__init__.py"),
+        Path("config.py"),
+        *[
+            p.relative_to(package)
+            for folder in ("gateway", "workspace")
+            for p in sorted((package / folder).glob("*.py"))
+        ],
+        *[Path("workspace/static") / name for name in CONSOLE_ASSETS],
+    )
+    for relative in relative_paths:
+        source = package / relative
+        for part in (source, *source.parents):
+            if part == package:
+                break
+            if part.is_symlink():
+                raise ValueError("untrusted_package_symlink")
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError("invalid_package_artifact")
+            contents = stream.read()
+        target = library / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for parent in (library, target.parent):
+            parent.chmod(0o755)
+        target.write_bytes(contents)
+        target.chmod(0o644)
+        inventory[str(target)] = hashlib.sha256(contents).hexdigest()
 
 
 def install(
@@ -167,25 +205,7 @@ def install(
     bwrap.chmod(0o755)
     inventory[str(bwrap)] = OFFICIAL_BWRAP_SHA256
     package = Path(__file__).resolve().parents[1]
-    for relative in (
-        Path("__init__.py"),
-        Path("config.py"),
-        *[
-            p.relative_to(package)
-            for folder in ("gateway", "workspace")
-            for p in sorted((package / folder).glob("*.py"))
-        ],
-    ):
-        source = package / relative
-        if source.is_symlink():
-            raise ValueError("untrusted_package_symlink")
-        target = prefix / "lib/deskd" / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        for parent in (prefix / "lib/deskd", target.parent):
-            parent.chmod(0o755)
-        target.write_bytes(source.read_bytes())
-        target.chmod(0o644)
-        inventory[str(target)] = hashlib.sha256(target.read_bytes()).hexdigest()
+    _copy_package(package, prefix / "lib/deskd", inventory)
     wrapper = (
         f"#!{python} -I\nimport sys\nsys.dont_write_bytecode = True\nsys.path.insert(0, "
         + repr(str(prefix / "lib"))
@@ -254,6 +274,20 @@ class Deployment:
         self.business_path = self.prefix / "business/s"
         self.roots_path = self.prefix / "policy/roots.json"
         self._verified = {}
+
+    def attest_console(self):
+        """Require the pinned UI only when starting its private control surface.
+
+        Older installations can still use their existing observer and runtime;
+        they cannot silently start a new console from untracked local assets.
+        """
+        assets = self.prefix / "lib/deskd/workspace/static"
+        if any(
+            str(assets / name) not in self.value["inventory"]
+            for name in CONSOLE_ASSETS
+        ):
+            raise ValueError("console_assets_not_installed")
+        self.attest()
 
     def attest(self, *, gateway_only=False):
         python_pin = self.value["python"]

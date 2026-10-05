@@ -19,6 +19,55 @@ from deskd.workspace import deployment
 from deskd.workspace.installation import Installation, RoleInstallation
 
 
+@pytest.fixture
+def console_package(tmp_path):
+    package = tmp_path / "source"
+    static = package / "workspace/static"
+    static.mkdir(parents=True)
+    (package / "gateway").mkdir()
+    for relative in ("__init__.py", "config.py", "workspace/console.py"):
+        (package / relative).write_text("# synthetic package\n")
+    for name in deployment.CONSOLE_ASSETS:
+        (static / name).write_text("synthetic console asset: " + name)
+    return package
+
+
+def test_console_install_copies_only_fixed_assets_and_pins_their_contents(
+    console_package, tmp_path
+):
+    library = tmp_path / "installed/deskd"
+    (console_package / "workspace/static/unlisted.txt").write_text("not published")
+    inventory = {}
+    deployment._copy_package(console_package, library, inventory)
+    assert not (library / "workspace/static/unlisted.txt").exists()
+    for name in deployment.CONSOLE_ASSETS:
+        source = console_package / "workspace/static" / name
+        target = library / "workspace/static" / name
+        assert target.read_bytes() == source.read_bytes()
+        assert inventory[str(target)] == hashlib.sha256(target.read_bytes()).hexdigest()
+        assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    assert stat.S_IMODE((library / "workspace/static").stat().st_mode) == 0o755
+
+
+@pytest.mark.parametrize("linked_directory", [False, True])
+def test_console_install_rejects_symlinked_assets_or_parent(
+    console_package, tmp_path, linked_directory
+):
+    static = console_package / "workspace/static"
+    if linked_directory:
+        target = tmp_path / "synthetic-static"
+        static.rename(target)
+        static.symlink_to(target, target_is_directory=True)
+    else:
+        target = tmp_path / "synthetic-asset"
+        target.write_text("never copied")
+        (static / "console.js").unlink()
+        (static / "console.js").symlink_to(target)
+    with pytest.raises(ValueError, match="untrusted_package_symlink"):
+        deployment._copy_package(console_package, tmp_path / "installed/deskd", {})
+    assert not (tmp_path / "installed/deskd/workspace/static/console.js").exists()
+
+
 def test_json_manifest_is_exclusive_and_readable_with_restrictive_umask(tmp_path):
     path = tmp_path / "manifest.json"
     previous = os.umask(0o077)
@@ -162,6 +211,20 @@ def test_changed_deployment_manifest_invalidates_attestation(declared):
     instance.path.write_text(json.dumps(value))
     with pytest.raises(ValueError, match="deployment_changed"):
         instance.attest()
+
+
+def test_console_requires_installed_assets_before_attesting(declared, monkeypatch):
+    instance, _, _ = declared
+    calls = []
+    monkeypatch.setattr(instance, "attest", lambda: calls.append("attested"))
+    with pytest.raises(ValueError, match="console_assets_not_installed"):
+        instance.attest_console()
+    assert calls == []
+    for name in deployment.CONSOLE_ASSETS:
+        path = instance.prefix / "lib/deskd/workspace/static" / name
+        instance.value["inventory"][str(path)] = "a" * 64
+    instance.attest_console()
+    assert calls == ["attested"]
 
 
 @pytest.fixture
