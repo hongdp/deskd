@@ -118,11 +118,6 @@ initial screen-reader check so opening the terminal does not rewrite its atteste
 configuration. Changing the installed model or policy through terminal settings
 can fence the workspace; make such changes through a reviewed installation update.
 
-The installation keeps the administrator-selected model fixed and suppresses
-the pinned runtime's model migration notices. Changing a role's model or
-permissions requires an updated managed installation; an unexpected terminal
-settings change fences the workspace.
-
 Run the read-only board in another administrator terminal:
 
 ```sh
@@ -189,17 +184,14 @@ Enabling another execution surface requires its own isolation acceptance.
 
 The gateway runs under a distinct UID. Its approved MCP bridge operates outside
 the role shell sandbox and is bound to an attested root by the controller; role
-shells cannot directly open business/control sockets. Protected configuration
-exposes a fixed set of eleven deskd tools and preapproves only its eight write
-verbs at the harness layer. The gateway still checks identity, permissions and
-independent action authorization for every call. The official daemon and
+shells cannot directly open business/control sockets. The official daemon and
 administrator controller remain trusted. In particular, the daemon's writable
 `CODEX_HOME` means the trusted harness can replace its root-owned base config;
 roles cannot access it. Artifact and active-root checks are repeated during
 recovery before leases are granted. These checks are not a defense against a
 compromised administrator or malicious replacement of the trusted runtime.
 
-The protected MCP configuration enables only the fixed deskd tool catalogue.
+The protected MCP configuration enables only the eleven fixed deskd tools.
 Its eight write verbs have explicit harness approval settings because their
 authorization is enforced by the gateway. Every call still requires an attested
 role connection and capability; publishing a memo also requires another stable
