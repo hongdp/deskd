@@ -155,6 +155,8 @@ class Installation:
             "[features]",
             "plugins = false",
             "apps = false",
+            "hooks = false",
+            "image_generation = false",
             "browser_use = false",
             "computer_use = false",
             "remote_models = false",

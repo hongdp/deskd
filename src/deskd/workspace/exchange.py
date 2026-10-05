@@ -10,6 +10,7 @@ from __future__ import annotations
 from deskd.gateway.actions import tool_catalog as memo_catalog
 from deskd.gateway.commands import CommandHandler
 from deskd.gateway.identity import ActionPolicy, IdentityError, PrincipalId, identifier
+from deskd.workspace.store import WorkspaceError
 
 WRITE_FIELDS = {
     "mail.send": {"recipient", "body"},
@@ -102,15 +103,21 @@ class WorkspaceExchange:
         return {name: handler(name) for name in WRITE_FIELDS}
 
     def readers(self):
-        def inbox(identity, args):
-            if args:
-                raise IdentityError("invalid_read_arguments")
-            return {"messages": self.store.inbox(identity.principal.value)}
+        def page(method, fields):
+            def read(identity, args):
+                if type(args) is not dict or set(args) - fields:
+                    raise IdentityError("invalid_read_arguments")
+                # Null is an omitted cursor internally, but the public schema
+                # accepts only explicit strings, not loosely typed sentinels.
+                for key in ("cursor", "task_id"):
+                    if key in args and type(args[key]) is not str:
+                        raise IdentityError("invalid_" + key)
+                try:
+                    return method(identity.principal.value, **args)
+                except WorkspaceError as exc:
+                    raise IdentityError(exc.code) from None
 
-        def tasks(identity, args):
-            if args:
-                raise IdentityError("invalid_read_arguments")
-            return {"tasks": self.store.tasks(identity.principal.value)}
+            return read
 
         def receipt(identity, args):
             if set(args) != {"event_id"}:
@@ -121,7 +128,11 @@ class WorkspaceExchange:
             )
             return result if result is not None else {"status": "pending_or_unknown"}
 
-        return {"inbox.read": inbox, "tasks.read": tasks, "workspace.receipt": receipt}
+        return {
+            "inbox.read": page(self.store.inbox_page, {"cursor", "limit"}),
+            "tasks.read": page(self.store.tasks_page, {"cursor", "limit", "task_id"}),
+            "workspace.receipt": receipt,
+        }
 
     def pump(self, *, limit=100):
         """Retained outbox replay; the store owns per-event atomic receipts.
@@ -156,8 +167,15 @@ def tool_catalog():
             "status": {"enum": ["active", "blocked", "done", "cancelled"]},
             "expected_version": {"type": "integer", "minimum": 1},
         },
-        "inbox.read": {},
-        "tasks.read": {},
+        "inbox.read": {
+            "cursor": {"type": "string", "maxLength": 1024},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        },
+        "tasks.read": {
+            "cursor": {"type": "string", "maxLength": 1024},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "task_id": string,
+        },
         "workspace.receipt": {"event_id": string},
     }
     descriptions = {
@@ -165,8 +183,8 @@ def tool_catalog():
         "inbox.ack": "Explicitly acknowledge messages handled by your authenticated seat.",
         "task.create": "Queue a task for a seat with optional existing dependency IDs.",
         "task.update": "Request a version-checked update to a task you own or were assigned.",
-        "inbox.read": "Read only your authenticated seat's inbox.",
-        "tasks.read": "Read only tasks you own or were assigned.",
+        "inbox.read": "Read a complete-body page of your unhandled inbox in arrival order. Follow next_cursor while has_more; omit cursor to revisit messages. Reading is not an acknowledgment.",
+        "tasks.read": "Read a complete-body page of tasks you own or were assigned, in creation order. Follow next_cursor while has_more, or pass task_id without cursor for one task.",
         "workspace.receipt": "Read the applied or rejected result of your own queued collaboration intent.",
     }
     result = memo_catalog()
@@ -177,7 +195,9 @@ def tool_catalog():
             "inputSchema": {
                 "type": "object",
                 "properties": properties,
-                "required": list(properties),
+                "required": []
+                if name in {"inbox.read", "tasks.read"}
+                else list(properties),
                 "additionalProperties": False,
             },
         }

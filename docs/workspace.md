@@ -84,6 +84,13 @@ is rejected. A gateway receipt for a collaboration command means **queued**;
 read its projection receipt to obtain the task ID or rejection. Neither receipt
 means the recipient model has handled the work.
 
+Inbox and task reads return `has_more` and `next_cursor`. Pass that cursor to
+read the next page; `limit` can reduce a page. Pages preserve full message/task
+bodies and stay within the wire budget. `tasks.read` also accepts `task_id` for
+work referenced by an event. Cursors are tied to the authenticated principal
+and resource type; acknowledgments and newly arriving work do not change the
+meaning of an existing position.
+
 Delivery states are distinct: `queued`, `delivering`, `delivered`, `handled` and
 `unknown`. An acknowledged turn does not acknowledge its inbox. Only an explicit
 recipient `inbox.ack` marks a message handled. New messages arriving during a turn
@@ -146,7 +153,8 @@ without repository credentials in the root test environment. The official
 runtime archive, executable and bundled sandbox helper are hash-pinned.
 
 The supported role configuration disables optional execution surfaces such as
-plugins, apps, browser/computer tools, JS REPL, Code Mode and same-tree helpers.
+plugins, apps, hooks, hosted image generation, browser/computer tools, JS REPL,
+Code Mode and same-tree helpers.
 Adding one changes the trusted computing base and requires its own isolation
 acceptance. The kernel, the pinned interpreter and its standard library, the
 official runtime, the fixed bridge, coordination service and lifecycle controller

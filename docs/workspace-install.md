@@ -165,7 +165,8 @@ use separate named permissions with their own writable data, minimal system
 reads, no shell network and explicit denial of peer roles, management, gateway,
 harness state and shared temporary state. Shells inherit no parent environment
 except an explicit `PATH`. Browser/computer integration, plugins, apps, model
-discovery, nested agents, shell snapshots, JavaScript REPL and code mode are off.
+discovery, nested agents, hooks, hosted image generation, shell snapshots,
+JavaScript REPL and code mode are off.
 Enabling another execution surface requires its own isolation acceptance.
 
 The gateway runs under a distinct UID. Its approved MCP bridge operates outside

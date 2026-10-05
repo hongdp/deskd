@@ -162,7 +162,9 @@ def test_business_read_is_identity_scoped_and_rechecks_revocation(exchange):
     outbox.pump()
     accepted = SimpleNamespace(evidence=peers["operator"], requested_root=None)
     assert transport._business_call("read", request("inbox.read", {}), accepted) == {
-        "messages": []
+        "messages": [],
+        "has_more": False,
+        "next_cursor": None,
     }
     accepted = SimpleNamespace(evidence=peers["reviewer"], requested_root=None)
     result = transport._business_call(

@@ -59,10 +59,12 @@ def _tool(tools, action):
     expected = re.sub(r"[^a-z0-9]", "", action)
     for entry in tools:
         if entry.get("type") == "namespace":
-            if "deskd" in entry.get("name", ""):
-                for tool in entry.get("tools", []):
-                    if re.sub(r"[^a-z0-9]", "", tool.get("name", "")) == expected:
-                        return entry["name"], tool["name"]
+            for tool in entry.get("tools", []):
+                name = tool.get("name", "")
+                if ("deskd" in entry.get("name", "") or "deskd" in name) and re.sub(
+                    r"[^a-z0-9]", "", name.rsplit("__", 1)[-1]
+                ) == expected:
+                    return entry["name"], name
         elif "deskd" in entry.get("name", ""):
             name = entry["name"]
             if re.sub(r"[^a-z0-9]", "", name.rsplit("__", 1)[-1]) == expected:
@@ -125,7 +127,7 @@ class CollaborationMock:
                 except Exception as exc:
                     # Every string here comes from this synthetic fixture. No request
                     # body, authorization header, or inherited environment is printed.
-                    owner.failure = type(exc).__name__ + ": " + str(exc)[:300]
+                    owner.failure = type(exc).__name__ + ": " + str(exc)[:2400]
                     self.send_error(500)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -233,6 +235,7 @@ class CollaborationMock:
                 "action": next(generator),
                 "waiting": None,
                 "searches": 0,
+                "discovered": [],
             }
         waiting = state["waiting"]
         if waiting:
@@ -243,7 +246,14 @@ class CollaborationMock:
                 and item.get("type") in ("function_call_output", "tool_search_output")
             ]
             assert outputs, "tool result must arrive before the next scripted step"
-            if waiting[1] != "search":
+            if waiting[1] == "search":
+                discovered = outputs[-1].get("tools")
+                assert isinstance(discovered, list) and len(discovered) <= 100, (
+                    "official tool search did not return bounded definitions"
+                )
+                assert all(isinstance(tool, dict) for tool in discovered)
+                state["discovered"].extend(discovered)
+            else:
                 result = _object(outputs[-1]["output"])
                 try:
                     state["action"] = state["generator"].send(result)
@@ -260,12 +270,28 @@ class CollaborationMock:
                         ],
                     }
         action, args = state["action"]
-        selected = _tool(body.get("tools", []), action)
+        advertised = [*body.get("tools", []), *state["discovered"]]
+        selected = _tool(advertised, action)
         call_id = f"synthetic-{self.calls}"
         if selected is None:
             state["searches"] += 1
             assert state["searches"] <= 2, (
-                "mock deskd tool was not exposed after discovery"
+                "mock deskd tool was not exposed after discovery: "
+                + json.dumps(
+                    {
+                        "action": action,
+                        "catalog": [
+                            {
+                                "type": entry.get("type"),
+                                "name": entry.get("name"),
+                                "tools": [
+                                    tool.get("name") for tool in entry.get("tools", [])
+                                ],
+                            }
+                            for entry in advertised
+                        ],
+                    }
+                )[:2000]
             )
             state["waiting"] = (call_id, "search")
             return {
@@ -390,6 +416,7 @@ def _native_attach(deployment, manager, mock, roots):
                 break
         else:
             pytest.fail("native terminal did not display its ready composer")
+        status_offset = len(output)
         os.write(master, b"/status")
         # Let the native paste-burst guard settle before pressing Enter.
         time.sleep(0.15)
@@ -397,7 +424,11 @@ def _native_attach(deployment, manager, mock, roots):
         expected_root = roots["desk/analyst"]["root_id"].encode()
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if expected_root in read_terminal():
+            read_terminal()
+            status_output = re.sub(
+                rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", bytes(output[status_offset:])
+            )
+            if expected_root in status_output and b"Session" in status_output:
                 break
             assert process.poll() is None, "native terminal exited before /status"
         else:

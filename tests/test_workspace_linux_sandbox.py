@@ -16,11 +16,13 @@ import shlex
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import zlib
 
 import pytest
 
@@ -42,6 +44,9 @@ class ModelMock:
     def __init__(self):
         self.command = None
         self.patch = None
+        self.image_path = None
+        self.image_output = None
+        self.image_call_id = None
         self.sent = False
         self.calls = 0
         self.failure = None
@@ -62,7 +67,17 @@ class ModelMock:
                     ]
                     owner.calls += 1
                     if not owner.sent:
-                        if owner.patch is not None:
+                        if owner.image_path is not None:
+                            if "view_image" not in names:
+                                raise ValueError("expected official view_image tool")
+                            owner.image_call_id = f"image-probe-{owner.calls}"
+                            item = {
+                                "type": "function_call",
+                                "name": "view_image",
+                                "arguments": json.dumps({"path": owner.image_path}),
+                                "call_id": owner.image_call_id,
+                            }
+                        elif owner.patch is not None:
                             if "apply_patch" not in names:
                                 raise ValueError("expected official apply_patch tool")
                             item = {
@@ -88,6 +103,16 @@ class ModelMock:
                             }
                         owner.sent = True
                     else:
+                        if owner.image_path is not None:
+                            outputs = [
+                                value
+                                for value in body.get("input", [])
+                                if value.get("type") == "function_call_output"
+                                and value.get("call_id") == owner.image_call_id
+                            ]
+                            if len(outputs) != 1:
+                                raise ValueError("missing synthetic image result")
+                            owner.image_output = outputs[0]["output"]
                         item = {
                             "type": "message",
                             "role": "assistant",
@@ -195,6 +220,30 @@ def runtime_tree():
         marker.write_text("SYNTHETIC-ROLE-MARKER")
         os.chown(marker, HARNESS_UID, HARNESS_UID)
         os.chmod(marker, 0o600)
+
+        # One deterministic RGB pixel, constructed as PNG chunks using stdlib.
+        # This is test input, never a user image or a file from outside scratchpad.
+        def chunk(kind, data):
+            return (
+                struct.pack(">I", len(data))
+                + kind
+                + data
+                + struct.pack(">I", zlib.crc32(kind + data))
+            )
+
+        png = Path(role.data) / "synthetic.png"
+        png.write_bytes(
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\x00\x00\x80\xff"))
+            + chunk(b"IEND", b"")
+        )
+        os.chown(png, HARNESS_UID, HARNESS_UID)
+        png.chmod(0o600)
+    for i, role in enumerate(roles):
+        link = Path(role.data) / "synthetic-peer.png"
+        link.symlink_to(Path(roles[1 - i].data) / "synthetic.png")
+        os.lchown(link, HARNESS_UID, HARNESS_UID)
     for parent in ("harness", "tmp"):
         marker = tree / parent / "synthetic-private"
         marker.write_text("SYNTHETIC-PARENT-PRIVATE")
@@ -433,6 +482,55 @@ def _run_patch_probe(client, binding, role, other, mock, suffix):
     mock.patch = None
 
 
+def _run_image_probe(client, binding, role, other, mock, suffix):
+    def contains_image(value):
+        if isinstance(value, dict):
+            return value.get("type") in ("input_image", "image_url") or any(
+                contains_image(child) for child in value.values()
+            )
+        return isinstance(value, list) and any(contains_image(v) for v in value)
+
+    for index, (target, permitted) in enumerate(
+        (
+            (Path(role.data) / "synthetic.png", True),
+            (Path(other.data) / "synthetic.png", False),
+            (Path(role.data) / "synthetic-peer.png", False),
+        )
+    ):
+        mock.image_path = str(target)
+        mock.image_output = None
+        mock.sent = False
+        before = mock.calls
+        turn_id = client.start_turn(
+            binding.thread_id,
+            [{"event_id": f"image-{suffix}-{index}", "type": "test.image"}],
+        )
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            event = client.poll_event(timeout=1)
+            if event and event.get("method") == "turn/completed":
+                params = event.get("params", {})
+                if (
+                    params.get("threadId") == binding.thread_id
+                    and params.get("turn", {}).get("id") == turn_id
+                ):
+                    assert params["turn"]["status"] == "completed"
+                    break
+        else:
+            pytest.fail("official view_image turn did not complete")
+        assert client.read_turn(binding.thread_id, turn_id) == "completed"
+        assert mock.sent and mock.calls >= before + 2 and mock.failure is None
+        assert mock.image_output is not None
+        assert contains_image(mock.image_output) is permitted, (
+            "view_image did not enforce the expected synthetic image boundary"
+        )
+        if not permitted:
+            text = json.dumps(mock.image_output).lower()
+            assert any(word in text for word in ("error", "unable", "denied", "fail"))
+    mock.image_path = None
+    mock.image_output = None
+
+
 def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree):
     # Imported after the opt-in fixture: ordinary developer runs do not need a
     # daemon, privileges, a downloaded runtime, or network access.
@@ -509,6 +607,14 @@ def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree)
                 mock,
                 f"initial-{i}",
             )
+            _run_image_probe(
+                client,
+                bindings[i],
+                role,
+                installation.roles[1 - i],
+                mock,
+                f"initial-{i}",
+            )
     finally:
         client.close()
     proc.terminate()
@@ -537,6 +643,9 @@ def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree)
                 f"resumed-{i}",
             )
             _run_patch_probe(
+                client, resumed, role, installation.roles[1 - i], mock, f"resumed-{i}"
+            )
+            _run_image_probe(
                 client, resumed, role, installation.roles[1 - i], mock, f"resumed-{i}"
             )
     finally:

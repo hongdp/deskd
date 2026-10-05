@@ -8,6 +8,7 @@ authorization facts. It contains no credentials and grants no gateway authority.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -31,6 +32,11 @@ class WorkspaceError(ValueError):
 
 
 _APPLICATION_ID = 0x44535731
+# Normal pages leave ample room for the gateway and MCP envelopes. A single
+# legal 64 KiB body can expand sixfold under JSON escaping, so it gets a larger
+# singleton budget rather than silently losing part of the body.
+READ_PAGE_BYTES = 256 * 1024
+READ_SINGLE_ITEM_BYTES = 512 * 1024
 _SCHEMA = """
 CREATE TABLE service(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  generation TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0);
@@ -102,6 +108,63 @@ def _json(value: object) -> str:
         ensure_ascii=False,
         allow_nan=False,
     )
+
+
+def _read_cursor(kind: str, actor: str, item_id: int | str) -> str:
+    raw = canonical_json([1, kind, actor, item_id]).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _parse_read_cursor(cursor: object, kind: str, actor: str) -> int | str:
+    """Cursors are positions, never authority; scope and ownership are checked."""
+    if type(cursor) is not str or not 1 <= len(cursor) <= 1024:
+        raise WorkspaceError("invalid_cursor")
+    try:
+        raw = base64.b64decode(
+            cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True
+        )
+        value = json.loads(raw)
+        if (
+            type(value) is not list
+            or len(value) != 4
+            or type(value[0]) is not int
+            or value[:3] != [1, kind, actor]
+            or _read_cursor(kind, actor, value[3]) != cursor
+        ):
+            raise ValueError
+        item_id = value[3]
+        if kind == "inbox":
+            _integer(item_id, "cursor", 1, 2**63 - 1)
+        elif (
+            type(item_id) is not str
+            or len(item_id) != 32
+            or any(c not in "0123456789abcdef" for c in item_id)
+        ):
+            raise ValueError
+        return item_id
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise WorkspaceError("invalid_cursor") from None
+
+
+def _read_page(rows: list[dict], *, kind: str, actor: str, limit: int) -> dict:
+    key = "messages" if kind == "inbox" else "tasks"
+    page = {key: [], "has_more": False, "next_cursor": None}
+    for row in rows[:limit]:
+        candidate = {
+            key: [*page[key], row],
+            "has_more": True,
+            "next_cursor": _read_cursor(kind, actor, row["id"]),
+        }
+        size = len(canonical_json(candidate).encode("utf-8"))
+        if page[key] and size > READ_PAGE_BYTES:
+            break
+        if size > READ_SINGLE_ITEM_BYTES:
+            raise WorkspaceError("read_item_too_large")
+        page = candidate
+    if len(page[key]) == len(rows):
+        page["has_more"] = False
+        page["next_cursor"] = None
+    return page
 
 
 class WorkspaceStore:
@@ -554,6 +617,37 @@ class WorkspaceStore:
                     (actor, limit),
                 )
             ]
+
+    def inbox_page(
+        self, actor: str, *, cursor: str | None = None, limit: int = 100
+    ) -> dict:
+        """Read complete unhandled messages in stable insertion order.
+
+        ACKs do not invalidate a cursor. Each call sees current state, not a
+        frozen snapshot; restart without a cursor to revisit unhandled items.
+        The scheduler's priority ordering is independent of this read order.
+        """
+        _integer(limit, "limit", 1, 100)
+        after = 0 if cursor is None else _parse_read_cursor(cursor, "inbox", actor)
+        with self._connect() as conn:
+            self._seat(conn, actor)
+            if (
+                cursor is not None
+                and conn.execute(
+                    "SELECT 1 FROM messages WHERE recipient=? AND id=?", (actor, after)
+                ).fetchone()
+                is None
+            ):
+                raise WorkspaceError("invalid_cursor")
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM messages WHERE recipient=? AND state!='handled' "
+                    "AND id>? ORDER BY id LIMIT ?",
+                    (actor, after, limit + 1),
+                )
+            ]
+            return _read_page(rows, kind="inbox", actor=actor, limit=limit)
 
     def acknowledge(self, actor: str, ids: list[int]) -> dict:
         if not isinstance(ids, list) or len(ids) > 1000:
@@ -1058,6 +1152,52 @@ class WorkspaceStore:
                     (actor, actor),
                 )
             ]
+
+    def tasks_page(
+        self,
+        actor: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+        task_id: str | None = None,
+    ) -> dict:
+        """Read owned/assigned tasks, by insertion order or one explicit ID.
+
+        The cursor names an immutable task ID, resolved to its current insertion
+        position within each transaction. Tied or decreasing wall clocks cannot
+        reorder tasks. Rows remain retained even when tasks finish or cancel.
+        """
+        _integer(limit, "limit", 1, 100)
+        anchor = None if cursor is None else _parse_read_cursor(cursor, "tasks", actor)
+        if task_id is not None:
+            _text(task_id, "task_id")
+            if cursor is not None:
+                raise WorkspaceError("invalid_read_arguments")
+        with self._connect() as conn:
+            self._seat(conn, actor)
+            after = 0
+            if anchor is not None:
+                row = conn.execute(
+                    "SELECT rowid FROM tasks WHERE id=? AND (creator=? OR assignee=?)",
+                    (anchor, actor, actor),
+                ).fetchone()
+                if row is None:
+                    raise WorkspaceError("invalid_cursor")
+                after = row[0]
+            if task_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE id=? AND (creator=? OR assignee=?)",
+                    (task_id, actor, actor),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE (creator=? OR assignee=?) "
+                    "AND rowid>? ORDER BY rowid LIMIT ?",
+                    (actor, actor, after, limit + 1),
+                ).fetchall()
+            return _read_page(
+                [dict(row) for row in rows], kind="tasks", actor=actor, limit=limit
+            )
 
     def snapshot(self) -> dict:
         """Trusted local observer projection: metadata only, no messages or prose."""
