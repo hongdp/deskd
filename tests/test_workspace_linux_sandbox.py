@@ -732,7 +732,9 @@ def test_fixed_bridge_config_is_present_only_in_role_project_layers():
     for entry in plan["files"][1:]:
         role = tomllib.loads(entry["content"])
         transport = role["mcp_servers"]["deskd"]
-        assert transport == {
+        assert {
+            k: transport[k] for k in ("command", "args", "enabled", "required")
+        } == {
             "command": "/opt/desk/bin/deskd-bridge",
             "args": ["--socket", "/opt/desk/business/s", "--gateway-uid", "26001"],
             "enabled": True,

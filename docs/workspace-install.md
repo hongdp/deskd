@@ -183,6 +183,13 @@ roles cannot access it. Artifact and active-root checks are repeated during
 recovery before leases are granted. These checks are not a defense against a
 compromised administrator or malicious replacement of the trusted runtime.
 
+The protected MCP configuration enables only the fixed deskd tool catalogue.
+Its eight write verbs have explicit harness approval settings because their
+authorization is enforced by the gateway. Every call still requires an attested
+role connection and capability; publishing a memo also requires another stable
+principal's approval. Shell escalation remains disabled. Adding a new tool does
+not automatically include it in this approval list.
+
 The `Workspace official runtime isolation` workflow runs on a fresh GitHub-hosted
 Ubuntu 22.04 VM. Root creates a private mount namespace whose `/tmp` is backed by
 the job scratchpad. It changes no accounts, AppArmor policy, sysctl or existing

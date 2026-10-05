@@ -22,6 +22,17 @@ OFFICIAL_LINUX_X64_SHA256 = (
 )
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 _PATH = re.compile(r"/[A-Za-z0-9_./-]+\Z")
+BRIDGE_READ_TOOLS = ("inbox.read", "tasks.read", "workspace.receipt")
+BRIDGE_WRITE_TOOLS = (
+    "proposal.create",
+    "approval.issue",
+    "approval.revoke",
+    "action.execute",
+    "mail.send",
+    "inbox.ack",
+    "task.create",
+    "task.update",
+)
 
 
 def _path(value: str) -> str:
@@ -248,13 +259,22 @@ class Installation:
         return "\n".join(lines) + "\n"
 
     def _bridge_configuration(self, *, enabled: bool) -> str:
-        return (
+        result = (
             "[mcp_servers.deskd]\n"
             f"command = {_quote(self.path('bin/deskd-bridge'))}\n"
             f"args = {json.dumps(['--socket', self.path('business/s'), '--gateway-uid', str(self.gateway_uid)])}\n"
             f"enabled = {str(enabled).lower()}\n"
             f"required = {str(enabled).lower()}\n"
+            f"enabled_tools = {json.dumps(BRIDGE_READ_TOOLS + BRIDGE_WRITE_TOOLS)}\n"
         )
+        # Only these fixed gateway verbs bypass the harness's interactive MCP
+        # approval prompt. The gateway still authenticates every call and owns
+        # independent action authorization; this grants no shell escalation.
+        for name in BRIDGE_WRITE_TOOLS:
+            result += (
+                f'[mcp_servers.deskd.tools.{_quote(name)}]\napproval_mode = "approve"\n'
+            )
+        return result
 
     def role_configuration(
         self, role: RoleInstallation, *, with_gateway_bridge: bool = False

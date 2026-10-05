@@ -5,6 +5,7 @@ import tomllib
 import pytest
 
 from deskd.workspace.installation import Installation, RoleInstallation
+from deskd.workspace.exchange import tool_catalog
 
 
 @pytest.mark.parametrize("provider", ["api", "mock"])
@@ -49,3 +50,13 @@ def test_fixed_profiles_disable_hook_discovery_and_hosted_image_generation(provi
     for role in installation.roles:
         assert "features" not in configs[role.root + "/.codex/config.toml"]
     assert features.get("view_image", True) is True
+    expected_tools = {tool["name"] for tool in tool_catalog()}
+    expected_reads = {"inbox.read", "tasks.read", "workspace.receipt"}
+    assert base["approval_policy"] == "never"
+    for config in configs.values():
+        bridge = config["mcp_servers"]["deskd"]
+        assert set(bridge["enabled_tools"]) == expected_tools
+        assert set(bridge["tools"]) == expected_tools - expected_reads
+        assert all(
+            value == {"approval_mode": "approve"} for value in bridge["tools"].values()
+        )
