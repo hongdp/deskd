@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -306,7 +307,9 @@ def _wait(manager, deployment, mock, predicate, *, seconds=60):
     )
 
 
-def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board():
+def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
+    monkeypatch,
+):
     supplied = os.environ.get("DESKD_SANDBOX_TEST_ROOT")
     if not supplied:
         pytest.skip("opt-in ephemeral Linux root runner required")
@@ -327,6 +330,21 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board():
     board = None
     board_thread = None
     lifecycle = []
+    # Observe only fresh fixture children; do not change their executable,
+    # arguments, identity, environment, protocol or authorization decisions.
+    # These mock-only files cannot contain a real key or provider response.
+    diagnostics = []
+    actual_popen = subprocess.Popen
+
+    def observed_popen(argv, **kwargs):
+        if isinstance(argv, list) and str(prefix / "lib") in argv:
+            path = prefix / f"synthetic-child-{len(diagnostics)}.log"
+            diagnostics.append(path)
+            with path.open("wb") as log:
+                return actual_popen(argv, **{**kwargs, "stderr": log})
+        return actual_popen(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", observed_popen)
     try:
         manifest = install(
             prefix,
@@ -482,6 +500,12 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board():
         )
         assert mock.finished["engineer"] == 2
         assert lifecycle
+    except Exception:
+        for path in diagnostics:
+            data = path.read_bytes()[:4096]
+            if data:
+                print("SYNTHETIC CHILD DIAGNOSTIC", data.decode(errors="replace"))
+        raise
     finally:
         if board is not None:
             board.shutdown()
