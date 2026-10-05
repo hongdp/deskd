@@ -160,8 +160,11 @@ is in `workspace/service.py` and `workspace/store.py`.
 ## Trust boundary and acceptance
 
 An administrator owns the prefix, executables, role roots and `.codex` policy
-layers. Only each role's `data` child is writable. Roles share the harness UID but
-use separate named permissions with their own writable data, minimal system
+layers. Only each role's `data` child is writable. Roles share the harness UID;
+the official project loader uses `.codex` as its root marker, so a thread whose
+working directory is `data` loads the protected parent policy. The native sandbox
+also prevents creating a shadow `.codex` directory in writable data.
+roles use separate named permissions with their own writable data, minimal system
 reads, no shell network and explicit denial of peer roles, management, gateway,
 harness state and shared temporary state. Shells inherit no parent environment
 except an explicit `PATH`. Browser/computer integration, plugins, apps, model

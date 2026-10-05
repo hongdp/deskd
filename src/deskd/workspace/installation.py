@@ -140,6 +140,11 @@ class Installation:
             'approval_policy = "never"',
             'default_permissions = "locked"',
             'web_search = "disabled"',
+            # The protected role policy is above its writable data cwd. Without
+            # a marker the official loader stops at cwd and never sees it.
+            # Reuse protected metadata: a new arbitrary marker in writable data
+            # could redirect project discovery away from the trusted policy.
+            'project_root_markers = [".codex"]',
             f"model = {_quote(model)}",
         ]
         if provider == "api":
