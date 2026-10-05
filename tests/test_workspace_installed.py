@@ -242,6 +242,21 @@ class CollaborationMock:
                 },
             )
         elif seat == "engineer" and any("task_id" in x for x in payloads):
+            goals = yield "goal.read", {}
+            assert goals["goals"] == []
+            yield "memory.remember", {
+                "title": "Synthetic isolation note", "body": "Private fixture memory only.",
+                "sources": [], "request_id": "installed-private-memory",
+            }
+            # Projection is asynchronous. Bounded reads observe its retained
+            # result; no second write and no real model/network source is used.
+            for _ in range(10):
+                notes = yield "memory.search", {"query": "Synthetic isolation note", "include_shared": False}
+                if notes["memories"]:
+                    break
+            assert len(notes["memories"]) == 1
+            assert notes["memories"][0]["owner"] == "desk/engineer"
+            assert notes["memories"][0]["shared"] == 0
             tasks = yield "tasks.read", {}
             task = next(x for x in tasks["tasks"] if x["status"] != "done")
             yield (

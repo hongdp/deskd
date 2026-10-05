@@ -51,7 +51,7 @@ def test_fixed_profiles_disable_hook_discovery_and_hosted_image_generation(provi
         assert "features" not in configs[role.root + "/.codex/config.toml"]
     assert features.get("view_image", True) is True
     expected_tools = {tool["name"] for tool in tool_catalog()}
-    expected_reads = {"inbox.read", "tasks.read", "workspace.receipt"}
+    expected_reads = {"inbox.read", "tasks.read", "workspace.receipt", "goal.read", "source.list", "source.read", "memory.search", "memory.read"}
     assert base["approval_policy"] == "never"
     assert base["model"] == "gpt-5.5"
     assert base["tui"] == {"screen_reader_detection_done": True}

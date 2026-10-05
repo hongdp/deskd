@@ -11,6 +11,7 @@ from deskd.gateway.actions import tool_catalog as memo_catalog
 from deskd.gateway.commands import CommandHandler
 from deskd.gateway.identity import ActionPolicy, IdentityError, PrincipalId, identifier
 from deskd.workspace.store import WorkspaceError
+from .extensions import EXTENSION_ACTIONS, extension_catalog
 
 WRITE_FIELDS = {
     "mail.send": {"recipient", "body"},
@@ -20,6 +21,7 @@ WRITE_FIELDS = {
 }
 READ_ACTIONS = ("inbox.read", "tasks.read", "workspace.receipt")
 ACTIONS = {
+    **EXTENSION_ACTIONS,
     **{name: ActionPolicy(name) for name in WRITE_FIELDS},
     **{name: ActionPolicy(name) for name in READ_ACTIONS},
 }
@@ -47,11 +49,12 @@ def _ids(value, label):
 
 
 class WorkspaceExchange:
-    def __init__(self, events, store, *, principals):
+    def __init__(self, events, store, *, principals, extended=None):
         self.events = events
         self.store = store
         self.principals = frozenset(principals)
         self.cursor = 0
+        self.extended = extended
         for principal in self.principals:
             desk, seat = principal.split("/")
             PrincipalId(desk, seat)
@@ -100,7 +103,8 @@ class WorkspaceExchange:
 
             return CommandHandler("workspace." + name, apply)
 
-        return {name: handler(name) for name in WRITE_FIELDS}
+        return {**(self.extended.handlers() if self.extended else {}),
+                **{name: handler(name) for name in WRITE_FIELDS}}
 
     def readers(self):
         def page(method, fields):
@@ -129,6 +133,7 @@ class WorkspaceExchange:
             return result if result is not None else {"status": "pending_or_unknown"}
 
         return {
+            **(self.extended.readers() if self.extended else {}),
             "inbox.read": page(self.store.inbox_page, {"cursor", "limit"}),
             "tasks.read": page(self.store.tasks_page, {"cursor", "limit", "task_id"}),
             "workspace.receipt": receipt,
@@ -141,10 +146,11 @@ class WorkspaceExchange:
         cannot duplicate a coordination effect or create an extra wake demand.
         """
         count = 0
+        projectors = self.extended.projectors() if self.extended else {}
         for item in self.events.events(after_sequence=self.cursor, limit=limit):
             event = item["event"]
-            if event["event_type"] in {"workspace." + n for n in WRITE_FIELDS}:
-                self.store.apply_gateway_event(event)
+            if event["event_type"] in {"workspace." + n for n in (*WRITE_FIELDS, *projectors)}:
+                self.store.apply_gateway_event(event, projectors=projectors)
                 count += 1
             self.cursor = item["sequence"]
         return count
@@ -187,7 +193,7 @@ def tool_catalog():
         "tasks.read": "Read a complete-body page of tasks you own or were assigned, in creation order. Follow next_cursor while has_more, or pass task_id without cursor for one task.",
         "workspace.receipt": "Read the applied or rejected result of your own queued collaboration intent.",
     }
-    result = memo_catalog()
+    result = memo_catalog() + extension_catalog()
     for name, properties in fields.items():
         tool = {
             "name": name,

@@ -86,8 +86,11 @@ Seats use these fixed tools through the trusted bridge:
 | `task.create`, `task.update`, `tasks.read` | Assign work, track dependencies and perform version-checked updates on owned/assigned tasks. |
 | `workspace.receipt` | Read the applied or rejected result of the caller's own queued collaboration intent, using its gateway event ID. |
 | `proposal.create`, `approval.issue`, `action.execute` | Propose exact memo content, authorize it as a different stable principal, then publish once as its designated executor. |
+| `goal.read`, `goal.report`, `goal.ask` | Read a participating goal, report retained evidence and artifacts for its current stage, or explicitly ask the human to decide. |
+| `source.list`, `source.request`, `source.read`, `source.publish` | Request a named administrator-approved source, read a bounded captured response, and deliberately share that snapshot. |
+| `memory.remember`, `memory.revise`, `memory.forget`, `memory.publish`, `memory.search`, `memory.read` | Maintain private role notes and explicitly publish selected versions within the same desk. |
 
-Every tool also takes a stable `request_id`. Reusing that ID with changed content
+Every write tool also takes a stable `request_id`. Reusing that ID with changed content
 is rejected. A gateway receipt for a collaboration command means **queued**;
 read its projection receipt to obtain the task ID or rejection. Neither receipt
 means the recipient model has handled the work.
@@ -163,7 +166,7 @@ without repository credentials in the root test environment. The official
 runtime archive, executable and bundled sandbox helper are hash-pinned.
 
 The supported role configuration disables optional execution surfaces such as
-plugins, apps, hooks, hosted image generation, automatic goals, shared memory
+plugins, apps, hooks, hosted image generation, native automatic goals, native shared memory
 generation/import, browser/computer tools, JS REPL,
 Code Mode and same-tree helpers.
 Adding one changes the trusted computing base and requires its own isolation
@@ -172,6 +175,11 @@ official runtime, the fixed bridge, coordination service and lifecycle controlle
 remain trusted. This implementation does not claim to withstand compromise of
 root or those trusted programs, guarantee independent model judgment, or provide
 external exactly-once execution.
+
+The separate deskd goal coordinator and role-owned notes use the governed tools
+above; they do not enable the runtime's disabled native memory or goal features.
+See [continuous work](workspace-goals.md) for the finite research-brief workflow,
+human decisions, approved sources, notifications and recovery procedures.
 
 The API key helper is outside the role sandbox, uses the fixed gateway socket,
 checks the kernel peer UID and reads only its explicitly provisioned key file

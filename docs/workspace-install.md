@@ -177,8 +177,8 @@ Roles use separate named permissions with their own writable data, minimal syste
 reads, no shell network and explicit denial of peer roles, management, gateway,
 harness state and shared temporary state. Shells inherit no parent environment
 except an explicit `PATH`. Browser/computer integration, plugins, apps, model
-discovery, nested agents, hooks, hosted image generation, automatic goals,
-shared memory generation/import, shell snapshots,
+discovery, nested agents, hooks, hosted image generation, native automatic goals,
+native shared memory generation/import, shell snapshots,
 JavaScript REPL and code mode are off.
 Enabling another execution surface requires its own isolation acceptance.
 
@@ -191,12 +191,17 @@ roles cannot access it. Artifact and active-root checks are repeated during
 recovery before leases are granted. These checks are not a defense against a
 compromised administrator or malicious replacement of the trusted runtime.
 
-The protected MCP configuration enables only the eleven fixed deskd tools.
-Its eight write verbs have explicit harness approval settings because their
+The protected MCP configuration enables only the 24 fixed deskd tools.
+Its 16 write verbs have explicit harness approval settings because their
 authorization is enforced by the gateway. Every call still requires an attested
 role connection and capability; publishing a memo also requires another stable
 principal's approval. Shell escalation remains disabled. Adding a new tool does
 not automatically include it in this approval list.
+
+The added goal, source and role-note tools are governed deskd operations. They
+do not enable native runtime memory, arbitrary role network access or a generic
+external tool proxy. The gateway performs approved source retrieval outside its
+command transaction. See [continuous work](workspace-goals.md).
 
 The `Workspace official runtime isolation` workflow runs on a fresh GitHub-hosted
 Ubuntu 22.04 VM. Root creates a private mount namespace whose `/tmp` is backed by
