@@ -44,6 +44,17 @@ def _object(value):
     if isinstance(value, str):
         return _object(json.loads(value))
     if isinstance(value, list):
+        # Stock 0.160.0 MCP output has a timing preamble plus one text body.
+        # Strip only this exact observed envelope; never ignore an extra result
+        # or an error block while looking for a convenient JSON payload.
+        if len(value) == 2:
+            header = value[0]
+            assert isinstance(header, dict) and header.get("type") == "input_text"
+            assert re.fullmatch(
+                r"Wall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:",
+                header.get("text", ""),
+            ), "unexpected synthetic tool preamble"
+            return _object(value[1])
         assert len(value) == 1, "unexpected synthetic tool output"
         return _object(value[0])
     assert isinstance(value, dict)
