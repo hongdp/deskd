@@ -314,6 +314,7 @@ ptrace.restype = ctypes.c_long
 ctypes.set_errno(0)
 seized = ptrace(0x4206, {daemon_pid}, None, None)
 results['owned_daemon_ptrace'] = seized == -1 and ctypes.get_errno() in (errno.EPERM, errno.ESRCH, errno.EACCES)
+denied('owned_daemon_signal_zero', lambda: os.kill({daemon_pid}, 0))
 denied('other_write', lambda: pathlib.Path({str(Path(other.data) / "injected")!r}).write_text('bad'))
 denied('config_write', lambda: pathlib.Path({str(Path(role.root) / ".codex/config.toml")!r}).write_text('bad'))
 def shadow_config():

@@ -457,11 +457,23 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
     board = None
     board_thread = None
     lifecycle = []
-    # Observe only fresh fixture children; do not change their executable,
-    # arguments, identity, environment, protocol or authorization decisions.
+    # Observe only fresh fixture children. The original entry, identity,
+    # environment, protocol and authorization decisions still run unchanged.
     # These mock-only files cannot contain a real key or provider response.
     diagnostics = []
     actual_popen = subprocess.Popen
+    observe_errors = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from deskd.workspace.runtime import CodexRuntime
+original_message = CodexRuntime._message
+def observed_message(self, deadline):
+    value = original_message(self, deadline)
+    if 'error' in value:
+        print('SYNTHETIC RUNTIME ERROR ' + json.dumps(value['error'])[:2000], file=sys.stderr, flush=True)
+    return value
+CodexRuntime._message = observed_message
+"""
 
     def observed_popen(argv, **kwargs):
         if (
@@ -471,6 +483,9 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
         ):
             path = prefix / f"synthetic-child-{len(diagnostics)}.log"
             diagnostics.append(path)
+            if "bootstrap" in argv or "controller" in argv:
+                argv = list(argv)
+                argv[4] = observe_errors + argv[4]
             with path.open("wb") as log:
                 return actual_popen(argv, **{**kwargs, "stderr": log})
         return actual_popen(argv, **kwargs)
@@ -485,6 +500,7 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
             gateway_uid=GATEWAY_UID,
             business_gid=BUSINESS_GID,
             mock_port=mock.server.server_port,
+            provider="mock",
         )
         deployment = Deployment(manifest)
         deployment.attest()
@@ -699,7 +715,8 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
         assert lifecycle
     except Exception:
         for path in diagnostics:
-            data = path.read_bytes()[:4096]
+            with path.open("rb") as log:
+                data = log.read(4096)
             if data:
                 print("SYNTHETIC CHILD DIAGNOSTIC", data.decode(errors="replace"))
         raise
