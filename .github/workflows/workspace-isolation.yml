@@ -7,12 +7,14 @@ on:
     paths:
       - "src/deskd/workspace/**"
       - "tests/test_workspace_linux_sandbox.py"
+      - "tests/test_workspace_installed.py"
       - ".github/workflows/workspace-isolation.yml"
   push:
     branches: [main]
     paths:
       - "src/deskd/workspace/**"
       - "tests/test_workspace_linux_sandbox.py"
+      - "tests/test_workspace_installed.py"
       - ".github/workflows/workspace-isolation.yml"
   workflow_dispatch:
 
@@ -112,7 +114,7 @@ jobs:
           cd "$workspace"
           "$python_executable" -m pytest -o addopts='' -p no:cacheprovider \
             --basetemp="$TMPDIR/pytest" --junitxml="$TMPDIR/results.xml" \
-            tests/test_workspace_linux_sandbox.py -q
+            tests/test_workspace_linux_sandbox.py tests/test_workspace_installed.py -q
           "$python_executable" - "$TMPDIR/results.xml" <<'VERIFY_EXECUTION'
           import sys
           import xml.etree.ElementTree as ET

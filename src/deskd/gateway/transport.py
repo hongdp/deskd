@@ -29,11 +29,17 @@ import uuid
 from .commands import GatewayCommands
 from .actions import ActionError
 from .events import EventConflict, EventValidationError
-from .identity import IdentityError, PrincipalId, TransportEvidence, identifier
+from .identity import (
+    IdentityError,
+    PrincipalId,
+    TransportEvidence,
+    identifier,
+    parse_metadata,
+)
 from .registry import Registry
 from .wire import JsonLineReader, WireError, encode_frame
 
-BUSINESS_METHODS = frozenset({"hello", "execute", "status"})
+BUSINESS_METHODS = frozenset({"hello", "execute", "status", "read", "identify", "model.auth"})
 ADMIN_METHODS = frozenset(
     {"status", "connections", "bind", "revoke", "activate", "fence", "lease"}
 )
@@ -203,6 +209,7 @@ class _Accepted:
     connection: socket.socket
     peer: PeerCredentials
     evidence: TransportEvidence
+    requested_root: str | None = None
 
 
 class GatewayTransport:
@@ -232,6 +239,10 @@ class GatewayTransport:
         max_connections: int = 16,
         idle_timeout: float = 300,
         frame_timeout: float = 5,
+        readers: dict[str, Callable] | None = None,
+        admin_handlers: dict[str, Callable] | None = None,
+        allow_identify: bool = False,
+        auth_provider: Callable[[], str] | None = None,
     ):
         if not callable(activation_check):
             raise TransportError("activation_check_required")
@@ -258,6 +269,21 @@ class GatewayTransport:
             raise TransportError("socket_paths_must_differ")
         self.registry = registry
         self.commands = commands
+        self.allow_identify = allow_identify
+        if auth_provider is not None and not callable(auth_provider):
+            raise TransportError("invalid_auth_provider")
+        self.auth_provider = auth_provider
+        # Fixed installation code only; neither map can be populated by a peer.
+        self.readers = dict(readers or {})
+        self.admin_handlers = dict(admin_handlers or {})
+        for name, handler in self.readers.items():
+            identifier(name, "reader")
+            if not callable(handler):
+                raise TransportError("invalid_reader")
+        for name, handler in self.admin_handlers.items():
+            identifier(name, "admin_handler")
+            if not name.startswith("workspace.") or not callable(handler):
+                raise TransportError("invalid_admin_handler")
         self.admin_uids = frozenset(admin_uids)
         self.activation_check = activation_check
         self.idle_timeout = idle_timeout
@@ -557,12 +583,42 @@ class GatewayTransport:
                 "connection_id": accepted.evidence.connection_id,
                 "service_generation": accepted.evidence.service_generation,
             }
+        if method == "model.auth":
+            self._fields(params, set())
+            if self.auth_provider is None:
+                raise IdentityError("model_auth_not_configured")
+            return {"token": self.auth_provider()}
         if method == "execute":
             self._fields(params, {"request_id", "mcp"})
             request_id = identifier(params["request_id"], "request_id")
             return asdict(
                 self.commands.execute(request_id, params["mcp"], accepted.evidence)
             )
+        if method == "identify":
+            if not self.allow_identify:
+                raise IdentityError("unknown_business_method")
+            self._fields(params, {"_meta"})
+            root, _ = parse_metadata(params)
+            with self._lock:
+                if accepted.requested_root not in (None, root):
+                    raise IdentityError("channel_root_changed")
+                accepted.requested_root = root
+            # An observation is not authority. Only the independent controller
+            # can grant a lease after checking the registered root and process.
+            try:
+                self.registry.authorize("state.read", params, accepted.evidence)
+                return {"ready": True}
+            except IdentityError as exc:
+                if exc.code in {"inactive_channel", "service_fenced"}:
+                    return {"ready": False}
+                raise
+        if method == "read":
+            self._fields(params, {"name", "arguments", "_meta"})
+            name = identifier(params["name"], "reader")
+            if name not in self.readers or type(params["arguments"]) is not dict:
+                raise IdentityError("unknown_reader")
+            identity = self.registry.authorize(name, params, accepted.evidence)
+            return self.readers[name](identity, params["arguments"])
         self._fields(params, {"_meta"})
         identity = self.registry.authorize("state.read", params, accepted.evidence)
         return {
@@ -574,6 +630,8 @@ class GatewayTransport:
         }
 
     def _admin_call(self, method: str, params: dict[str, Any]) -> Any:
+        if method in self.admin_handlers:
+            return self.admin_handlers[method](params)
         if method not in ADMIN_METHODS:
             raise IdentityError("unknown_admin_method")
         assert self.service_generation is not None
@@ -615,6 +673,11 @@ class GatewayTransport:
                             "uid": v.peer.uid,
                             "gid": v.peer.gid,
                             "service_generation": v.evidence.service_generation,
+                            **(
+                                {"requested_root": v.requested_root}
+                                if self.allow_identify
+                                else {}
+                            ),
                         }
                         for k, v in self._connections.items()
                     ]

@@ -109,7 +109,12 @@ class Installation:
         return self.path("bin/codex")
 
     def configuration(
-        self, *, mock_port: int | None = None, with_gateway_bridge: bool = False
+        self,
+        *,
+        mock_port: int | None = None,
+        with_gateway_bridge: bool = False,
+        provider: str = "mock",
+        model: str = "gpt-5.5",
     ) -> str:
         """Render fixed profiles; an optional loopback mock never needs a key.
 
@@ -117,6 +122,14 @@ class Installation:
         manager must select an authorized provider through its own installation
         mechanism; no role can change this profile catalogue.
         """
+        if (
+            provider not in {"mock", "api"}
+            or type(model) is not str
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model)
+        ):
+            raise ValueError("invalid_model_provider")
+        if provider == "api" and mock_port is not None:
+            raise ValueError("api_provider_cannot_use_mock_endpoint")
         if type(with_gateway_bridge) is not bool:
             raise ValueError("invalid bridge switch")
         if mock_port is not None and (
@@ -127,9 +140,11 @@ class Installation:
             'approval_policy = "never"',
             'default_permissions = "locked"',
             'web_search = "disabled"',
-            'model = "gpt-5.5"',
+            f"model = {_quote(model)}",
         ]
-        if mock_port is not None:
+        if provider == "api":
+            lines.append('model_provider = "deskd_api"')
+        elif mock_port is not None:
             lines.append('model_provider = "deskd_mock"')
         lines += [
             "[shell_environment_policy]",
@@ -160,6 +175,21 @@ class Installation:
                 'wire_api = "responses"',
                 "request_max_retries = 0",
                 "stream_max_retries = 0",
+            ]
+        if provider == "api":
+            lines += [
+                "[model_providers.deskd_api]",
+                'name = "deskd API"',
+                'base_url = "https://api.openai.com/v1"',
+                'wire_api = "responses"',
+                "requires_openai_auth = false",
+                "supports_websockets = false",
+                "[model_providers.deskd_api.auth]",
+                f"command = {_quote(self.path('bin/deskd-model-auth'))}",
+                f"args = {json.dumps(['--socket', self.path('business/s'), '--gateway-uid', str(self.gateway_uid)])}",
+                f"cwd = {_quote(self.path('base'))}",
+                "timeout_ms = 5000",
+                "refresh_interval_ms = 300000",
             ]
         if with_gateway_bridge:
             lines += self._bridge_configuration(enabled=False).splitlines()
@@ -232,11 +262,19 @@ class Installation:
         return result
 
     def plan(
-        self, *, mock_port: int | None = None, with_gateway_bridge: bool = False
+        self,
+        *,
+        mock_port: int | None = None,
+        with_gateway_bridge: bool = False,
+        provider: str = "mock",
+        model: str = "gpt-5.5",
     ) -> dict:
         """Return reviewable metadata/content. Every emitted path is explicit."""
         config = self.configuration(
-            mock_port=mock_port, with_gateway_bridge=with_gateway_bridge
+            mock_port=mock_port,
+            with_gateway_bridge=with_gateway_bridge,
+            provider=provider,
+            model=model,
         )
         files = [
             {

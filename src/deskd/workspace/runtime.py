@@ -385,6 +385,10 @@ class CodexRuntime:
     def _queue(self, event: dict) -> None:
         if len(self._events) >= MAX_EVENTS:
             self._fail("event_backlog_exceeded")
+        self._validate_event(event)
+        self._events.append(event)
+
+    def _validate_event(self, event: dict) -> None:
         if event.get("method") == "thread/settings/updated":
             params = event.get("params", {})
             thread_id = params.get("threadId")
@@ -397,7 +401,6 @@ class CodexRuntime:
                     self.close()
                     raise RuntimePolicyError("root_settings_changed")
                 self._validate_settings(settings, config, sandbox_key="sandboxPolicy")
-        self._events.append(event)
 
     def _dispatch(self, value: dict, deadline: float) -> bool:
         if "method" not in value:
@@ -538,6 +541,10 @@ class CodexRuntime:
         copied["config"] = json.loads(_encode(config.config))
         copied["expected_sandbox"] = json.loads(_encode(config.expected_sandbox))
         self._roots[binding.thread_id] = RootConfig(**copied)
+        # Notifications can precede the start/resume response. Validate them
+        # once their root has been bound, before any caller can start a turn.
+        for event in tuple(self._events):
+            self._validate_event(event)
         return binding
 
     def start_root(self, config: RootConfig) -> RootBinding:

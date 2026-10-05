@@ -41,6 +41,7 @@ class ModelMock:
 
     def __init__(self):
         self.command = None
+        self.patch = None
         self.sent = False
         self.calls = 0
         self.failure = None
@@ -61,21 +62,31 @@ class ModelMock:
                     ]
                     owner.calls += 1
                     if not owner.sent:
-                        if "exec_command" not in names or owner.command is None:
-                            raise ValueError("expected official exec_command tool")
+                        if owner.patch is not None:
+                            if "apply_patch" not in names:
+                                raise ValueError("expected official apply_patch tool")
+                            item = {
+                                "type": "custom_tool_call",
+                                "name": "apply_patch",
+                                "input": owner.patch,
+                                "call_id": f"patch-probe-{owner.calls}",
+                            }
+                        else:
+                            if "exec_command" not in names or owner.command is None:
+                                raise ValueError("expected official exec_command tool")
+                            item = {
+                                "type": "function_call",
+                                "call_id": f"isolation-probe-{owner.calls}",
+                                "name": "exec_command",
+                                "arguments": json.dumps(
+                                    {
+                                        "cmd": owner.command,
+                                        "yield_time_ms": 10000,
+                                        "max_output_tokens": 500,
+                                    }
+                                ),
+                            }
                         owner.sent = True
-                        item = {
-                            "type": "function_call",
-                            "call_id": f"isolation-probe-{owner.calls}",
-                            "name": "exec_command",
-                            "arguments": json.dumps(
-                                {
-                                    "cmd": owner.command,
-                                    "yield_time_ms": 10000,
-                                    "max_output_tokens": 500,
-                                }
-                            ),
-                        }
                     else:
                         item = {
                             "type": "message",
@@ -272,9 +283,11 @@ def _probe_command(
         "harness_read": installation.path("harness/synthetic-private"),
         "shared_tmp_read": installation.path("tmp/synthetic-private"),
         "owned_daemon_proc": f"/proc/{daemon_pid}/environ",
+        "owned_daemon_mem": f"/proc/{daemon_pid}/mem",
+        "owned_daemon_root_file": f"/proc/{daemon_pid}/root{installation.path('harness/synthetic-private')}",
     }
     script = f"""
-import json, os, pathlib, socket
+import ctypes, errno, json, os, pathlib, socket
 results = {{"parent_environment": os.environ.get("DESKD_SYNTHETIC_PARENT_ONLY") is None}}
 def denied(name, action):
     try:
@@ -286,6 +299,21 @@ def denied(name, action):
         results[name] = False
 for name, path in {paths!r}.items():
     denied(name, lambda path=path: open(path, 'rb'))
+def directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    os.close(fd)
+for name, path in {{'owned_daemon_root': '/proc/{daemon_pid}/root', 'owned_daemon_fd': '/proc/{daemon_pid}/fd'}}.items():
+    denied(name, lambda path=path: directory(path))
+# This is exclusively the fixture daemon PID, verified using SO_PEERCRED.
+# SEIZE neither stops the target nor reads memory. If it unexpectedly succeeds,
+# fail the receipt; tracer exit releases it without sending a signal.
+libc = ctypes.CDLL(None, use_errno=True)
+ptrace = libc.ptrace
+ptrace.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+ptrace.restype = ctypes.c_long
+ctypes.set_errno(0)
+seized = ptrace(0x4206, {daemon_pid}, None, None)
+results['owned_daemon_ptrace'] = seized == -1 and ctypes.get_errno() in (errno.EPERM, errno.ESRCH, errno.EACCES)
 denied('other_write', lambda: pathlib.Path({str(Path(other.data) / "injected")!r}).write_text('bad'))
 denied('config_write', lambda: pathlib.Path({str(Path(role.root) / ".codex/config.toml")!r}).write_text('bad'))
 def shadow_config():
@@ -326,6 +354,7 @@ def _run_probe(
     mock,
     suffix,
 ):
+    mock.patch = None
     mock.command = _probe_command(
         installation,
         role,
@@ -373,20 +402,34 @@ def _run_probe(
     assert (Path(role.data) / f"own-{suffix}").read_text() == "allowed"
 
 
-def _observe_mock_errors(client):
-    # Temporary diagnosis of this newly created credential-free mock daemon.
-    # The original decoder, peer checks, validation and public calls are intact;
-    # only an error string is captured by pytest and shown when a test fails.
-    original = client._message
-
-    def receive(deadline):
-        value = original(deadline)
-        error = value.get("error")
-        if isinstance(error, dict):
-            print("SYNTHETIC-DAEMON-ERROR:", str(error.get("message", ""))[:2000])
-        return value
-
-    client._message = receive
+def _run_patch_probe(client, binding, role, other, mock, suffix):
+    for target_role, permitted in ((role, True), (other, False)):
+        target = Path(target_role.data) / f"patch-{suffix}-{permitted}"
+        mock.patch = f"*** Begin Patch\n*** Add File: {target}\n+SYNTHETIC-PATCH\n*** End Patch\n"
+        mock.sent = False
+        before = mock.calls
+        turn_id = client.start_turn(
+            binding.thread_id, [{"event_id": "patch-" + suffix, "type": "test.patch"}]
+        )
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            event = client.poll_event(timeout=1)
+            if event and event.get("method") == "turn/completed":
+                params = event.get("params", {})
+                if (
+                    params.get("threadId") == binding.thread_id
+                    and params.get("turn", {}).get("id") == turn_id
+                ):
+                    assert params["turn"]["status"] == "completed"
+                    break
+        else:
+            pytest.fail("official apply_patch turn did not complete")
+        assert client.read_turn(binding.thread_id, turn_id) == "completed"
+        assert mock.sent and mock.calls >= before + 2 and mock.failure is None
+        assert target.exists() is permitted
+        if permitted:
+            assert target.read_text().strip() == "SYNTHETIC-PATCH"
+    mock.patch = None
 
 
 def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree):
@@ -423,7 +466,6 @@ def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree)
         timeout=10,
     ).connect()
     assert client.peer_pid == proc.pid
-    _observe_mock_errors(client)
     bindings = []
     configs = []
     try:
@@ -458,6 +500,14 @@ def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree)
                 mock,
                 f"initial-{i}",
             )
+            _run_patch_probe(
+                client,
+                bindings[i],
+                role,
+                installation.roles[1 - i],
+                mock,
+                f"initial-{i}",
+            )
     finally:
         client.close()
     proc.terminate()
@@ -470,7 +520,6 @@ def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree)
         timeout=10,
     ).connect()
     assert client.peer_pid == proc.pid
-    _observe_mock_errors(client)
     try:
         for i, role in enumerate(installation.roles):
             resumed = client.resume_root(bindings[i].thread_id, configs[i])
@@ -485,6 +534,9 @@ def test_official_named_profiles_isolate_roles_and_survive_restart(runtime_tree)
                 advertised.resolve(),
                 mock,
                 f"resumed-{i}",
+            )
+            _run_patch_probe(
+                client, resumed, role, installation.roles[1 - i], mock, f"resumed-{i}"
             )
     finally:
         client.close()

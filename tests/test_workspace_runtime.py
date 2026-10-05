@@ -670,3 +670,25 @@ def test_repeating_history_cursor_fails_closed():
         client.start_root(config())
         with pytest.raises(RuntimeUnavailable, match="invalid_turn_cursor"):
             client.read_turn("root-1", "historical")
+
+
+def test_settings_notification_before_start_reply_is_checked_after_binding():
+    def handler(conn, message):
+        if message["method"] == "thread/start":
+            altered = settings()
+            altered["sandboxPolicy"] = {"type": "dangerFullAccess"}
+            conn.sendall(
+                frame(
+                    {
+                        "method": "thread/settings/updated",
+                        "params": {"threadId": "root-1", "threadSettings": altered},
+                    }
+                )
+            )
+        return False
+
+    with daemon(handler) as (client, _):
+        client.connect()
+        with pytest.raises(RuntimePolicyError, match="root_settings_mismatch"):
+            client.start_root(config())
+        assert client._socket is None

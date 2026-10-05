@@ -15,6 +15,7 @@ index you can read in one screen beats navigation you have to maintain.
 - [`gateway-foundation.md`](gateway-foundation.md) — experimental overlay
   primitives: root identity bindings, lifecycle fencing, durable outbox and
   consumer receipts.
+- [`workspace.md`](workspace.md) — persistent seats, durable collaboration, shared status, independent management and recovery.
 - [`local-workflow.md`](local-workflow.md) — runnable credential-free memo
   workflow, independent approval, offline responsibility board, fixed MCP bridge
   and memo-only Unix service; actual harness isolation remains unverified.
