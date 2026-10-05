@@ -106,9 +106,17 @@ sudo /opt/deskd-python/bin/python -m deskd.workspace attach \
 This checks the installation, active authority and registered root, then drops to
 the harness UID and invokes the official native terminal with an explicit Unix
 socket endpoint. It must not fall back to an embedded runtime. This is a trusted
-human entry into the harness, not an untrusted role sandbox. The automated
-acceptance exercises the public daemon protocol; interactive terminal keystrokes
-remain a separate manual acceptance item.
+human entry into the harness, not an untrusted role sandbox. Automated acceptance
+starts this public entry in a real terminal, checks `/status` against the registered
+root, and exits with `/quit`. The daemon and controller remain active, no extra
+mock model call occurs, and the protected configuration still passes attestation.
+This test sends no model prompt. Interactive model work and other terminal actions
+are separate acceptance scopes.
+
+The pinned installation preconfigures known model-migration notices and the
+initial screen-reader check so opening the terminal does not rewrite its attested
+configuration. Changing the installed model or policy through terminal settings
+can fence the workspace; make such changes through a reviewed installation update.
 
 The installation keeps the administrator-selected model fixed and suppresses
 the pinned runtime's model migration notices. Changing a role's model or
@@ -181,7 +189,10 @@ Enabling another execution surface requires its own isolation acceptance.
 
 The gateway runs under a distinct UID. Its approved MCP bridge operates outside
 the role shell sandbox and is bound to an attested root by the controller; role
-shells cannot directly open business/control sockets. The official daemon and
+shells cannot directly open business/control sockets. Protected configuration
+exposes a fixed set of eleven deskd tools and preapproves only its eight write
+verbs at the harness layer. The gateway still checks identity, permissions and
+independent action authorization for every call. The official daemon and
 administrator controller remain trusted. In particular, the daemon's writable
 `CODEX_HOME` means the trusted harness can replace its root-owned base config;
 roles cannot access it. Artifact and active-root checks are repeated during
@@ -197,7 +208,9 @@ not automatically include it in this approval list.
 
 The `Workspace official runtime isolation` workflow runs on a fresh GitHub-hosted
 Ubuntu 22.04 VM. Root creates a private mount namespace whose `/tmp` is backed by
-the job scratchpad. It changes no accounts, AppArmor policy, sysctl or existing
+the job scratchpad. After artifact downloads, all test processes also enter a
+private network namespace with only loopback, so even the trusted harness has no
+external network route. It changes no accounts, AppArmor policy, sysctl or existing
 service. All homes, files, model replies and effects are synthetic. A normal
 unprivileged developer run skips these opt-in tests and cannot establish kernel
 isolation.
@@ -206,18 +219,29 @@ The actual-runtime fixture checks both roles before and after daemon restart:
 own data is writable; peer reads/writes, gateway dummy secrets, policy replacement,
 shadow config creation, ancestor rename, hardlinks, symlink escapes, shared temp,
 harness private files, gateway/daemon sockets and loopback networking are denied.
-It also checks the official `apply_patch` tool and access to only the fixture's
-newly created daemon through `/proc` and a non-stopping ptrace request. It never
-reads another process's environment or memory. A positive unsandboxed control
-proves the peer file/business socket are otherwise accessible to the harness UID.
+It checks own/peer writes through the official `apply_patch` tool. The official
+`view_image` tool can read an own synthetic PNG but cannot read a peer PNG directly
+or through an own symlink. Process probes target only the fixture's newly created,
+peer-verified daemon: opening its `/proc` environment, root, file-descriptor and
+memory paths, a non-stopping ptrace request, and a signal-0 permission check are
+refused. No signal is delivered and no process environment or memory is read.
+A positive unsandboxed control proves the peer file/business socket are otherwise
+accessible to the harness UID.
 
 The full installed fixture uses the actual installer, two service UIDs, official
 daemon, public runtime adapter, MCP bridge, gateway and controller. It verifies
 message wakeups, independent approval, one memo despite repeated execution,
-task completion, read-only board output, durable pause/queue recovery and
-revocation across restart. Every expected test must execute: skipped checks,
-missing tool receipts, failed turns and missing kernel support fail CI.
+task completion, a timer queued during pause, and pause/queue/revocation state
+across graceful restart. It kills only its own controller to verify automatic
+fencing and supervised process recovery with the same registered roots, preserved
+pause/revocation and no repeated memo. The live board omits business payloads,
+rejects writes, reports loss of service and observes gateway fencing. Native
+terminal acceptance covers the precise `/status` and `/quit` sequence above.
+Every expected test must execute: skipped checks, missing tool receipts, failed
+turns and missing kernel support fail CI.
 
-Consult the workflow result for the exact tested revision. Mock acceptance does
-not test the real OpenAI service, any broker, arbitrary third-party MCP servers,
-or interactive terminal behavior. Those are separate acceptance scopes.
+The [complete acceptance run](https://github.com/hongdp/deskd/actions/runs/37250433109)
+at revision `3b7d7a79cc619a01a9654ee6e90b1ba2c81e4fc4` passed all four tests with
+zero skips in 31.08 seconds. Consult subsequent workflow results for later code
+revisions. This mock acceptance does not test the real OpenAI service, a broker,
+arbitrary third-party MCP servers, or interactive model conversations.
