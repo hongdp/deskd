@@ -72,11 +72,16 @@ The dedicated Linux tests exercise the actual official runtime separately.
 
 ## Work and responsibility
 
+For task assignment, two-way operator messages, independent review requests and
+published results, use the [paired human console](workspace-console.md). It is a
+separate administrative interface; the public board above remains read-only and
+continues to omit private contents.
+
 Seats use these fixed tools through the trusted bridge:
 
 | Tool | Result |
 | --- | --- |
-| `mail.send` | A durable intent addressed to a registered seat. Sender comes from the authenticated binding. |
+| `mail.send` | A durable intent addressed to a registered seat, or a result/question to the human mailbox `@supervisor`. Sender comes from the authenticated binding. |
 | `inbox.read`, `inbox.ack` | Read and explicitly acknowledge only the current seat's messages. |
 | `task.create`, `task.update`, `tasks.read` | Assign work, track dependencies and perform version-checked updates on owned/assigned tasks. |
 | `workspace.receipt` | Read the applied or rejected result of the caller's own queued collaboration intent, using its gateway event ID. |

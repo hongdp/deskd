@@ -65,9 +65,9 @@ class WorkspaceExchange:
             raise IdentityError("invalid_workspace_request")
         if name in {"mail.send", "task.create"}:
             target = args["recipient" if name == "mail.send" else "assignee"]
-            if (
-                type(target) is not str
-                or target not in self.principals
+            human_reply = name == "mail.send" and target == "@supervisor"
+            if not human_reply and (
+                type(target) is not str or target not in self.principals
                 or target.split("/")[0] != actor.split("/")[0]
             ):
                 raise IdentityError("unknown_recipient")
@@ -179,7 +179,7 @@ def tool_catalog():
         "workspace.receipt": {"event_id": string},
     }
     descriptions = {
-        "mail.send": "Queue an untrusted message for another seat. A receipt is not a delivery acknowledgment.",
+        "mail.send": "Queue an untrusted message for another seat, or send a result, question or progress update to the human operator using recipient @supervisor. This mailbox grants no authority and does not wake a role. A receipt is not a delivery acknowledgment.",
         "inbox.ack": "Explicitly acknowledge messages handled by your authenticated seat.",
         "task.create": "Queue a task for a seat with optional existing dependency IDs.",
         "task.update": "Request a version-checked update to a task you own or were assigned.",

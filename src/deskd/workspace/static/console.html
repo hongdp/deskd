@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>deskd · 工作台</title>
+  <link rel="stylesheet" href="/console.css">
+  <script src="/console.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+  <aside class="sidebar">
+    <a class="brand" href="#overview" aria-label="deskd 工作台"><span class="brand-mark" aria-hidden="true">d</span><span>deskd<span class="brand-caption">你的协作工作台</span></span></a>
+    <nav aria-label="工作台导航">
+      <button class="nav-item" data-view="overview" aria-current="page"><span class="nav-icon" aria-hidden="true">◫</span>总览</button>
+      <button class="nav-item" data-view="tasks"><span class="nav-icon" aria-hidden="true">☷</span>任务<span class="nav-count" id="nav-tasks">0</span></button>
+      <button class="nav-item" data-view="messages"><span class="nav-icon" aria-hidden="true">▤</span>消息<span class="nav-count" id="nav-messages">0</span></button>
+      <button class="nav-item" data-view="reviews"><span class="nav-icon" aria-hidden="true">◇</span>待复核<span class="nav-count" id="nav-reviews">0</span></button>
+      <button class="nav-item" data-view="results"><span class="nav-icon" aria-hidden="true">▱</span>成果</button>
+      <button class="nav-item" data-view="activity"><span class="nav-icon" aria-hidden="true">↗</span>动态</button>
+    </nav>
+    <div class="sidebar-bottom"><span class="identity-avatar" aria-hidden="true">我</span><div><strong>我的工作台</strong><p>以本人身份交办与跟进</p></div></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar">
+      <div class="breadcrumb">工作空间 <span aria-hidden="true">/</span> <span id="page-name">总览</span></div>
+      <div class="topbar-actions"><span id="connection" class="connection" role="status">正在连接</span><button id="refresh" class="icon-button" aria-label="刷新工作台" title="刷新工作台">↻</button><button id="theme" class="icon-button" aria-label="切换深浅主题" title="切换深浅主题">◐</button><button id="logout" class="text-button" hidden>断开访问</button></div>
+    </header>
+    <main id="main" tabindex="-1">
+      <section id="pairing" class="pairing-panel" aria-labelledby="pairing-title">
+        <div class="pairing-symbol" aria-hidden="true">◈</div><p class="eyebrow">欢迎来到 deskd</p><h1 id="pairing-title">连接你的工作台</h1>
+        <p id="pairing-description" class="muted">先在本机终端确认访问，再查看团队的任务、消息与成果。</p>
+        <div id="pairing-code-wrap" class="pairing-code-wrap" hidden><span class="field-label">本次访问编号</span><code id="pairing-code"></code><p>在启动工作台的终端中确认此编号。确认后，这里会自动打开。</p></div>
+        <button id="pair" class="primary-button">请求连接</button><p id="pairing-feedback" class="form-feedback" role="status"></p>
+      </section>
+      <div id="console-content" hidden>
+        <div id="banner" class="banner" role="status" hidden></div>
+        <div class="page-heading"><div><p class="eyebrow" id="page-eyebrow">每件事，都有着落</p><h1 id="page-title">工作台总览</h1><p id="page-description" class="muted">交办新任务，看看团队的进展。</p></div><button id="new-task" class="primary-button">＋ 交办任务</button></div>
+        <section id="view-overview" class="view" aria-label="总览">
+          <div id="metrics" class="metrics"></div>
+          <div class="overview-grid"><section class="panel composer-panel" aria-labelledby="composer-heading"><div class="section-heading"><h2 id="composer-heading">想让团队做些什么？</h2><span class="subtle">以你的身份发送</span></div>
+            <form id="composer"><div class="composer-options"><div class="segmented" role="group" aria-label="交办方式"><button type="button" data-compose="task" aria-pressed="true">交办任务</button><button type="button" data-compose="message" aria-pressed="false">发送消息</button></div><div class="recipient-field"><label for="recipient">交给</label><select id="recipient" name="recipient" required aria-label="接收角色"></select></div></div>
+              <div id="title-field"><label class="sr-only" for="task-title">任务标题</label><input id="task-title" name="title" placeholder="一句话说明要完成的事" maxlength="250" required autocomplete="off"></div>
+              <label class="sr-only" id="body-label" for="compose-body">任务要求</label><textarea id="compose-body" name="body" rows="4" maxlength="16000" placeholder="补充背景、交付要求或截止时间…"></textarea>
+              <div class="composer-footer"><p id="compose-hint">提交后进入任务队列，完成进展以任务状态为准。</p><button id="send" class="primary-button" type="submit">交办任务 <span aria-hidden="true">↗</span></button></div><p id="compose-feedback" class="form-feedback" role="status"></p>
+            </form></section><section class="panel attention-panel"><div class="section-heading"><h2>需要你关注</h2><span class="soft-label">此刻</span></div><div id="attention"></div></section></div>
+          <section class="section-spaced"><div class="section-heading"><div><h2>你的团队</h2><p class="section-description">每个角色独立工作，按分工协作。</p></div><span class="subtle">暂停仅影响后续自动唤醒</span></div><div id="roles" class="role-grid" data-live-list></div></section>
+          <section class="panel section-spaced"><div class="section-heading"><h2>近期任务</h2><button class="text-button" data-go="tasks">查看全部 →</button></div><div id="recent-tasks" data-live-list></div></section>
+        </section>
+        <section id="view-tasks" class="view" aria-label="任务" hidden><div class="filter-bar"><label for="task-filter">任务状态</label><select id="task-filter"><option value="open">进行中</option><option value="all">全部任务</option><option value="done">已完成</option><option value="cancelled">已取消</option></select><span class="subtle">完成由负责角色明确记录</span></div><div id="tasks-list" class="panel" data-live-list></div><p id="tasks-limit" class="limit-note" hidden>当前仅显示部分任务，其他记录仍保留在账本中。</p></section>
+        <section id="view-messages" class="view" aria-label="消息" hidden><div class="filter-bar"><label for="message-filter">对话角色</label><select id="message-filter"><option value="all">全部角色</option></select><button id="compose-message" class="text-button">发送新消息 →</button></div><p class="context-note">这里显示你与团队的往来。排队、已送达、已处理是不同状态；角色之间的私信不在这里展示。</p><div id="messages-list" class="messages-list" data-live-list></div><p id="messages-limit" class="limit-note" hidden>当前优先显示未读回复，部分往来未显示；标记已读后会继续显示其余未读回复。</p></section>
+        <section id="view-reviews" class="view" aria-label="待复核" hidden><p class="context-note">查看提案原文，指定另一角色独立复核。发送复核请求本身不授予执行权限。</p><div id="reviews-list" class="card-list" data-live-list></div><div id="approvals-list" class="section-spaced" data-live-list></div><p id="reviews-limit" class="limit-note" hidden>当前展示最近的提案与授权记录，较早记录仍保留在账本中。</p></section>
+        <section id="view-results" class="view" aria-label="成果" hidden><p class="context-note">这里汇集经独立授权发布的共享备忘录，以及角色记录为完成的任务。</p><div id="results-list" class="card-list" data-live-list></div><p id="results-limit" class="limit-note" hidden>当前展示最近的成果记录，较早记录仍保留在账本中。</p></section>
+        <section id="view-activity" class="view" aria-label="动态" hidden><div id="activity-list" class="panel" data-live-list></div><p id="activity-limit" class="limit-note" hidden>当前仅显示部分近期动态，其他记录仍保留在账本中。</p></section>
+        <footer class="workspace-footer"><span id="last-updated">尚未获取状态</span><span>角色身份独立 · 操作留有记录</span></footer>
+      </div>
+    </main>
+  </div>
+  <dialog id="detail-dialog" aria-labelledby="detail-title"><div class="dialog-header"><h2 id="detail-title"></h2><button id="close-dialog" class="icon-button" aria-label="关闭详情">×</button></div><div id="detail-body" class="dialog-body"></div><div id="detail-actions" class="dialog-actions"></div></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
