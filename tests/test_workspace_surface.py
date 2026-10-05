@@ -195,6 +195,46 @@ def test_business_connection_never_calls_admin_method(exchange, method):
         )
 
 
+def test_model_auth_is_absent_from_mcp_and_no_generic_tool_can_invoke_it(exchange):
+    from deskd.workspace.exchange import tool_catalog
+
+    _, _, events, commands, peers, transport = exchange
+    calls = []
+    transport.auth_provider = lambda: calls.append(True) or "SYNTHETIC-NOT-A-REAL-KEY"
+    assert "model.auth" not in {tool["name"] for tool in tool_catalog()}
+    with pytest.raises(IdentityError):
+        commands.execute("auth-spoof", request("model.auth", {}), peers["operator"])
+    assert calls == [] and events.events() == []
+    with pytest.raises(IdentityError, match="unknown_admin_method"):
+        transport._admin_call("model.auth", {})
+    assert calls == []
+
+
+def test_model_auth_requires_explicit_configuration_and_empty_fixed_arguments(exchange):
+    from deskd.gateway.wire import WireError
+
+    _, _, events, _, peers, transport = exchange
+    accepted = SimpleNamespace(evidence=peers["operator"])
+    with pytest.raises(IdentityError, match="model_auth_not_configured"):
+        transport._business_call("model.auth", {}, accepted)
+    calls = []
+    transport.auth_provider = lambda: calls.append(True) or "SYNTHETIC-NOT-A-REAL-KEY"
+    for params in (
+        {"path": "/synthetic/other"},
+        {"endpoint": "https://invalid.example"},
+        {"role": "analyst"},
+    ):
+        with pytest.raises(WireError, match="invalid_method_params"):
+            transport._business_call("model.auth", params, accepted)
+    assert calls == []
+    assert transport._business_call("model.auth", {}, accepted) == {
+        "token": "SYNTHETIC-NOT-A-REAL-KEY"
+    }
+    assert calls == [True] and events.events() == []
+    status = transport._business_call("status", {"_meta": request()["_meta"]}, accepted)
+    assert "SYNTHETIC-NOT-A-REAL-KEY" not in json.dumps(status)
+
+
 @contextmanager
 def board(snapshot):
     server = make_server(snapshot)

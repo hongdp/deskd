@@ -309,3 +309,50 @@ def test_all_revoked_roots_recover_without_resuming_or_reauthorizing(controlled)
     assert controller.tick() is None
     assert not any(method == "lease" for method, _ in trace)
     assert runtime.sent == []
+
+
+def test_bridge_disconnect_between_listing_and_renewal_does_not_fence_workspace(
+    controlled,
+):
+    controller, store, _, state, trace = controlled
+    controller.start()
+    state["connections"] = [
+        {"connection_id": "departed", "requested_root": "root-operator", "pid": 4242},
+        {"connection_id": "live", "requested_root": "root-reviewer", "pid": 4242},
+    ]
+    original = controller.admin
+
+    def disconnect(method, params):
+        if method == "lease" and params["connection_id"] == "departed":
+            return {"ok": False, "error": {"code": "unknown_live_connection"}}
+        return original(method, params)
+
+    controller.admin = disconnect
+    assert controller.tick() is None
+    assert store.snapshot()["service"]["active"] == 1
+    leases = [params for method, params in trace if method == "lease"]
+    assert [params["connection_id"] for params in leases] == ["live"]
+    assert sum(method == "fence" for method, _ in trace) == 1
+
+
+@pytest.mark.parametrize(
+    "code", ["binding_mismatch", "service_fenced", "channel_cannot_be_rebound"]
+)
+def test_only_disconnected_channel_error_is_tolerated_during_renewal(controlled, code):
+    controller, store, _, state, trace = controlled
+    controller.start()
+    state["connections"] = [
+        {"connection_id": "live", "requested_root": "root-operator", "pid": 4242}
+    ]
+    original = controller.admin
+
+    def reject(method, params):
+        if method == "lease":
+            return {"ok": False, "error": {"code": code}}
+        return original(method, params)
+
+    controller.admin = reject
+    with pytest.raises(WorkspaceError, match="gateway_control_rejected"):
+        controller.tick()
+    assert store.snapshot()["service"]["active"] == 0
+    assert trace[-1][0] == "fence"

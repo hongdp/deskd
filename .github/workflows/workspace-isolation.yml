@@ -6,6 +6,7 @@ on:
   pull_request:
     paths:
       - "src/deskd/workspace/**"
+      - "src/deskd/gateway/**"
       - "tests/test_workspace_linux_sandbox.py"
       - "tests/test_workspace_installed.py"
       - ".github/workflows/workspace-isolation.yml"
@@ -13,6 +14,7 @@ on:
     branches: [main]
     paths:
       - "src/deskd/workspace/**"
+      - "src/deskd/gateway/**"
       - "tests/test_workspace_linux_sandbox.py"
       - "tests/test_workspace_installed.py"
       - ".github/workflows/workspace-isolation.yml"
@@ -111,6 +113,33 @@ jobs:
           (resources / "bwrap").chmod(0o755)
           print("Verified official Codex 0.160.0 Linux x64 artifact.")
           FETCH_OFFICIAL
+          # Hosted setup-python ancestors belong to the runner account. Copy
+          # only its test interpreter environment into our root-owned scratchpad;
+          # do not relax installation checks or alter the host tool cache.
+          "$python_executable" - "$TMPDIR/python" <<'COPY_TEST_PYTHON'
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+          import subprocess
+          import sys
+
+          destination = Path(sys.argv[1])
+          shutil.copytree(Path(sys.base_prefix), destination, symlinks=False)
+          for path in [destination, *destination.rglob("*")]:
+              info = path.lstat()
+              if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                  raise SystemExit("Unexpected test interpreter entry")
+              path.chmod(0o755 if stat.S_ISDIR(info.st_mode) or info.st_mode & 0o111 else 0o644)
+              if path.stat().st_uid != 0:
+                  raise SystemExit("Test interpreter must be root owned")
+          interpreter = destination / "bin/python3.11"
+          subprocess.run([str(interpreter), "-I", "-B", "-c",
+                          "import cryptography,sys; assert sys.version_info >= (3,11)"],
+                         env={"PATH": "/usr/bin:/bin"}, check=True, timeout=10)
+          print("Prepared protected scratchpad test interpreter.")
+          COPY_TEST_PYTHON
+          export DESKD_SANDBOX_TEST_PYTHON="$TMPDIR/python/bin/python3.11"
           cd "$workspace"
           "$python_executable" -m pytest -o addopts='' -p no:cacheprovider \
             --basetemp="$TMPDIR/pytest" --junitxml="$TMPDIR/results.xml" \

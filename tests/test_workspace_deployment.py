@@ -313,7 +313,8 @@ def test_api_provider_has_fixed_endpoint_and_private_command_auth(declared):
     }
     assert not {"env_key", "experimental_bearer_token"} & set(provider)
     assert config["shell_environment_policy"] == {
-        "inherit": "none", "set": {"PATH": "/usr/bin:/bin"}
+        "inherit": "none",
+        "set": {"PATH": "/usr/bin:/bin"},
     }
     for role in instance.installation.roles:
         filesystem = config["permissions"][role.seat]["filesystem"]
@@ -322,11 +323,14 @@ def test_api_provider_has_fixed_endpoint_and_private_command_auth(declared):
         assert filesystem[str(instance.prefix / "harness")] == "deny"
 
 
-@pytest.mark.parametrize("kwargs", [
-    {"provider": "api", "mock_port": 12345},
-    {"provider": "custom"},
-    {"provider": "api", "model": "model\n[unauthorized]"},
-])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"provider": "api", "mock_port": 12345},
+        {"provider": "custom"},
+        {"provider": "api", "model": "model\n[unauthorized]"},
+    ],
+)
 def test_provider_does_not_accept_endpoint_or_config_injection(declared, kwargs):
     instance, _, _ = declared
     with pytest.raises(ValueError):
@@ -346,9 +350,19 @@ def install_model(tmp_path, monkeypatch):
     monkeypatch.setattr(deployment.os, "geteuid", lambda: 0)
     monkeypatch.setattr(deployment.os, "chown", lambda *_: None)
     monkeypatch.setattr(deployment, "_protected_directory", lambda _: None)
-    monkeypatch.setattr(deployment, "OFFICIAL_LINUX_X64_SHA256", hashlib.sha256(binary.read_bytes()).hexdigest())
-    monkeypatch.setattr(deployment, "OFFICIAL_BWRAP_SHA256", hashlib.sha256(helper.read_bytes()).hexdigest())
-    monkeypatch.setattr(deployment.subprocess, "run", lambda *_, **__: SimpleNamespace(stdout="1\n"))
+    monkeypatch.setattr(
+        deployment,
+        "OFFICIAL_LINUX_X64_SHA256",
+        hashlib.sha256(binary.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        deployment,
+        "OFFICIAL_BWRAP_SHA256",
+        hashlib.sha256(helper.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        deployment.subprocess, "run", lambda *_, **__: SimpleNamespace(stdout="1\n")
+    )
     return tmp_path / "i", binary
 
 
@@ -356,15 +370,23 @@ def install_model(tmp_path, monkeypatch):
 def test_install_writes_pinned_helpers_without_creating_a_key(install_model, provider):
     prefix, binary = install_model
     path = deployment.install(
-        prefix, binary=binary, harness_uid=12001, gateway_uid=12002,
-        business_gid=12003, provider=provider,
+        prefix,
+        binary=binary,
+        harness_uid=12001,
+        gateway_uid=12002,
+        business_gid=12003,
+        provider=provider,
         mock_port=12345 if provider == "mock" else None,
-        model="synthetic-model", python=Path("/usr/bin/python3"),
+        model="synthetic-model",
+        python=Path("/usr/bin/python3"),
     )
     manifest = json.loads(path.read_text())
     assert manifest["provider"] == provider and manifest["model"] == "synthetic-model"
     assert not (prefix / "gateway/model.key").exists()
-    for name, command in [("deskd-bridge", "bridge"), ("deskd-model-auth", "model-auth")]:
+    for name, command in [
+        ("deskd-bridge", "bridge"),
+        ("deskd-model-auth", "model-auth"),
+    ]:
         wrapper = prefix / "bin" / name
         if provider == "mock" and command == "model-auth":
             assert not wrapper.exists()
@@ -373,22 +395,42 @@ def test_install_writes_pinned_helpers_without_creating_a_key(install_model, pro
         assert text.startswith(f"#!{Path('/usr/bin/python3').resolve()} -I\n")
         assert text.index("sys.dont_write_bytecode = True") < text.index("from deskd.")
         assert f'main(["{command}", *sys.argv[1:]])' in text
-        assert manifest["inventory"][str(wrapper)] == hashlib.sha256(wrapper.read_bytes()).hexdigest()
+        assert (
+            manifest["inventory"][str(wrapper)]
+            == hashlib.sha256(wrapper.read_bytes()).hexdigest()
+        )
         assert stat.S_IMODE(wrapper.stat().st_mode) == 0o755
     assert not list((prefix / "lib").rglob("__pycache__"))
 
 
 @pytest.mark.parametrize("provider", ["api", "mock"])
-def test_install_cli_explicitly_selects_provider_without_key_arguments(monkeypatch, capsys, provider):
+def test_install_cli_explicitly_selects_provider_without_key_arguments(
+    monkeypatch, capsys, provider
+):
     from deskd.workspace.__main__ import main
 
     calls = []
-    monkeypatch.setattr(deployment, "install", lambda *args, **kwargs: calls.append((args, kwargs)) or Path("/synthetic/deployment.json"))
+    monkeypatch.setattr(
+        deployment,
+        "install",
+        lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or Path("/synthetic/deployment.json")
+        ),
+    )
     argv = [
-        "install" if provider == "api" else "install-mock", "--prefix", "/synthetic",
-        "--binary", "/synthetic/codex", "--harness-uid", "12001",
-        "--gateway-uid", "12002", "--business-gid", "12003",
-        "--model", "synthetic-model",
+        "install" if provider == "api" else "install-mock",
+        "--prefix",
+        "/synthetic",
+        "--binary",
+        "/synthetic/codex",
+        "--harness-uid",
+        "12001",
+        "--gateway-uid",
+        "12002",
+        "--business-gid",
+        "12003",
+        "--model",
+        "synthetic-model",
     ]
     if provider == "mock":
         argv += ["--mock-port", "12345"]
@@ -402,10 +444,25 @@ def test_install_cli_explicitly_selects_provider_without_key_arguments(monkeypat
 def test_api_install_cli_requires_explicit_model_before_install(monkeypatch):
     from deskd.workspace.__main__ import main
 
-    monkeypatch.setattr(deployment, "install", lambda *_, **__: pytest.fail("must not install"))
+    monkeypatch.setattr(
+        deployment, "install", lambda *_, **__: pytest.fail("must not install")
+    )
     with pytest.raises(SystemExit) as error:
-        main(["install", "--prefix", "/synthetic", "--binary", "/synthetic/codex",
-              "--harness-uid", "12001", "--gateway-uid", "12002", "--business-gid", "12003"])
+        main(
+            [
+                "install",
+                "--prefix",
+                "/synthetic",
+                "--binary",
+                "/synthetic/codex",
+                "--harness-uid",
+                "12001",
+                "--gateway-uid",
+                "12002",
+                "--business-gid",
+                "12003",
+            ]
+        )
     assert error.value.code == 2
 
 
@@ -424,9 +481,13 @@ def gateway_auth_model(declared, monkeypatch):
     instance.value["provider"] = "api"
     instance.value["mock_port"] = None
     instance.gateway_db.parent.mkdir()
-    (instance.prefix / "gateway/model.key").write_text("SYNTHETIC-ONLY-NOT-A-REAL-MODEL-KEY")
+    (instance.prefix / "gateway/model.key").write_text(
+        "SYNTHETIC-ONLY-NOT-A-REAL-MODEL-KEY"
+    )
     with sqlite3.connect(instance.gateway_db) as conn:
-        conn.execute("CREATE TABLE service(singleton INTEGER PRIMARY KEY, generation INTEGER, active INTEGER)")
+        conn.execute(
+            "CREATE TABLE service(singleton INTEGER PRIMARY KEY, generation INTEGER, active INTEGER)"
+        )
         conn.execute("INSERT INTO service VALUES(1,7,0)")
     state = {"reads": 0, "attested": 0, "tampered": False}
 
@@ -472,12 +533,16 @@ def gateway_auth_model(declared, monkeypatch):
 
     def status(generation, active):
         with sqlite3.connect(instance.gateway_db) as conn:
-            conn.execute("UPDATE service SET generation=?,active=?", (generation, active))
+            conn.execute(
+                "UPDATE service SET generation=?,active=?", (generation, active)
+            )
 
     return instance, state, status
 
 
-def test_model_key_read_waits_for_attested_current_active_generation(gateway_auth_model):
+def test_model_key_read_waits_for_attested_current_active_generation(
+    gateway_auth_model,
+):
     instance, state, status = gateway_auth_model
     deployment.run_installed("gateway", instance.path)
     assert state["reads"] == 0
@@ -515,15 +580,23 @@ def attach_model(declared, monkeypatch):
     """Observe the explicit human attach boundary without switching any UID."""
     instance, _, _ = declared
     seats = instance.seats()
-    rows = [{
-        "principal": seat.principal, "root_id": seat.root_id,
-        "manifest_hash": seat.manifest_hash,
-        "binding_generation": seat.binding_generation, "revoked": False,
-    } for seat in seats]
+    rows = [
+        {
+            "principal": seat.principal,
+            "root_id": seat.root_id,
+            "manifest_hash": seat.manifest_hash,
+            "binding_generation": seat.binding_generation,
+            "revoked": False,
+        }
+        for seat in seats
+    ]
     bindings = [{**row, "status": "bound"} for row in rows]
     replies = {
         "status": {"ok": True, "result": {"fenced": False}},
-        "workspace.status": {"ok": True, "result": {"service": {"active": 1}, "seats": rows}},
+        "workspace.status": {
+            "ok": True,
+            "result": {"service": {"active": 1}, "seats": rows},
+        },
         "workspace.bindings": {"ok": True, "result": bindings},
     }
     calls = []
@@ -547,31 +620,77 @@ def attach_model(declared, monkeypatch):
     monkeypatch.setattr(instance, "runtime", Runtime)
     monkeypatch.setattr(deployment.os, "geteuid", lambda: 0)
     for name in ("chdir", "setgroups", "setgid", "setuid", "execve"):
-        monkeypatch.setattr(deployment.os, name, lambda *args, name=name: calls.append((name, *args)))
+        monkeypatch.setattr(
+            deployment.os, name, lambda *args, name=name: calls.append((name, *args))
+        )
     monkeypatch.setenv("DESKD_SYNTHETIC_INHERITED_SECRET", "SYNTHETIC-NOT-A-REAL-KEY")
     return instance, replies, calls, runtime_failure
 
 
-def test_attach_checks_existing_root_then_drops_groups_gid_uid_before_exec(attach_model):
+def test_attach_checks_existing_root_then_drops_groups_gid_uid_before_exec(
+    attach_model,
+):
     instance, _, calls, _ = attach_model
     deployment.attach_seat(instance.path, "trader")
-    assert [call[0] for call in calls] == ["attest", "resume", "read", "close", "chdir", "setgroups", "setgid", "setuid", "execve"]
+    assert [call[0] for call in calls] == [
+        "attest",
+        "resume",
+        "read",
+        "close",
+        "chdir",
+        "setgroups",
+        "setgid",
+        "setuid",
+        "execve",
+    ]
     role = next(r for r in instance.installation.roles if r.seat == "trader")
     assert calls[1][1] == calls[2][1] == "root-trader"
     assert calls[1][2].permissions == "trader"
-    assert calls[4:8] == [("chdir", role.data), ("setgroups", [12003]), ("setgid", 12001), ("setuid", 12001)]
+    assert calls[4:8] == [
+        ("chdir", role.data),
+        ("setgroups", [12003]),
+        ("setgid", 12001),
+        ("setuid", 12001),
+    ]
     _, binary, argv, environment = calls[-1]
     assert binary == instance.installation.binary
-    assert argv == [binary, "--remote", "unix://" + str(instance.prefix / "harness/app-server-control/app-server-control.sock"), "--cd", role.data, "resume", "root-trader"]
-    assert environment == {**instance.plan["launch"]["environment"], "TERM": "xterm-256color"}
+    assert argv == [
+        binary,
+        "--remote",
+        "unix://"
+        + str(instance.prefix / "harness/app-server-control/app-server-control.sock"),
+        "--cd",
+        role.data,
+        "resume",
+        "root-trader",
+    ]
+    assert environment == {
+        **instance.plan["launch"]["environment"],
+        "TERM": "xterm-256color",
+    }
     assert "DESKD_SYNTHETIC_INHERITED_SECRET" not in environment
 
 
-@pytest.mark.parametrize("failure", [
-    "fenced", "inactive", "status_error", "revoked", "binding_revoked", "missing_binding",
-    "workspace_root", "workspace_hash", "workspace_generation", "binding_root", "binding_hash", "binding_generation",
-])
-def test_attach_denies_unready_or_changed_authority_before_runtime_or_privilege_drop(attach_model, failure):
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "fenced",
+        "inactive",
+        "status_error",
+        "revoked",
+        "binding_revoked",
+        "missing_binding",
+        "workspace_root",
+        "workspace_hash",
+        "workspace_generation",
+        "binding_root",
+        "binding_hash",
+        "binding_generation",
+    ],
+)
+def test_attach_denies_unready_or_changed_authority_before_runtime_or_privilege_drop(
+    attach_model, failure
+):
     instance, replies, calls, _ = attach_model
     row = replies["workspace.status"]["result"]["seats"][1]
     binding = replies["workspace.bindings"]["result"][1]
@@ -590,9 +709,15 @@ def test_attach_denies_unready_or_changed_authority_before_runtime_or_privilege_
         replies["workspace.bindings"]["result"].remove(binding)
     else:
         target = row if failure.startswith("workspace") else binding
-        key = {"root": "root_id", "hash": "manifest_hash", "generation": "binding_generation"}[failure.split("_")[1]]
+        key = {
+            "root": "root_id",
+            "hash": "manifest_hash",
+            "generation": "binding_generation",
+        }[failure.split("_")[1]]
         target[key] = 2 if key == "binding_generation" else "changed"
-    with pytest.raises(ValueError, match="managed_workspace_not_ready|seat_not_authorized"):
+    with pytest.raises(
+        ValueError, match="managed_workspace_not_ready|seat_not_authorized"
+    ):
         deployment.attach_seat(instance.path, "trader")
     assert calls == [("attest",)]
 
@@ -614,6 +739,8 @@ def test_attach_unknown_seat_never_spawns_a_new_root(attach_model):
 
 def test_attach_requires_independent_administrator_before_manifest_read(monkeypatch):
     monkeypatch.setattr(deployment.os, "geteuid", lambda: 12001)
-    monkeypatch.setattr(deployment, "Deployment", lambda _: pytest.fail("must not read manifest"))
+    monkeypatch.setattr(
+        deployment, "Deployment", lambda _: pytest.fail("must not read manifest")
+    )
     with pytest.raises(ValueError, match="independent_administrator_required"):
         deployment.attach_seat(Path("/synthetic"), "trader")

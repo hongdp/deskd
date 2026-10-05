@@ -331,7 +331,7 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board():
         manifest = install(
             prefix,
             binary=root / "official/codex",
-            python=Path(sys.executable),
+            python=Path(os.environ["DESKD_SANDBOX_TEST_PYTHON"]),
             harness_uid=HARNESS_UID,
             gateway_uid=GATEWAY_UID,
             business_gid=BUSINESS_GID,

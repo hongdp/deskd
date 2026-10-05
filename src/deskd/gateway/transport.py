@@ -1,4 +1,4 @@
-"""Linux UDS boundary for the gateway's fixed, credential-free local protocol.
+"""Linux UDS boundary for the gateway's fixed local protocol.
 
 Business peers cannot invoke management verbs. SO_PEERCRED proves a process UID,
 not a role: authentic MCP metadata still depends on the sandboxed harness trust
@@ -10,6 +10,8 @@ Wire: {id: str, method: str, params: object}; response is {id, ok, result} or
 execute.params = {request_id, mcp: {name, arguments, _meta}}.
 Management methods: status, connections, bind, revoke, activate, fence, lease.
 There is no general SQL, process execution, remote URL or upstream tool proxy.
+An explicit installed API profile can additionally supply a private model.auth
+callback for the trusted runtime; it is not a model-visible MCP tool.
 """
 
 from __future__ import annotations

@@ -1,8 +1,9 @@
 """Compose the fixed collaboration surface with the existing gateway.
 
 Configuration and OS directory preparation belong to the privileged installer.
-This module opens only explicitly supplied databases and socket paths. It never
-reads a credential, auto-binds a role or starts another runtime instance.
+This module opens only explicitly supplied databases and socket paths. An API
+installation may supply its separately guarded model-auth callback. This module
+never discovers credentials, auto-binds a role or starts another runtime instance.
 """
 
 from __future__ import annotations
