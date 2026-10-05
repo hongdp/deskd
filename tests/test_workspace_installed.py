@@ -24,6 +24,7 @@ import tempfile
 import termios
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.request
 
@@ -761,6 +762,29 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
         assert lifecycle
     except Exception:
         if "deployment" in locals():
+            # Only this fresh mock installation's generated non-secret config.
+            # Print differing key names, never values or another host's config.
+            config_path = prefix / "harness/config.toml"
+            expected_config = next(
+                item["content"]
+                for item in deployment.plan["files"]
+                if item["path"] == str(config_path)
+            )
+            before = tomllib.loads(expected_config)
+            after = tomllib.loads(config_path.read_text())
+
+            def changed_keys(left, right, stem=""):
+                if isinstance(left, dict) and isinstance(right, dict):
+                    return [
+                        key
+                        for name in sorted(left.keys() | right.keys())
+                        for key in changed_keys(
+                            left.get(name), right.get(name), stem + "/" + name
+                        )
+                    ]
+                return [stem] if left != right else []
+
+            print("SYNTHETIC CONFIG CHANGED KEYS", changed_keys(before, after))
             for name in deployment.value["inventory"]:
                 path = Path(name)
                 assert prefix in path.parents
