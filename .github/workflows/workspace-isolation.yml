@@ -141,9 +141,18 @@ jobs:
           COPY_TEST_PYTHON
           export DESKD_SANDBOX_TEST_PYTHON="$TMPDIR/python/bin/python3.11"
           cd "$workspace"
-          "$python_executable" -m pytest -o addopts='' -p no:cacheprovider \
-            --basetemp="$TMPDIR/pytest" --junitxml="$TMPDIR/results.xml" \
+          # All actual runtime/model/terminal probes run with loopback only in
+          # a fresh network namespace. Artifact downloads are already complete.
+          # The host network is unchanged; role shells still get their own
+          # stricter official sandbox network boundary inside this namespace.
+          /usr/bin/unshare --net --fork /bin/bash --noprofile --norc -s -- \
+            "$python_executable" "$TMPDIR" <<'PRIVATE_TEST_NETWORK'
+          set -euo pipefail
+          /usr/sbin/ip link set lo up
+          "$1" -m pytest -o addopts='' -p no:cacheprovider \
+            --basetemp="$2/pytest" --junitxml="$2/results.xml" \
             tests/test_workspace_linux_sandbox.py tests/test_workspace_installed.py -q
+          PRIVATE_TEST_NETWORK
           "$python_executable" - "$TMPDIR/results.xml" <<'VERIFY_EXECUTION'
           import sys
           import xml.etree.ElementTree as ET

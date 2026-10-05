@@ -553,18 +553,26 @@ class CodexRuntime:
         binding = self._bind(
             self._request(
                 "thread/start",
-                {**config.params(), "ephemeral": False, "historyMode": "paginated"},
+                {**config.params(), "ephemeral": False, "historyMode": "legacy"},
             ),
             config,
         )
         try:
             # Official 0.160.0 stages a new empty root without materializing its
-            # store entry. The public paginated read persists it without a model
-            # turn; resume on a later connection otherwise rejects that root.
-            # Never report a durable binding until this identity-checked read
-            # succeeds. A lost response closes the connection, with no retry or
-            # replacement root created here.
-            self.read_root(binding.thread_id, include_turns=True)
+            # store entry. Its public explicit-name update persists a legacy
+            # root without a model turn. The label is display metadata only;
+            # authority remains the exact verified root ID and configuration.
+            # Never report a durable binding until the metadata operation and
+            # identity-checked read succeed. No retry or replacement follows an
+            # ambiguous response.
+            self._request(
+                "thread/name/set",
+                {
+                    "threadId": binding.thread_id,
+                    "name": "deskd " + (config.permissions or "root"),
+                },
+            )
+            self.read_root(binding.thread_id)
         except Exception:
             self.close()
             raise

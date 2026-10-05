@@ -156,6 +156,7 @@ class MockDaemon:
                             "platformOs": "linux",
                         },
                         "thread/start": settings(),
+                        "thread/name/set": {},
                         "thread/resume": settings(),
                         "thread/read": {"thread": thread_info()},
                         "thread/turns/list": {
@@ -265,23 +266,38 @@ def test_empty_root_is_materialized_before_binding_returns_without_model_turn():
             for m in server.messages
             if m.get("method", "").startswith(("thread/", "turn/"))
         ]
-        assert [m["method"] for m in calls] == ["thread/start", "thread/read"]
+        assert [m["method"] for m in calls] == [
+            "thread/start",
+            "thread/name/set",
+            "thread/read",
+        ]
         assert calls[0]["params"]["ephemeral"] is False
-        assert calls[0]["params"]["historyMode"] == "paginated"
+        assert calls[0]["params"]["historyMode"] == "legacy"
         assert calls[1]["params"] == {
             "threadId": binding.thread_id,
-            "includeTurns": True,
+            "name": "deskd root",
+        }
+        assert calls[2]["params"] == {
+            "threadId": binding.thread_id,
+            "includeTurns": False,
         }
 
 
-@pytest.mark.parametrize("failure", ["rejected", "lost", "wrong_root"])
+@pytest.mark.parametrize(
+    "failure", ["rejected", "lost", "wrong_root", "read_rejected", "read_lost"]
+)
 def test_materialization_failure_closes_without_recreating_or_starting_a_turn(failure):
     def handler(conn, message):
-        if message["method"] != "thread/read":
+        target = (
+            "thread/read"
+            if failure in {"wrong_root", "read_rejected", "read_lost"}
+            else "thread/name/set"
+        )
+        if message["method"] != target:
             return False
-        if failure == "lost":
+        if failure in {"lost", "read_lost"}:
             conn.shutdown(socket.SHUT_RDWR)
-        elif failure == "rejected":
+        elif failure in {"rejected", "read_rejected"}:
             conn.sendall(
                 frame(
                     {
@@ -314,7 +330,10 @@ def test_materialization_failure_closes_without_recreating_or_starting_a_turn(fa
             client.start_root(config())
         assert client._socket is None and client._roots == {}
         assert sum(m.get("method") == "thread/start" for m in server.messages) == 1
-        assert sum(m.get("method") == "thread/read" for m in server.messages) == 1
+        assert sum(m.get("method") == "thread/name/set" for m in server.messages) == 1
+        assert sum(m.get("method") == "thread/read" for m in server.messages) == int(
+            failure in {"wrong_root", "read_rejected", "read_lost"}
+        )
         assert not any(
             m.get("method") in {"turn/start", "thread/resume"} for m in server.messages
         )
@@ -542,7 +561,7 @@ def test_settings_changed_notification_invalidates_binding():
 
     with daemon(handler) as (client, _):
         client.connect()
-        client.start_root(config())
+        client.resume_root("root-1", config())
         with pytest.raises(RuntimePolicyError):
             client.read_root("root-1")
         assert client._socket is None
@@ -623,7 +642,7 @@ def test_read_root_rejects_changed_cwd():
 
     with daemon(handler) as (client, _):
         client.connect()
-        client.start_root(config())
+        client.resume_root("root-1", config())
         with pytest.raises(RuntimePolicyError):
             client.read_root("root-1")
         assert client._socket is None
