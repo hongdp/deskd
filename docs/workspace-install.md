@@ -110,6 +110,11 @@ human entry into the harness, not an untrusted role sandbox. The automated
 acceptance exercises the public daemon protocol; interactive terminal keystrokes
 remain a separate manual acceptance item.
 
+The installation keeps the administrator-selected model fixed and suppresses
+the pinned runtime's model migration notices. Changing a role's model or
+permissions requires an updated managed installation; an unexpected terminal
+settings change fences the workspace.
+
 Run the read-only board in another administrator terminal:
 
 ```sh

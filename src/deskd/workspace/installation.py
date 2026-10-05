@@ -33,6 +33,15 @@ BRIDGE_WRITE_TOOLS = (
     "task.create",
     "task.update",
 )
+# The pinned official catalogue advertises these UI migrations even for custom
+# providers. The administrator selected a fixed model; acknowledge the notices
+# without migrating it or letting terminal startup rewrite attested policy.
+OFFICIAL_MODEL_MIGRATIONS = {
+    "gpt-5.6-sol": "gpt-6-sol",
+    "gpt-5.6-terra": "gpt-6-sol",
+    "gpt-5.6-luna": "gpt-6-luna",
+    "gpt-5.5": "gpt-6-sol",
+}
 
 
 def _path(value: str) -> str:
@@ -164,6 +173,11 @@ class Installation:
             lines.append('model_provider = "deskd_api"')
         elif mock_port is not None:
             lines.append('model_provider = "deskd_mock"')
+        lines.append("[notice.model_migrations]")
+        lines += [
+            f"{_quote(old)} = {_quote(new)}"
+            for old, new in OFFICIAL_MODEL_MIGRATIONS.items()
+        ]
         lines += [
             "[memories]",
             "generate_memories = false",

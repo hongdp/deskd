@@ -405,9 +405,18 @@ def _native_attach(deployment, manager, mock, roots):
                 for _ in range(count - replies.get(query, 0)):
                     os.write(master, answer)
                 replies[query] = count
+        visible = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", bytes(output))
+        assert not any(
+            marker in visible
+            for marker in (
+                b"Meet GPT-6 Sol",
+                b"Try new model",
+                b"Codex just got an upgrade.",
+            )
+        ), "native terminal offered a model migration instead of a ready composer"
         manager.tick()
         assert mock.failure is None and mock.calls == before_calls
-        return re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", bytes(output))
+        return visible
 
     try:
         process = subprocess.Popen(

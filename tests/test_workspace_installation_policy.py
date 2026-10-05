@@ -53,6 +53,13 @@ def test_fixed_profiles_disable_hook_discovery_and_hosted_image_generation(provi
     expected_tools = {tool["name"] for tool in tool_catalog()}
     expected_reads = {"inbox.read", "tasks.read", "workspace.receipt"}
     assert base["approval_policy"] == "never"
+    assert base["model"] == "gpt-5.5"
+    assert base["notice"]["model_migrations"] == {
+        "gpt-5.6-sol": "gpt-6-sol",
+        "gpt-5.6-terra": "gpt-6-sol",
+        "gpt-5.6-luna": "gpt-6-luna",
+        "gpt-5.5": "gpt-6-sol",
+    }
     for config in configs.values():
         bridge = config["mcp_servers"]["deskd"]
         assert set(bridge["enabled_tools"]) == expected_tools
