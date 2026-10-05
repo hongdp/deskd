@@ -439,7 +439,7 @@ class WorkspaceStore:
     ) -> dict:
         if (
             conn.execute(
-                "SELECT count(*) FROM messages WHERE recipient=? AND state!='handled'",
+                "SELECT count(*) FROM messages WHERE recipient=? AND state NOT IN ('handled','goal_closed')",
                 (recipient,),
             ).fetchone()[0]
             >= 10_000
@@ -595,7 +595,7 @@ class WorkspaceStore:
             }
             return self._save_receipt(conn, "@supervisor", request_id, fingerprint, result)
 
-    def apply_gateway_event(self, event: dict) -> dict:
+    def apply_gateway_event(self, event: dict, *, projectors=None) -> dict:
         """Project one trusted gateway outbox fact and receipt in one transaction.
 
         This is not an ingress for caller-created events. The wrapper must read
@@ -682,6 +682,8 @@ class WorkspaceStore:
                         args["status"],
                         expected_version=args["expected_version"],
                     )
+                elif projectors is not None and action in projectors:
+                    result = projectors[action](actor, args, event_id)
                 else:
                     raise WorkspaceError("invalid_gateway_action")
                 result = {"applied": True, "result": result}
@@ -718,7 +720,7 @@ class WorkspaceStore:
         _integer(limit, "limit", 1, 1000)
         with self._connect() as conn:
             self._seat(conn, actor)
-            where = "" if include_handled else " AND state!='handled'"
+            where = "" if include_handled else " AND state NOT IN ('handled','goal_closed','goal_paused')"
             return [
                 dict(row)
                 for row in conn.execute(
@@ -753,7 +755,7 @@ class WorkspaceStore:
             rows = [
                 dict(row)
                 for row in conn.execute(
-                    "SELECT * FROM messages WHERE recipient=? AND state!='handled' "
+                    "SELECT * FROM messages WHERE recipient=? AND state NOT IN ('handled','goal_closed','goal_paused') "
                     "AND id>? ORDER BY id LIMIT ?",
                     (actor, after, limit + 1),
                 )
@@ -1495,7 +1497,7 @@ class WorkspaceStore:
                     )
                 }
                 seat["oldest_unhandled_at"] = conn.execute(
-                    "SELECT min(created_at) FROM messages WHERE recipient=? AND state!='handled'",
+                    "SELECT min(created_at) FROM messages WHERE recipient=? AND state NOT IN ('handled','goal_closed','goal_paused')",
                     (seat["principal"],),
                 ).fetchone()[0]
                 seat["next_trigger_at"] = conn.execute(

@@ -51,6 +51,15 @@ def main(argv=None):
             "workspace.store.schedule_timer",
             "workspace.store.cancel_timer",
             "workspace.revoke",
+            "workspace.console.extended",
+            "workspace.goal.create",
+            "workspace.goal.update",
+            "workspace.goal.answer",
+            "workspace.source.configure",
+            "workspace.source.disable",
+            "workspace.notification.configure",
+            "workspace.notification.ack",
+            "workspace.memory.search",
             "status",
             "connections",
             "bind",
@@ -65,6 +74,19 @@ def main(argv=None):
         "demo", help="rehearse durable collaboration with a fixed mock runtime"
     )
     demo.add_argument("--output", type=Path, required=True)
+    backup = sub.add_parser("backup", help="export offline domain facts without runtime authority")
+    backup.add_argument("--workspace-db", type=Path, required=True)
+    backup.add_argument("--gateway-db", type=Path, required=True)
+    backup.add_argument("--output", type=Path, required=True)
+    backup.add_argument("--offline-confirmed", action="store_true")
+    verify = sub.add_parser("verify-backup", help="verify a detached facts archive")
+    verify.add_argument("--archive", type=Path, required=True)
+    restore = sub.add_parser("restore-archive", help="restore detached facts into a fresh directory")
+    restore.add_argument("--archive", type=Path, required=True)
+    restore.add_argument("--output", type=Path, required=True)
+    unit = sub.add_parser("service-template", help="print an inert service unit for review")
+    unit.add_argument("--python", required=True)
+    unit.add_argument("--deployment", required=True)
     for name, help_text in (
         (
             "install",
@@ -101,7 +123,21 @@ def main(argv=None):
             command.add_argument("--daemon-pid", type=int, required=True)
     args = parser.parse_args(argv)
     try:
-        if args.command == "model-auth":
+        if args.command in {"backup", "verify-backup", "restore-archive", "service-template"}:
+            from .operations import export_backup, verify_backup, restore_archive, render_service_unit
+
+            if args.command == "backup":
+                result = export_backup(args.workspace_db, args.gateway_db, args.output, offline_confirmed=args.offline_confirmed)
+            elif args.command == "verify-backup":
+                result = verify_backup(args.archive)
+            elif args.command == "restore-archive":
+                result = restore_archive(args.archive, args.output)
+            else:
+                print(render_service_unit(python_executable=args.python, deployment=args.deployment), end="")
+                return 0
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+        elif args.command == "model-auth":
             from .model_auth import helper_main
 
             return helper_main(args.socket, args.gateway_uid, sys.stdout.buffer)

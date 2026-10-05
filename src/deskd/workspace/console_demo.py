@@ -83,6 +83,30 @@ def create_demo(output):
     call("trader", "proposal.create", {
         "executor_principal": "demo/trader", "body": "待复核示例：将下周工作计划记录为一份本地备忘录。仅影响此演示账本。",
     }, "seed-proposal-pending")
+    # Explicit synthetic examples only. No source worker, model or dispatcher runs.
+    gateway.automation.sources.configure("demo-news", "https://example.test/demo-news")
+    note = gateway.automation.knowledge.remember(
+        "demo/engineer", "示例共享知识：交付前检查", "这是合成示例笔记。交付前核对来源、独立复核结论与成果记录。",
+        sources=[], request_id="seed-shared-note",
+    )
+    gateway.automation.knowledge.publish(
+        "demo/engineer", note["id"], expected_version=note["version"], request_id="seed-publish-note",
+    )
+    gateway.automation.knowledge.remember(
+        "demo/trader", "演示私人笔记", "PRIVATE_SYNTHETIC_NOTE_NOT_SHARED",
+        sources=[], request_id="seed-private-note",
+    )
+    goal = gateway.automation.create_goal(
+        title="示例目标：整理公开动态", objective="这是预置的模拟目标。调研公开资料，经独立复核后交付一份共享备忘录。",
+        researcher="demo/engineer", reviewer="demo/analyst", executor="demo/trader",
+        source_ids=["demo-news"], request_id="seed-goal", interval_seconds=None,
+        max_cycles=1, followup_seconds=3600, max_followups=2,
+    )
+    gateway.automation.goals.ask(
+        "demo/engineer", goal_id=goal["id"], question="示例问题：这次应关注最近一周还是最近一个月？回答后只更新演示账本，不会调用模型。",
+        request_id="seed-goal-question",
+    )
+    gateway.automation.tick()
     handlers = gateway._handlers()
 
     def admin(method, params):
@@ -93,4 +117,6 @@ def create_demo(output):
         except IdentityError as exc:
             return {"ok": False, "error": {"code": exc.code}}
 
-    return ConsoleBackend(admin, mode="demo")
+    backend = ConsoleBackend(admin, mode="demo")
+    backend._demo_gateway = gateway  # Synthetic-only fixture; never an HTTP route.
+    return backend

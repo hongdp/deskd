@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 
 from deskd.gateway.actions import MemoWorkflow, WORKFLOW_ACTIONS
 from deskd.gateway.commands import GatewayCommands
@@ -20,6 +21,7 @@ from deskd.gateway.registry import Registry
 from deskd.gateway.transport import GatewayTransport
 from .exchange import ACTIONS, WorkspaceExchange
 from .store import WorkspaceError, WorkspaceStore
+from .automation import WorkspaceAutomation
 
 
 # Explicit, closed administrative protocol. It does not accept a method name,
@@ -131,13 +133,14 @@ class WorkspaceGateway:
         self.events = GatewayEventStore(gateway_db)
         self.memos = MemoWorkflow(gateway_db)
         self.store = WorkspaceStore(coordination_db)
+        self.automation = WorkspaceAutomation(self.store, self.registry.db_path)
         self.exchange = WorkspaceExchange(
-            self.events, self.store, principals=principals
+            self.events, self.store, principals=principals, extended=self.automation.exchange
         )
         self.commands = GatewayCommands(
             self.registry,
             self.events,
-            handlers={**self.memos.handlers(), **self.exchange.handlers()},
+            handlers={**self.automation.memo_handlers(self.memos.handlers()), **self.exchange.handlers()},
         )
         self.transport = GatewayTransport(
             self.registry,
@@ -153,6 +156,8 @@ class WorkspaceGateway:
         )
         self.stopping = threading.Event()
         self._management_lock = threading.RLock()
+        self._source_thread = None
+        self._notification_thread = None
 
     @staticmethod
     def _fields(params, names):
@@ -425,6 +430,7 @@ class WorkspaceGateway:
             }
 
         return {
+            **{name: guarded(callback) for name, callback in self.automation.handlers().items()},
             "workspace.status": guarded(status),
             "workspace.console.snapshot": guarded(console_snapshot),
             "workspace.console.task": guarded(console_task),
@@ -445,15 +451,53 @@ class WorkspaceGateway:
 
     def start(self):
         self.transport.start()
+        self._source_thread = threading.Thread(target=self._source_worker, daemon=True, name="deskd-sources")
+        self._source_thread.start()
+        self._notification_thread = threading.Thread(target=self._notification_worker, daemon=True, name="deskd-attention")
+        self._notification_thread.start()
         return self
 
+    def _source_worker(self):
+        while not self.stopping.wait(0.2):
+            try:
+                # Network reads never hold the management or outbox lock.
+                if self.automation.active():
+                    self.automation.sources.process_next()
+            except Exception:
+                # Deliberately omit paths, payloads and underlying transport text.
+                self.automation.notifications.emit("error", "source_worker", "worker_error",
+                                                   "信息获取暂时不可用", "请检查工作台中的信息源状态。")
+
+    def tick(self):
+        with self._management_lock:
+            self.exchange.pump()
+            self.automation.tick()
+
+    def _notification_worker(self):
+        while not self.stopping.wait(1):
+            try:
+                self.automation.dispatch_notifications()
+            except Exception:
+                # Delivery retries and their final failure are visible in health.
+                self.automation.notifications.emit("error", "notification_worker", "worker_error",
+                                                   "通知发送暂时不可用", "请在工作台查看待处理通知。")
+
     def serve_forever(self):
+        next_tick = 0
         try:
             while not self.stopping.wait(0.05):
-                self.exchange.pump()
+                with self._management_lock:
+                    self.exchange.pump()
+                    if time.monotonic() >= next_tick:
+                        self.automation.tick()
+                        next_tick = time.monotonic() + 1
         finally:
             self.close()
 
     def close(self):
         self.stopping.set()
         self.transport.close()
+        if self._source_thread and self._source_thread is not threading.current_thread():
+            self._source_thread.join(timeout=0.5)
+        if self._notification_thread and self._notification_thread is not threading.current_thread():
+            self._notification_thread.join(timeout=0.5)

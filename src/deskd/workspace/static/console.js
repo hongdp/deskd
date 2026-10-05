@@ -13,7 +13,8 @@
   const state = {
     paired: false, connected: false, snapshot: null, view: "overview", compose: "task",
     pending: false, refreshing: false, lastUpdated: null, timer: null, toastTimer: null,
-    intent: null, rendered: null, proof: null, epoch: 0,
+    intent: null, rendered: null, proof: null, epoch: 0, extended: null,
+    goalIntent: null, goalRequests: new Map(), knowledgeResults: null,
   };
   const labels = {
     queued: "排队中", delivering: "正在送达", delivered: "已送达", handled: "已处理",
@@ -30,6 +31,11 @@
     reviews: ["待复核", "让决策有所依据", "提案与独立复核", "先看清提案，再交给有权限的另一角色复核。"],
     results: ["成果", "把工作留在这里", "团队成果", "查看共享备忘录与已完成任务。"],
     activity: ["动态", "进展清晰可见", "工作动态", "任务、消息和调度的重要变化。"],
+    goals: ["持续目标", "交代目标，持续推进", "持续目标", "让团队完成调研、独立复核与交付，并在需要时主动找你。"],
+    notifications: ["提醒", "只在需要时打扰", "需要你关注", "重要变化集中在这里，相同状态保持安静。"],
+    sources: ["信息来源", "让工作有据可查", "允许读取的来源", "明确团队可以获取哪些公开信息。"],
+    knowledge: ["共享知识", "积累可以复用的经验", "团队共享知识", "查找角色主动分享的结论与工作笔记。"],
+    operations: ["运行维护", "持续、可控地运行", "运行与恢复", "查看健康状态、额度与恢复边界。"],
   };
   const eventLabels = {
     "task.created": "创建了任务", "task.updated": "更新了任务进度", "task.cancelled": "取消了任务",
@@ -47,6 +53,10 @@
     "console.read": "你已读消息", "console.cancel": "你取消了任务",
     "memo.proposed": "提交了共享备忘录提案", "memo.approved": "独立授权了提案", "memo.published": "发布了共享备忘录",
     "review.requested": "请求了独立复核",
+    "goal.created": "创建了持续目标", "goal.active": "恢复了目标推进", "goal.paused": "暂停了目标推进",
+    "goal.completed": "完成了目标交付", "goal.cancelled": "取消了持续目标", "goal.waiting_human": "目标需要你的决定",
+    "source.configured": "配置了允许读取的信息来源", "source.disabled": "停用了信息来源",
+    "memory.published": "分享了工作笔记", "memory.revised": "更新了角色笔记", "memory.forgotten": "删除了角色笔记",
   };
   const errors = {
     session_required: "访问已到期，请重新连接工作台。",
@@ -64,11 +74,29 @@
     proposal_already_executed: "这项提案已经执行，无需再次请求复核。",
     independent_reviewer_required: "复核角色必须不同于指定执行人，请重新选择。",
     reviewer_not_authorized: "该角色目前没有复核权限，请刷新后重新选择。",
+    goal_requires_independent_participants: "调研、复核与交付须由三位不同角色负责。",
+    invalid_source_ids: "请至少选择一个已配置的信息来源。", goal_interval_required: "重复执行的目标需要指定间隔。",
+    goal_state_conflict: "目标状态已经变化，请查看最新进展后再操作。", goal_closed: "目标已经结束，不能继续修改。",
+    source_url_rejected: "请输入不含登录信息、查询参数或片段的公开 HTTPS 地址。",
+    invalid_source_name: "来源名称须以小写字母开头，只包含小写字母、数字、短横线或下划线。",
+    source_address_rejected: "该地址不属于允许读取的公开网络。", unknown_goal: "该目标已不可用，请刷新。",
+    source_configuration_limit: "信息来源已达到 100 个配置的上限，请使用已有来源。",
+    goal_participant_not_authorized: "所选角色没有完成对应阶段所需的权限，请选择其他角色或请管理员调整权限。",
     task_not_owned: "这里只能取消你交办的任务。",
     forbidden_origin: "无法从当前页面操作，请使用启动终端给出的本地工作台地址。",
     outcome_unknown: "连接中断，尚不能确认操作是否完成。请先核对最新记录，避免重复操作。",
     status_unavailable: "暂时无法获取工作台状态。保留的内容可能已过时。",
     console_unavailable: "工作台暂时不可用，请检查启动终端。",
+  };
+  const blockedReasons = {
+    participant_revoked: "参与角色已停用，需要管理员调整安排。",
+    seat_budget_exhausted: "负责角色的自动工作次数已用完，需要补充额度。",
+    task_cancelled: "当前阶段的任务已取消，需要重新确认目标安排。",
+    followup_budget_exhausted: "已达到自动跟进次数上限，需要你查看进展后决定下一步。",
+    approval_unavailable: "缺少可用的独立授权，需要复核角色确认。",
+    approval_revoked: "独立授权已被撤销，当前不能继续交付。",
+    approval_expired: "独立授权已过期，需要重新复核后才能交付。",
+    delivery_mismatch: "交付记录与本轮复核凭据不一致，需要人工核实。",
   };
 
   function randomId() {
@@ -196,6 +224,10 @@
     state.snapshot = null;
     state.rendered = null;
     state.intent = null;
+    state.extended = null;
+    state.goalIntent = null;
+    state.goalRequests.clear();
+    state.knowledgeResults = null;
     state.pending = false;
     $("#console-content").hidden = true;
     $("#pairing").hidden = false;
@@ -210,14 +242,18 @@
     clearTimeout(state.toastTimer);
     $("#toast").hidden = true;
     $("#toast").textContent = "";
-    ["#metrics", "#attention", "#roles", "#recent-tasks", "#tasks-list", "#messages-list", "#reviews-list", "#approvals-list", "#results-list", "#activity-list"].forEach((selector) => $(selector).replaceChildren());
-    ["#nav-tasks", "#nav-messages", "#nav-reviews"].forEach((selector) => { $(selector).textContent = "0"; });
+    ["#metrics", "#attention", "#roles", "#recent-tasks", "#tasks-list", "#messages-list", "#reviews-list", "#approvals-list", "#results-list", "#activity-list", "#goals-list", "#sources-list", "#knowledge-list", "#notifications-list", "#health-metrics", "#health-detail", "#goal-sources"].forEach((selector) => $(selector).replaceChildren());
+    ["#nav-tasks", "#nav-messages", "#nav-reviews", "#nav-goals", "#nav-notifications"].forEach((selector) => { $(selector).textContent = "0"; });
     $("#recipient").replaceChildren();
     delete $("#recipient").dataset.signature;
     const allMessages = node("option", "", "全部角色"); allMessages.value = "all";
     $("#message-filter").replaceChildren(allMessages);
     $("#task-title").value = "";
     $("#compose-body").value = "";
+    ["#goal-title", "#goal-objective", "#source-name", "#source-url", "#knowledge-query"].forEach((selector) => { $(selector).value = ""; });
+    ["#goal-researcher", "#goal-reviewer", "#goal-executor"].forEach((selector) => { $(selector).replaceChildren(); delete $(selector).dataset.signature; });
+    delete $("#goal-sources").dataset.signature;
+    ["#goal-feedback", "#source-feedback", "#knowledge-feedback"].forEach((selector) => feedback(selector, ""));
     document.title = "deskd · 工作台";
     feedback("#compose-feedback", "");
     feedback("#pairing-feedback", message, Boolean(message));
@@ -256,9 +292,11 @@
     try {
       if (!state.paired) showSession(await api("/api/session"));
       if (state.paired) {
-        const snapshot = await api("/api/snapshot");
+        const [snapshot, extended] = await Promise.all([api("/api/snapshot"), api("/api/workspace")]);
         if (!snapshot || !Array.isArray(snapshot.seats) || !Array.isArray(snapshot.tasks) || !Array.isArray(snapshot.messages)) throw { code: "status_unavailable" };
+        if (!extended || !Array.isArray(extended.goals) || !Array.isArray(extended.sources)) throw { code: "status_unavailable" };
         state.snapshot = snapshot;
+        state.extended = extended;
         state.connected = true;
         state.lastUpdated = Date.now();
         render(snapshot);
@@ -286,6 +324,9 @@
     updateButtons();
     try {
       const result = await api("/api/commands", { command: name, params });
+      clearTimeout(state.toastTimer);
+      $("#toast").hidden = true;
+      $("#toast").textContent = "";
       if (onSuccess) onSuccess(result);
       if (success) toast(success);
       return true;
@@ -368,7 +409,7 @@
     $("#banner").hidden = !notices.length;
     $("#banner").dataset.tone = snapshot.fenced ? "warn" : "info";
     populateRoles(snapshot.seats);
-    const signature = JSON.stringify({ ...snapshot, as_of: undefined });
+    const signature = JSON.stringify([{ ...snapshot, as_of: undefined }, state.extended]);
     if (state.rendered === signature) return;
     state.rendered = signature;
     const openTasks = snapshot.tasks.filter((task) => !["done", "cancelled"].includes(task.status));
@@ -389,6 +430,7 @@
     replaceList("#recent-tasks", snapshot.tasks.slice(0, 4).map(taskRow));
     if (!snapshot.tasks.length) $("#recent-tasks").append(empty("还没有任务", "从上方交办第一项任务，进展会显示在这里。"));
     renderTasks(); renderMessages(); renderReviews(); renderResults(); renderActivity();
+    renderExtended();
     const truncated = snapshot.truncated || {};
     $("#tasks-limit").hidden = !truncated.tasks;
     $("#messages-limit").hidden = !truncated.messages;
@@ -411,6 +453,8 @@
     if (blocked.length) attention(blocked.length + " 项任务需要协助", "查看任务详情，补充信息或调整安排。", "tasks", true);
     const unknown = snapshot.seats.reduce((sum, seat) => sum + (seat.inbox?.unknown || 0), 0);
     if (unknown) attention(unknown + " 条消息的处理结果待核对", "请在管理终端核对后，再决定是否重新提交。", "messages", true);
+    const notices = state.extended?.notifications?.unread_count || 0;
+    if (notices) attention(notices + " 项重要变化需要关注", "查看目标决定、交付与运行提醒。", "notifications", true);
     $("#attention").replaceChildren(...(items.length ? items : [empty("目前无需你介入", "有新回复或待复核提案时，会显示在这里。", "✓")]));
   }
 
@@ -437,10 +481,25 @@
     const row = node("article", "task-row");
     row.append(node("span", "task-symbol", task.status === "done" ? "✓" : task.status === "cancelled" ? "−" : ""));
     const content = node("div", "task-main");
-    content.append(button(task.title, () => openTask(task), "task-title", "task-" + task.id), node("p", "task-meta", roleName(task.assignee) + " · " + timeText(task.updated_at, true)));
+    content.append(button(taskTitle(task), () => openTask(task), "task-title", "task-" + task.id), node("p", "task-meta", roleName(task.assignee) + " · " + timeText(task.updated_at, true)));
     row.append(content, statusBadge(task.status));
     row.append(button("查看", () => openTask(task), "text-button", "task-view-" + task.id));
     return row;
+  }
+
+  function goalAssignment(task) {
+    if (task.creator !== "@supervisor" || typeof task.detail !== "string") return null;
+    try {
+      const value = JSON.parse(task.detail);
+      if (value.type === "goal_assignment" && typeof value.objective === "string" && ["research", "review", "delivery"].includes(value.stage)) return value;
+    } catch (_) { /* Ordinary task prose is displayed as text. */ }
+    return null;
+  }
+  function taskTitle(task) {
+    const assignment = goalAssignment(task);
+    if (!assignment) return task.title;
+    const goal = state.extended?.goals?.find((item) => item.id === assignment.goal_id);
+    return goal ? goal.title + " · " + ({ research: "调研", review: "独立复核", delivery: "交付" })[assignment.stage] + " · 第 " + assignment.cycle + " 轮" : task.title;
   }
 
   function renderTasks() {
@@ -463,7 +522,9 @@
   }
   function openTask(task) {
     const current = state.snapshot.tasks.find((item) => item.id === task.id) || task;
-    const elements = [metadata([["负责人", roleName(current.assignee)], ["交办人", roleName(current.creator)], ["状态", labels[current.status] || "待核对"], ["最近更新", timeText(current.updated_at, true)]]), node("p", "body-text", current.detail || "没有补充要求。")];
+    const assignment = goalAssignment(current);
+    const elements = [metadata([["负责人", roleName(current.assignee)], ["交办人", roleName(current.creator)], ["状态", labels[current.status] || "待核对"], ["最近更新", timeText(current.updated_at, true)]]), node("p", "body-text", assignment ? assignment.objective : current.detail || "没有补充要求。")];
+    if (assignment) elements.push(node("p", "context-note section-spaced", "这是持续目标中的" + ({ research: "调研", review: "独立复核", delivery: "交付" })[assignment.stage] + "任务。相关来源、复核与交付进展可在「持续目标」中查看。"));
     if (current.depends_on?.length) {
       elements.push(node("p", "context-note section-spaced", "依赖任务：" + current.depends_on.map((id) => state.snapshot.tasks.find((item) => item.id === id)?.title || "更早的关联任务").join("、")));
     }
@@ -475,7 +536,7 @@
         try { await command("cancel", { task_id: current.id, expected_version: current.version }, "任务已标记为取消。", () => $("#detail-dialog").close()); } catch (_) { /* Keep the confirmation visible for a new explicit choice. */ }
       }, "danger-button")]);
     }, "danger-button"));
-    openDialog(current.title, elements, actions);
+    openDialog(taskTitle(current), elements, actions);
   }
 
   function startMessage(principal, body = "") {
@@ -611,6 +672,175 @@
     }) : [empty("还没有工作动态", "交办任务后，关键进展会留在这里。", "↗")]);
   }
 
+  function goalBadge(value) {
+    const badge = statusBadge(value);
+    const names = { active: "推进中", scheduled: "等待下一轮", waiting_human: "需要你决定", blocked: "遇到阻碍", completed: "已完成", paused: "已暂停", cancelled: "已取消" };
+    badge.textContent = names[value] || "状态待核对";
+    if (["waiting_human", "blocked"].includes(value)) badge.dataset.tone = "warn";
+    return badge;
+  }
+
+  function requestFor(key) {
+    if (!state.goalRequests.has(key)) state.goalRequests.set(key, randomId());
+    return state.goalRequests.get(key);
+  }
+
+  function renderExtended() {
+    if (!state.extended) return;
+    const extended = state.extended;
+    const openGoals = extended.goals.filter((goal) => !["completed", "cancelled"].includes(goal.state));
+    $("#nav-goals").textContent = openGoals.length || "";
+    $("#nav-notifications").textContent = extended.notifications?.unread_count || "";
+    const attentionCount = (state.snapshot?.unread_count || 0) + (extended.notifications?.unread_count || 0);
+    document.title = attentionCount ? "(" + attentionCount + " 条待查看) deskd · 工作台" : "deskd · 工作台";
+    populateGoalForm(); renderGoals(); renderSources(); renderNotifications(); renderKnowledge(); renderHealth();
+  }
+
+  function populateGoalForm() {
+    const seats = state.snapshot.seats.filter((seat) => !seat.revoked);
+    const signature = JSON.stringify(seats.map((seat) => seat.principal));
+    [["#goal-researcher", "engineer"], ["#goal-reviewer", "analyst"], ["#goal-executor", "trader"]].forEach(([selector, preferred], index) => {
+      const select = $(selector);
+      if (select.dataset.signature === signature) return;
+      const previous = select.value;
+      select.replaceChildren(...seats.map((seat) => { const option = node("option", "", roleName(seat.principal)); option.value = seat.principal; return option; }));
+      const desired = seats.some((seat) => seat.principal === previous) ? previous : seats.find((seat) => seat.principal.split("/").pop() === preferred)?.principal || seats[index]?.principal;
+      if (desired) select.value = desired;
+      select.dataset.signature = signature;
+    });
+    const sources = state.extended.sources.filter((source) => source.enabled);
+    const sourceSignature = JSON.stringify(sources.map((source) => [source.name, source.version]));
+    if ($("#goal-sources").dataset.signature !== sourceSignature) {
+      const checked = new Set($$("#goal-sources input:checked").map((item) => item.value));
+      $("#goal-sources").replaceChildren(...sources.map((source) => {
+        const label = node("label", "source-option"); const input = node("input"); input.type = "checkbox"; input.value = source.name; input.checked = checked.has(source.name);
+        label.append(input, document.createTextNode(source.name)); return label;
+      }));
+      if (!sources.length) $("#goal-sources").append(node("p", "subtle", "还没有可用来源，请先添加一个公开信息来源。"));
+      $("#goal-sources").dataset.signature = sourceSignature;
+    }
+  }
+
+  function renderGoals() {
+    const goals = state.extended.goals;
+    replaceList("#goals-list", goals.length ? goals.map((goal) => {
+      const card = node("article", "content-card"); const header = node("div", "content-card-header");
+      header.append(node("h3", "", goal.title), goalBadge(goal.state));
+      const cycle = goal.cycles?.find((item) => item.number === goal.cycle) || goal.cycles?.[0];
+      const progress = node("div", "goal-progress");
+      [["research", "调研", goal.researcher], ["review", "独立复核", goal.reviewer], ["delivery", "交付", goal.executor]].forEach(([stage, label, principal], index) => {
+        if (index) progress.append(node("span", "", "→"));
+        const item = node("span", "goal-stage", label + " · " + roleName(principal)); item.dataset.current = String(cycle?.phase === stage); progress.append(item);
+      });
+      card.append(header, node("p", "body-text body-preview", goal.objective), progress, node("p", "content-card-meta", "第 " + goal.cycle + " / " + goal.max_cycles + " 轮" + (goal.next_due ? " · 下次推进 " + timeText(goal.next_due, true) : "")));
+      if (goal.question) card.append(node("p", "goal-question", "需要你决定：" + goal.question));
+      else if (goal.blocked_reason && blockedReasons[goal.blocked_reason]) card.append(node("p", "goal-question", blockedReasons[goal.blocked_reason]));
+      const actions = node("div", "content-card-actions"); actions.append(button(goal.state === "waiting_human" ? "查看并回复" : "查看进展", () => openGoal(goal), "secondary-button", "goal-" + goal.id));
+      card.append(actions); return card;
+    }) : [empty("还没有持续目标", "交代一次完整目标，团队会按调研、复核、交付的顺序推进。", "◎")]);
+  }
+
+  function openGoal(goal) {
+    const current = state.extended.goals.find((item) => item.id === goal.id) || goal;
+    const cycle = current.cycles?.find((item) => item.number === current.cycle) || current.cycles?.[0];
+    const stages = { research: "调研中", review: "独立复核中", delivery: "交付中", completed: "本轮已交付" };
+    const children = [metadata([["分工", [current.researcher, current.reviewer, current.executor].map(roleName).join(" → ")], ["当前阶段", stages[cycle?.phase] || "等待推进"], ["执行轮次", current.cycle + " / " + current.max_cycles], ["信息来源", (current.source_ids || []).join("、")], ["本阶段已跟进", String(cycle?.followups || 0) + " 次"]]), node("p", "body-text", current.objective)];
+    if (current.blocked_reason && blockedReasons[current.blocked_reason]) children.push(node("p", "goal-question", blockedReasons[current.blocked_reason]));
+    const actions = [];
+    if (current.state === "waiting_human") {
+      children.push(node("p", "goal-question", current.question || "团队需要你的补充信息。"));
+      const field = node("label", "field"); const answer = node("textarea"); answer.maxLength = 1000; answer.rows = 4;
+      field.append(node("span", "", "你的回复"), answer); children.push(field, node("p", "context-note section-spaced", "回复用于继续推进目标，不会替代独立执行授权。"));
+      actions.push(commandButton("回复并继续", async () => {
+        const body = answer.value.trim(); if (!body) { answer.focus(); return; }
+        const params = { goal_id: current.id, body, expected_version: current.version, request_id: requestFor(JSON.stringify(["answer", current.id, current.version, body])) };
+        try { await command("goal_answer", params, "回复已记录，目标可以继续推进。", () => $("#detail-dialog").close()); } catch (_) { /* Preserve the answer on failure. */ }
+      }, "primary-button"));
+    }
+    const mutate = (action) => async () => {
+      const params = { goal_id: current.id, action, expected_version: current.version, request_id: requestFor(JSON.stringify(["update", current.id, current.version, action])) };
+      try { await command("goal_update", params, action === "pause" ? "已暂停后续分派与跟进；已经开始的工作不会被强行停止。" : action === "resume" ? "已恢复目标推进。" : "已取消后续安排，并阻止已关联提案继续执行；已经完成的交付不会撤回。", () => $("#detail-dialog").close()); } catch (_) { /* A fresh decision is required after a version conflict. */ }
+    };
+    if (["active", "scheduled"].includes(current.state)) actions.push(commandButton("暂停后续推进", mutate("pause"), "secondary-button"));
+    if (["paused", "blocked"].includes(current.state)) actions.push(commandButton("恢复推进", mutate("resume"), "primary-button"));
+    if (!["completed", "cancelled"].includes(current.state)) actions.push(commandButton("取消目标", () => openDialog("确认取消这个目标？", [node("p", "body-text", current.title), node("p", "context-note section-spaced", "取消会停止后续分派与跟进，并阻止本目标已关联提案继续获批或执行。已经完成的交付不会撤回；正在运行的回合不会被强行停止。")], [button("保留目标", () => openGoal(current), "secondary-button"), commandButton("确认取消", mutate("cancel"), "danger-button")]), "danger-button"));
+    openDialog(current.title, children, actions);
+  }
+
+  function renderSources() {
+    const sources = state.extended.sources;
+    replaceList("#sources-list", sources.length ? sources.map((source) => {
+      const card = node("article", "content-card"); const header = node("div", "content-card-header");
+      header.append(node("h3", "", source.name), node("span", "badge", source.enabled ? "允许读取" : "已停用"));
+      card.append(header, node("p", "source-url", source.url), node("p", "content-card-meta", "单次最多 " + Math.round(source.max_bytes / 1024) + " KB · 超时 " + source.timeout_seconds + " 秒 · 第 " + source.version + " 版"));
+      const actions = node("div", "content-card-actions");
+      if (source.enabled) actions.append(commandButton("停用来源", async () => {
+        try { await command("source_disable", { name: source.name, expected_version: source.version }, "已停用该来源，后续读取请求将被拒绝。"); } catch (_) { /* Do not repeat a stale mutation. */ }
+      }, "text-button", "source-disable-" + source.name));
+      actions.append(button(source.enabled ? "修改地址" : "重新配置", () => {
+        $("#source-name").value = source.name; $("#source-url").value = source.url; $("#source-url").focus();
+      }, "text-button", "source-edit-" + source.name));
+      card.append(actions); return card;
+    }) : [empty("先允许一个信息来源", "团队只会读取你配置的公开来源，不会任意浏览其他地址。", "⊕")]);
+  }
+
+  function renderNotifications() {
+    const values = state.extended.notifications || { notifications: [], unread_count: 0 };
+    const names = { decision: "需要你决定", completion: "已完成交付", stalled: "进展需要协助", error: "运行遇到问题", budget: "额度需要关注" };
+    replaceList("#notifications-list", values.notifications?.length ? values.notifications.map((notice) => {
+      const card = node("article", "content-card"); const header = node("div", "content-card-header");
+      header.append(node("h3", "", notice.title), statusBadge(notice.acknowledged_at === null ? "unread" : "read"));
+      let body = notice.body || "请查看相关工作进展。";
+      body = blockedReasons[body] || (body === "A goal participant was revoked; the next cycle requires an operator decision." ? blockedReasons.participant_revoked : body);
+      if (notice.kind === "completion") {
+        try {
+          const detail = JSON.parse(body);
+          if (typeof detail.memo_id === "string" && typeof detail.body_sha256 === "string") body = detail.all_cycles_complete ? "目标的全部轮次已完成，成果已通过独立授权发布。可前往「成果」查看共享备忘录。" : "本轮成果已通过独立授权发布，目标会按设定间隔继续下一轮。";
+        } catch (_) { /* Plain-language notices stay plain text. */ }
+      }
+      card.append(node("p", "notification-kind", names[notice.kind] || "工作提醒"), header, node("p", "body-text", body), node("p", "content-card-meta", timeText(notice.created_at, true)));
+      const actions = node("div", "content-card-actions");
+      if (notice.acknowledged_at === null) actions.append(commandButton("我已查看", async () => {
+        try { await command("notification_ack", { notification_ids: [notice.id] }, "已确认查看这条提醒。"); } catch (_) { /* Keep unread until confirmed. */ }
+      }, "secondary-button", "notice-" + notice.id));
+      const destination = notice.kind === "completion" ? "results" : notice.source_id?.startsWith("message:") ? "messages" : notice.source_id?.startsWith("source:") ? "sources" : notice.kind === "budget" && notice.source_id?.startsWith("seat:") ? "operations" : "goals";
+      actions.append(button(({ results: "查看成果", messages: "查看消息", sources: "查看来源", operations: "查看额度", goals: "查看目标" })[destination], () => {
+        switchView(destination, true);
+        const goal = state.extended.goals.find((item) => item.id === notice.source_id);
+        if (destination === "goals" && goal) openGoal(goal);
+      }, "text-button")); card.append(actions); return card;
+    }) : [empty("暂时没有重要提醒", "需要你决定或工作有重要变化时，会在这里留下记录。", "◉")]);
+    $("#notifications-limit").hidden = !values.has_more;
+  }
+
+  function renderKnowledge() {
+    if (state.knowledgeResults === null) {
+      replaceList("#knowledge-list", [empty("搜索团队已经共享的知识", "输入关键词，或留空搜索近期共享笔记。私人记忆不会出现在结果中。", "▥")]); return;
+    }
+    const notes = state.knowledgeResults.memories || [];
+    replaceList("#knowledge-list", notes.length ? notes.map((note) => {
+      const card = node("article", "content-card"); const header = node("div", "content-card-header");
+      header.append(node("h3", "", note.title || "共享笔记"), node("span", "badge", "主动共享"));
+      const detail = node("details", "message-details"); detail.dataset.expandKey = "memory-" + note.id;
+      const summary = node("summary", "", "阅读完整笔记"); summary.dataset.focusKey = "memory-" + note.id;
+      detail.append(summary, node("p", "body-text", note.body));
+      card.append(header, node("p", "content-card-meta", roleName(note.owner) + " · 第 " + note.version + " 版"), node("p", "body-text body-preview", note.body), detail);
+      if (Array.isArray(note.sources) && note.sources.length) card.append(node("p", "note-provenance", "附有 " + note.sources.length + " 项来源记录，可由参与角色核对原始内容与指纹。"));
+      return card;
+    }) : [empty("没有找到匹配的共享笔记", "试试其他关键词，或等待角色明确分享新的工作笔记。", "▥")]);
+  }
+
+  function renderHealth() {
+    const health = state.extended.health || {};
+    const metrics = [["角色", health.seats ?? "—"], ["暂停唤醒", health.paused_seats ?? "—"], ["待核对投递", health.unknown_deliveries ?? "—"], ["额度耗尽", health.exhausted_turn_budgets ?? "—"]];
+    $("#health-metrics").replaceChildren(...metrics.map(([label, value]) => {
+      const card = node("div", "metric"); const content = node("div"); content.append(node("p", "metric-label", label), node("p", "metric-value", value)); card.append(content); return card;
+    }));
+    const title = node("h2", "", health.health === "attention" ? "有运行状态需要关注" : health.observation === "live" ? "已获取运行状态" : "当前为账本记录");
+    const facts = metadata([["自动调度", health.fenced ? "当前已暂停" : "当前未暂停"], ["状态来源", health.observation === "live" ? "刚刚观察到的服务状态" : "保存的记录，不能证明服务在线"], ["已使用自动轮次", String(health.automatic_turns_used ?? "—")], ["费用统计", "当前统计自动唤醒轮次，不代表模型 token 或实际费用"]]); facts.className = "health-facts";
+    $("#health-detail").replaceChildren(title, facts);
+  }
+
   $("#pair").addEventListener("click", async () => {
     $("#pair").disabled = true;
     try { showSession(await api("/api/pair", {})); await refresh(); }
@@ -666,6 +896,78 @@
     const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
     document.documentElement.dataset.theme = theme;
     try { localStorage.setItem("deskd.console.theme", theme); } catch (_) { /* Theme preference is optional. */ }
+  });
+  $("#goal-interval").addEventListener("change", () => {
+    const once = $("#goal-interval").value === "once";
+    $("#goal-cycles").disabled = once;
+    $("#goal-cycles").value = once ? "1" : "7";
+  });
+  $("#goal-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!state.connected || state.pending) return;
+    const params = {
+      title: $("#goal-title").value.trim(), objective: $("#goal-objective").value.trim(),
+      researcher: $("#goal-researcher").value, reviewer: $("#goal-reviewer").value, executor: $("#goal-executor").value,
+      source_ids: $$("#goal-sources input:checked").map((input) => input.value).sort(),
+      interval_seconds: $("#goal-interval").value === "once" ? null : Number($("#goal-interval").value),
+      max_cycles: Number($("#goal-cycles").value), followup_seconds: Number($("#goal-followup").value), max_followups: 2,
+    };
+    if (!params.title || !params.objective || !params.source_ids.length) {
+      feedback("#goal-feedback", "请填写目标与成果要求，并至少选择一个允许读取的信息来源。", true); return;
+    }
+    if (new Set([params.researcher, params.reviewer, params.executor]).size !== 3) {
+      feedback("#goal-feedback", "调研、复核与交付须选择三位不同的角色。", true); return;
+    }
+    const fingerprint = JSON.stringify(params);
+    if (!state.goalIntent || state.goalIntent.fingerprint !== fingerprint) state.goalIntent = { fingerprint, id: randomId() };
+    params.request_id = state.goalIntent.id;
+    feedback("#goal-feedback", "正在创建目标…");
+    try {
+      await command("goal_create", params, "", () => {
+        if ($("#goal-title").value.trim() === params.title) $("#goal-title").value = "";
+        if ($("#goal-objective").value.trim() === params.objective) $("#goal-objective").value = "";
+        state.goalIntent = null;
+        feedback("#goal-feedback", state.snapshot?.mode === "demo" ? "目标已记入演示账本。当前不会自动调用模型。" : "目标已创建，首项调研任务已进入队列。独立复核与交付进展会显示在下方。");
+      });
+    } catch (error) {
+      if (error.code !== "session_changed") feedback("#goal-feedback", error.code === "outcome_unknown" ? "尚不能确认是否创建成功。请先查看目标列表；相同内容重试会沿用本次请求编号。" : errorText(error), true);
+    }
+  });
+  $("#source-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!state.connected || state.pending) return;
+    const name = $("#source-name").value.trim(); const url = $("#source-url").value.trim();
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash || url.includes("?") || url.includes("#")) throw new Error();
+    } catch (_) { feedback("#source-feedback", errors.source_url_rejected, true); return; }
+    const existing = state.extended.sources.find((source) => source.name === name);
+    const submit = async () => {
+      feedback("#source-feedback", "正在保存来源…");
+      try {
+        await command("source_configure", { name, url, max_bytes: existing?.max_bytes || 65536, timeout_seconds: existing?.timeout_seconds || 5 }, "", () => {
+          if ($("#source-name").value.trim() === name) $("#source-name").value = "";
+          if ($("#source-url").value.trim() === url) $("#source-url").value = "";
+          feedback("#source-feedback", "已允许团队读取该来源。配置本身不会立刻读取网页。");
+          $("#detail-dialog").close();
+        });
+      } catch (error) { if (error.code !== "session_changed") feedback("#source-feedback", errorText(error), true); }
+    };
+    if (existing) openDialog("确认更新这个信息来源？", [metadata([["来源", name], ["原地址", existing.url], ["新地址", url]]), node("p", "context-note", "同名来源将更新为新版本并启用。依赖旧版本、尚未完成的读取可能需要重新发起。")], [button("暂不修改", () => $("#detail-dialog").close(), "secondary-button"), commandButton("确认更新来源", submit, "primary-button")]);
+    else await submit();
+  });
+  $("#knowledge-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!state.connected || state.pending) return;
+    const query = $("#knowledge-query").value.trim();
+    feedback("#knowledge-feedback", "正在查找已共享的笔记…");
+    try {
+      await command("memory_search", { query, limit: 20 }, "", (result) => {
+        state.knowledgeResults = result;
+        renderKnowledge();
+        feedback("#knowledge-feedback", result.has_more ? "找到部分匹配笔记，可用更具体的关键词缩小范围。" : "找到 " + (result.memories?.length || 0) + " 篇共享笔记。");
+      });
+    } catch (error) { if (error.code !== "session_changed") feedback("#knowledge-feedback", errorText(error), true); }
   });
   window.addEventListener("hashchange", () => switchView(location.hash.slice(1)));
   window.addEventListener("online", refresh);

@@ -1,7 +1,8 @@
 # Human workspace console
 
 The console brings tasks, operator correspondence, independent review requests,
-published memos and role controls into one local browser interface. The UI is in
+published memos, continuous goals, approved sources, shared notes, notifications
+and role controls into one local browser interface. The UI is in
 Chinese, supports narrow screens and light/dark themes, and requires no web
 framework, external font or CDN. It is separate from the public, read-only board.
 
@@ -20,8 +21,8 @@ terminal's `pair IDENTIFIER` instruction only for the browser you opened. The
 page opens automatically after confirmation. The identifier is not a password
 and cannot authenticate another browser.
 
-This demo creates fresh SQLite databases and synthetic initial tasks, replies
-and memos. New submissions really enter that local ledger, but **no model or
+This demo creates fresh SQLite databases and synthetic initial tasks, replies,
+memos, a human question, approved source metadata and private/shared notes. New submissions really enter that local ledger, but **no model or
 background worker runs**. They remain queued until processed by a separately
 configured runtime. Demo replies are labeled prewritten examples. Nothing reads
 a provider credential, connects to a broker or sends an external notification.
@@ -67,6 +68,15 @@ the console; copying loose web files into an old manifest is not an upgrade.
 - **成果:** read published shared memos and tasks explicitly recorded as done.
   A completed task is the assignee's recorded status, not independent proof that
   its requested real-world outcome was achieved.
+- **持续目标:** start a finite research–review–publication workflow, pause or
+  cancel it, and answer questions from its assigned roles.
+- **信息来源:** approve exact public HTTPS URLs or disable configured sources.
+- **共享知识:** search notes their owners explicitly shared; private role memory
+  is omitted.
+- **提醒:** inspect persistent decisions, completions, errors and exhausted
+  budgets, then explicitly mark items read.
+- **运行维护:** inspect metadata health and the offline backup/recovery boundary.
+  See [continuous work](workspace-goals.md) for setup and operational commands.
 - **动态:** inspect recent coordination events. No model transcript, private role
   file, arbitrary download path or credentials are exposed.
 

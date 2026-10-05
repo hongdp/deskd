@@ -93,6 +93,13 @@ class BrowserSessions:
 
 # No method or administrative identity is supplied by the browser.
 COMMANDS = {
+    "goal_create": ("workspace.goal.create", {"title", "objective", "researcher", "reviewer", "executor", "source_ids", "request_id", "interval_seconds", "max_cycles", "followup_seconds", "max_followups"}),
+    "goal_update": ("workspace.goal.update", {"goal_id", "action", "expected_version", "request_id"}),
+    "goal_answer": ("workspace.goal.answer", {"goal_id", "body", "expected_version", "request_id"}),
+    "source_configure": ("workspace.source.configure", {"name", "url", "max_bytes", "timeout_seconds"}),
+    "source_disable": ("workspace.source.disable", {"name", "expected_version"}),
+    "notification_ack": ("workspace.notification.ack", {"notification_ids"}),
+    "memory_search": ("workspace.memory.search", {"query", "limit"}),
     "task": ("workspace.console.task", {"assignee", "title", "body", "request_id"}),
     "message": ("workspace.console.message", {"recipient", "body", "request_id"}),
     "cancel": ("workspace.console.cancel", {"task_id", "expected_version"}),
@@ -149,6 +156,15 @@ class ConsoleBackend:
         except OSError as exc:
             # A connection failure is not proof that a mutation did not commit.
             raise ConsoleError("outcome_unknown", 503) from exc
+
+    def workspace(self):
+        self.attest()
+        result = self._call("workspace.console.extended", {})
+        if type(result) is not dict:
+            raise ConsoleError("status_unavailable", 503)
+        if self.mode != "installed":
+            result["health"] = {**result.get("health", {}), "observation": "synthetic", "health": "unverified"}
+        return result
 
 
 def _decode(body):
@@ -293,6 +309,9 @@ def make_server(backend, *, port=0, sessions=None):
                 if self.path == "/api/snapshot":
                     sessions.require(self._proof())
                     return self._reply(200, {"ok": True, "result": backend.snapshot()})
+                if self.path == "/api/workspace":
+                    sessions.require(self._proof())
+                    return self._reply(200, {"ok": True, "result": backend.workspace()})
                 raise ConsoleError("not_found", 404)
             self._run(get)
 

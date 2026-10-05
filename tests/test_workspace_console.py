@@ -148,3 +148,49 @@ def test_demo_is_explicit_fresh_and_never_starts_a_runtime(tmp_path):
     assert not (directory / "unused-admin").exists()
     with pytest.raises(FileExistsError):
         create_demo(directory)
+
+
+def test_extended_console_requires_pairing_and_preserves_human_goal_authority(console):
+    _, _, _, request = console
+    assert request("/api/workspace")[0] == 401
+    pair(console)
+    before = request("/api/workspace")[1]["result"]
+    assert before["health"]["observation"] == "synthetic"
+    source = {"command": "source_configure", "params": {
+        "name": "console-fixture", "url": "https://example.test/brief", "max_bytes": 8192, "timeout_seconds": 1,
+    }}
+    assert request("/api/commands", source)[0] == 200
+    goal = {"command": "goal_create", "params": {
+        "title": "HTTP goal", "objective": "Synthetic scope", "researcher": "demo/engineer",
+        "reviewer": "demo/analyst", "executor": "demo/trader", "source_ids": ["console-fixture"],
+        "request_id": "http-goal", "interval_seconds": None, "max_cycles": 1,
+        "followup_seconds": 60, "max_followups": 2,
+    }}
+    code, created = request("/api/commands", goal)
+    assert code == 200 and created["result"]["state"] == "active"
+    assert request("/api/commands", goal) == (200, created)
+    value = created["result"]
+    pause = {"command": "goal_update", "params": {
+        "goal_id": value["id"], "action": "pause", "expected_version": value["version"], "request_id": "http-goal-pause",
+    }}
+    assert request("/api/commands", pause)[1]["result"]["state"] == "paused"
+    assert request("/api/commands", pause)[0] == 200
+    assert request("/api/commands", {"command": "goal.report", "params": {}})[0] == 400
+    assert request("/api/commands", {"command": "notification_configure", "params": {}})[0] == 400
+    assert request("/api/logout", {})[0] == 200
+    assert request("/api/workspace")[0] == 401
+
+
+def test_console_source_validation_never_fetches_and_cannot_read_role_memory(console):
+    _, _, _, request = console
+    pair(console)
+    command = {"command": "source_configure", "params": {
+        "name": "private", "url": "http://127.0.0.1/", "max_bytes": 1000, "timeout_seconds": 1,
+    }}
+    assert request("/api/commands", command)[0] == 400
+    command = {"command": "memory_search", "params": {"query": "", "limit": 20}}
+    code, found = request("/api/commands", command)
+    assert code == 200
+    assert all(m["shared"] for m in found["result"]["memories"])
+    command["params"]["actor"] = "demo/engineer"
+    assert request("/api/commands", command)[0] == 400

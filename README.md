@@ -50,6 +50,10 @@ For the native-harness overlay, see the
 durable mail and tasks, independent memo authorization, a live board and managed
 recovery. Its offline rehearsal needs no model or credentials. Dedicated hosted
 Linux acceptance exercises the pinned official runtime and service-user boundary.
+The paired [human console](docs/workspace-console.md) also supports
+[finite research goals](docs/workspace-goals.md), approved public sources,
+private role memory with explicit sharing, persistent attention and offline
+operational archives.
 
 ```bash
 pip install "deskd[web]"                     # the engine + the web console
