@@ -22,7 +22,13 @@ from deskd.gateway.identity import (
 )
 from deskd.gateway.registry import Registry
 from deskd.gateway.transport import GatewayTransport
-from deskd.workspace.board import HTML, JS, make_server, public_snapshot
+from deskd.workspace.board import (
+    HTML,
+    JS,
+    make_server,
+    public_snapshot,
+    read_installed_snapshot,
+)
 from deskd.workspace.exchange import ACTIONS, WorkspaceExchange
 from deskd.workspace.store import WorkspaceStore
 
@@ -286,6 +292,7 @@ def test_http_status_uses_explicit_metadata_allowlist_and_safe_rendering():
         public = json.loads(body)
         assert public["delivery"] == {"queued": 2}
         assert public["fenced"] is False
+        assert public["live_observation"] is False
         assert not any(
             marker in body
             for marker in (b"PRIVATE-", b"private-root", b"private-manifest")
@@ -324,3 +331,166 @@ def test_http_snapshot_failure_does_not_leak_exception():
 
 def test_unknown_service_state_is_visibly_fenced():
     assert public_snapshot({})["fenced"] is True
+
+
+def test_recorded_ledger_is_never_presented_as_live_health():
+    recorded = snapshot()
+    recorded["service"]["active"] = 1
+    assert public_snapshot(recorded)["live_observation"] is False
+    assert b"Recorded ledger state. Live health is unverified." in JS
+    assert b"Running:" not in JS
+    assert b"Last status may be stale" in JS
+
+
+@pytest.fixture
+def observer():
+    calls = []
+    responses = {
+        "status": {
+            "ok": True,
+            "result": {"fenced": False, "token": "PRIVATE-UNEXPECTED"},
+        },
+        "workspace.status": {"ok": True, "result": snapshot()},
+    }
+
+    def admin(method):
+        calls.append(method)
+        result = responses[method]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    deployment = SimpleNamespace(
+        attest=lambda: calls.append("attest"),
+        admin=admin,
+    )
+    return deployment, responses, calls
+
+
+@pytest.mark.parametrize(
+    "gateway_fenced,workspace_active,expected_fenced",
+    [
+        (False, 1, False),
+        (True, 1, True),
+        (False, 0, True),
+        (True, 0, True),
+    ],
+)
+def test_installed_board_observes_gateway_and_ledger_before_marking_live(
+    observer,
+    gateway_fenced,
+    workspace_active,
+    expected_fenced,
+):
+    deployment, responses, calls = observer
+    responses["status"]["result"]["fenced"] = gateway_fenced
+    responses["workspace.status"]["result"]["service"]["active"] = workspace_active
+    with board(lambda: read_installed_snapshot(deployment)) as server:
+        status, _, body = fetch(server, "/status")
+    assert status == 200
+    result = json.loads(body)
+    assert result["live_observation"] is True
+    assert result["fenced"] is expected_fenced
+    assert result["seats"][0]["queued"] == 2
+    assert "PRIVATE" not in body.decode() and b"private-root" not in body
+    assert set(result) == {"live_observation", "fenced", "seats", "delivery"}
+    assert calls == ["attest", "status", "workspace.status"]
+
+
+@pytest.mark.parametrize(
+    "method,response",
+    [
+        ("status", OSError("PRIVATE-CONNECTION-FAILURE")),
+        ("status", {"ok": False, "error": {"code": "PRIVATE-DENIED"}}),
+        ("status", {"ok": True, "result": {"fenced": 0}}),
+        ("workspace.status", OSError("PRIVATE-CONNECTION-FAILURE")),
+        ("workspace.status", {"ok": False}),
+        (
+            "workspace.status",
+            {"ok": True, "result": {"service": {"active": True}, "seats": []}},
+        ),
+        ("workspace.status", {"ok": True, "result": {"service": {"active": 1}}}),
+    ],
+)
+def test_installed_board_never_falls_back_to_active_ledger_on_observation_failure(
+    observer, method, response
+):
+    deployment, responses, _ = observer
+    with board(lambda: read_installed_snapshot(deployment)) as server:
+        first = fetch(server, "/status")
+        assert json.loads(first[2])["live_observation"] is True
+        responses[method] = response
+        status, _, body = fetch(server, "/status")
+    assert status == 503 and body == b"Status unavailable"
+
+
+def test_installed_board_attestation_failure_calls_no_gateway_method(observer):
+    deployment, _, calls = observer
+
+    def reject():
+        raise ValueError("PRIVATE-POLICY-CHANGE")
+
+    deployment.attest = reject
+    with board(lambda: read_installed_snapshot(deployment)) as server:
+        status, _, body = fetch(server, "/status")
+    assert status == 503 and body == b"Status unavailable" and calls == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [[], ["--state", "/synthetic/db", "--deployment", "/synthetic/deployment"]],
+)
+def test_board_cli_requires_exactly_one_observation_source(arguments):
+    from deskd.workspace.__main__ import main
+
+    with pytest.raises(SystemExit) as error:
+        main(["board", *arguments])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("mode", ["state", "deployment"])
+def test_board_cli_selects_read_only_observer(mode, tmp_path, monkeypatch, capsys):
+    from deskd.workspace import board as board_module, deployment as deployment_module
+    from deskd.workspace.__main__ import main
+
+    path = tmp_path / "synthetic"
+    path.write_text("synthetic fixture, never opened as a real database")
+    calls = []
+    installed = object()
+    monkeypatch.setattr(
+        deployment_module,
+        "Deployment",
+        lambda candidate: calls.append(("deployment", candidate)) or installed,
+    )
+    monkeypatch.setattr(
+        board_module,
+        "read_installed_snapshot",
+        lambda candidate: calls.append(("live", candidate)) or snapshot(),
+    )
+    monkeypatch.setattr(
+        board_module,
+        "read_snapshot",
+        lambda candidate: calls.append(("recorded", candidate)) or snapshot(),
+    )
+
+    class Server:
+        server_port = 12345
+
+        def __init__(self, callback):
+            self.callback = callback
+
+        def serve_forever(self, **_):
+            self.callback()
+
+        def server_close(self):
+            calls.append(("closed",))
+
+    monkeypatch.setattr(
+        board_module, "make_server", lambda callback, **_: Server(callback)
+    )
+    assert main(["board", "--" + mode, str(path)]) == 0
+    if mode == "deployment":
+        assert calls == [("deployment", path), ("live", installed), ("closed",)]
+    else:
+        assert calls == [("recorded", path), ("recorded", path), ("closed",)]
+    assert capsys.readouterr().err == ""

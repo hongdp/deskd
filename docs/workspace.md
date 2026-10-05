@@ -24,7 +24,8 @@ flowchart LR
   Bridge --> Gateway[Gateway: separate UID]
   Manager --> Gateway
   Gateway --> Ledger[Identity, authorization and durable work]
-  Ledger --> Board[Read-only live board]
+  Gateway --> Board[Read-only observed status]
+  Ledger --> Recorded[Recorded ledger view]
 ```
 
 ## Try the complete local rehearsal
@@ -39,8 +40,26 @@ python -m deskd.workspace board --state ./scratchpad/workspace-demo/workspace.sq
 The output directory must be new. The demo writes a responsibility snapshot,
 `report.json`, and two explicit SQLite databases. Its fixed mock runtime performs
 no inference or external calls. The read-only board prints its loopback URL and
-updates automatically. It omits message bodies, task details and transcripts.
-Close it with Ctrl-C.
+updates automatically. With `--state`, it shows **recorded ledger state** and
+explicitly marks live health as unverified: a database's last active flag cannot
+prove that the gateway is still running. It omits message bodies, task details
+and transcripts. Close it with Ctrl-C.
+
+For an installed workspace, run the observer as the independent administrator:
+
+```sh
+python -m deskd.workspace board --deployment /opt/deskd/policy/deployment.json
+```
+
+`--deployment` and `--state` are mutually exclusive. The installed observer
+checks the protected deployment and requests only `status` and
+`workspace.status` over the authenticated administrative socket. It marks a
+snapshot as a live observation only after both requests succeed. Either gateway
+fencing or an inactive workspace is shown as fenced; a failed check or lost
+connection returns unavailable and marks the previous display as stale. A live
+observation describes the most recent poll, not a continuous health guarantee.
+The HTTP interface remains read-only and exposes only public status fields; it
+does not request model credentials, display private contents or grant authority.
 
 The rehearsal covers authenticated message and task intents, projection receipts,
 coalesced wakes, explicit inbox acknowledgments, independent memo approval,

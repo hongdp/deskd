@@ -224,6 +224,8 @@ def test_start_resume_read_event_turn_and_interrupt():
         )
         assert binding.session_id == binding.thread_id == "root-1"
         assert client.resume_root("root-1", config()) == binding
+        resume = next(m for m in server.messages if m.get("method") == "thread/resume")
+        assert resume["params"]["excludeTurns"] is True
         assert client.read_root("root-1")["cwd"] == "/work/role"
         assert (
             client.start_turn(
@@ -251,6 +253,70 @@ def test_start_resume_read_event_turn_and_interrupt():
                 "sandboxPolicy",
             }
             & call["params"].keys()
+        )
+
+
+def test_empty_root_is_materialized_before_binding_returns_without_model_turn():
+    with daemon() as (client, server):
+        client.connect()
+        binding = client.start_root(config())
+        calls = [
+            m
+            for m in server.messages
+            if m.get("method", "").startswith(("thread/", "turn/"))
+        ]
+        assert [m["method"] for m in calls] == ["thread/start", "thread/read"]
+        assert calls[0]["params"]["ephemeral"] is False
+        assert calls[0]["params"]["historyMode"] == "paginated"
+        assert calls[1]["params"] == {
+            "threadId": binding.thread_id,
+            "includeTurns": True,
+        }
+
+
+@pytest.mark.parametrize("failure", ["rejected", "lost", "wrong_root"])
+def test_materialization_failure_closes_without_recreating_or_starting_a_turn(failure):
+    def handler(conn, message):
+        if message["method"] != "thread/read":
+            return False
+        if failure == "lost":
+            conn.shutdown(socket.SHUT_RDWR)
+        elif failure == "rejected":
+            conn.sendall(
+                frame(
+                    {
+                        "id": message["id"],
+                        "error": {
+                            "code": -32600,
+                            "message": "synthetic persistence rejection",
+                        },
+                    }
+                )
+            )
+        else:
+            conn.sendall(
+                frame(
+                    {
+                        "id": message["id"],
+                        "result": {
+                            "thread": thread_info(id="foreign", sessionId="foreign")
+                        },
+                    }
+                )
+            )
+        return True
+
+    with daemon(handler) as (client, server):
+        client.connect()
+        with pytest.raises(
+            (RuntimeRequestError, RuntimeUnavailable, RuntimePolicyError)
+        ):
+            client.start_root(config())
+        assert client._socket is None and client._roots == {}
+        assert sum(m.get("method") == "thread/start" for m in server.messages) == 1
+        assert sum(m.get("method") == "thread/read" for m in server.messages) == 1
+        assert not any(
+            m.get("method") in {"turn/start", "thread/resume"} for m in server.messages
         )
 
 
@@ -460,7 +526,7 @@ def test_request_error_has_only_code_and_no_server_message():
 
 def test_settings_changed_notification_invalidates_binding():
     def handler(conn, message):
-        if message["method"] == "thread/read":
+        if message["method"] == "thread/read" and not message["params"]["includeTurns"]:
             altered = settings()
             altered["sandboxPolicy"] = {"type": "dangerFullAccess"}
             conn.sendall(
@@ -543,7 +609,7 @@ def test_missing_root_identity_field_fails_closed():
 
 def test_read_root_rejects_changed_cwd():
     def handler(conn, message):
-        if message["method"] == "thread/read":
+        if message["method"] == "thread/read" and not message["params"]["includeTurns"]:
             conn.sendall(
                 frame(
                     {

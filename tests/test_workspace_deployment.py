@@ -285,9 +285,18 @@ def test_bootstrap_cannot_restore_a_revoked_principal(bootstrap_model):
     gateway.registry.trusted_revoke(
         PrincipalId("desk", "trader"), expected_binding_generation=1
     )
-    with pytest.raises(ValueError, match="bootstrap_existing_authority_mismatch"):
-        deployment.run_installed("bootstrap", instance.path)
-    assert sum(kind == "start" for kind, _ in runtime_calls) == 3
+    runtime_calls.clear()
+    deployment.run_installed("bootstrap", instance.path)
+    assert ("resume", "root-trader") not in runtime_calls
+    assert (
+        next(
+            row
+            for row in gateway.store.snapshot()["seats"]
+            if row["principal"] == "desk/trader"
+        )["revoked"]
+        == 1
+    )
+    assert not any(kind == "start" for kind, _ in runtime_calls)
     row = next(
         r
         for r in gateway._handlers()["workspace.bindings"]({})

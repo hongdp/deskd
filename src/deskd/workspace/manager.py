@@ -466,6 +466,26 @@ class WorkspaceManager:
         self._wait("gateway", self._gateway_ready)
         if not self._fence():
             raise WorkspaceError("gateway_fence_failed")
+        if bootstrap and self.deployment.roots_path.exists():
+            declared = {seat.principal for seat in self.deployment.seats()}
+            authority = self.deployment.admin("workspace.bindings")
+            coordination = self.deployment.admin("workspace.status")
+            if authority.get("ok") is not True or coordination.get("ok") is not True:
+                raise WorkspaceError("bootstrap_state_unavailable")
+            bound = authority.get("result")
+            seats = coordination.get("result", {}).get("seats")
+            if not isinstance(bound, list) or not isinstance(seats, list):
+                raise WorkspaceError("bootstrap_state_invalid")
+            # The root record is written before per-seat registration. Explicit
+            # management up may repair an interrupted registration; automatic
+            # recovery never enters this branch. Complete revoked seats are
+            # handled by the controller and must not be bootstrapped again.
+            bootstrap = not (
+                len(bound) == len(declared)
+                and len(seats) == len(declared)
+                and {row.get("principal") for row in bound} == declared
+                and {row.get("principal") for row in seats} == declared
+            )
         self._spawn("daemon")
         self._wait("daemon", self._daemon_ready)
         if bootstrap:
@@ -488,8 +508,6 @@ class WorkspaceManager:
         self._lock()
         self._started = True
         try:
-            if self.deployment.roots_path.exists():
-                bootstrap = False
             self._start_cycle(bootstrap=bootstrap)
         except BaseException:
             self.close()

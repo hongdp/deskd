@@ -7,15 +7,20 @@ and every process belongs to the newly installed scratchpad workspace.
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import select
+import signal
 import sqlite3
 import subprocess
+import struct
 import sys
 import tempfile
+import termios
 import threading
 import time
 import urllib.error
@@ -307,6 +312,128 @@ def _wait(manager, deployment, mock, predicate, *, seconds=60):
     )
 
 
+def _native_attach(deployment, manager, mock, roots):
+    """Real terminal; only local /status and /quit, never a model prompt."""
+    master, slave = os.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 48, 140, 0, 0))
+    entry = (
+        "import fcntl,sys,termios;fcntl.ioctl(0,termios.TIOCSCTTY,0);"
+        "sys.path.insert(0,sys.argv.pop(1));"
+        "from deskd.workspace.__main__ import main;raise SystemExit(main())"
+    )
+    process = None
+    output = bytearray()
+    replies = {}
+    probes = {
+        b"\x1b[6n": b"\x1b[1;1R",
+        b"\x1b]10;?\x1b\\": b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\",
+        b"\x1b]11;?\x1b\\": b"\x1b]11;rgb:0000/0000/0000\x1b\\",
+        b"\x1b[?u": b"\x1b[?0u",
+        b"\x1b[c": b"\x1b[?1;2c",
+    }
+    daemon_pid = manager.pids["daemon"]
+    before_calls = mock.calls
+
+    def read_terminal():
+        ready, _, _ = select.select([master], [], [], 0.1)
+        if ready:
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                data = b""
+            output.extend(data)
+            assert len(output) <= 2 * 1024 * 1024, "synthetic terminal output limit"
+            for query, answer in probes.items():
+                count = output.count(query)
+                for _ in range(count - replies.get(query, 0)):
+                    os.write(master, answer)
+                replies[query] = count
+        manager.tick()
+        assert mock.failure is None and mock.calls == before_calls
+        return re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", bytes(output))
+
+    try:
+        process = subprocess.Popen(
+            [
+                deployment.value["python"]["path"],
+                "-I",
+                "-B",
+                "-c",
+                entry,
+                str(deployment.prefix / "lib"),
+                "attach",
+                "--deployment",
+                str(deployment.path),
+                "--seat",
+                "analyst",
+            ],
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(deployment.prefix / "base"),
+                "TERM": "xterm-256color",
+                "LANG": "C.UTF-8",
+            },
+            cwd=deployment.prefix / "base",
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
+            start_new_session=True,
+        )
+        os.close(slave)
+        slave = None
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            visible = read_terminal()
+            assert process.poll() is None, "native terminal exited before ready"
+            if b"shortcuts" in visible:
+                break
+        else:
+            pytest.fail("native terminal did not display its ready composer")
+        os.write(master, b"/status")
+        # Let the native paste-burst guard settle before pressing Enter.
+        time.sleep(0.15)
+        os.write(master, b"\r")
+        expected_root = roots["desk/analyst"]["root_id"].encode()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if expected_root in read_terminal():
+                break
+            assert process.poll() is None, "native terminal exited before /status"
+        else:
+            pytest.fail("native /status did not show the registered root")
+        os.write(master, b"/quit")
+        time.sleep(0.15)
+        os.write(master, b"\r")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and process.poll() is None:
+            read_terminal()
+        assert process.poll() == 0, "native /quit did not exit cleanly"
+        assert manager.pids["daemon"] == daemon_pid and mock.calls == before_calls
+        assert json.loads(deployment.roots_path.read_text()) == roots
+        assert deployment.admin("workspace.status")["result"]["service"]["active"]
+        runtime = deployment.runtime()
+        try:
+            assert runtime.peer_pid == daemon_pid
+            seat = next(s for s in deployment.seats() if s.principal == "desk/analyst")
+            binding = runtime.resume_root(seat.root_id, seat.config)
+            assert binding.thread_id == expected_root.decode()
+            assert runtime.read_root(binding.thread_id)["id"] == binding.thread_id
+        finally:
+            runtime.close()
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        os.close(master)
+        if slave is not None:
+            os.close(slave)
+
+
 def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
     monkeypatch,
 ):
@@ -317,7 +444,7 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
     root = Path(supplied)
     _assert_root_tree(root)
     assert root.name == "scratchpad" and os.path.samefile(root / "system-tmp", "/tmp")
-    from deskd.workspace.board import make_server
+    from deskd.workspace.board import make_server, read_installed_snapshot
     from deskd.workspace.deployment import Deployment, install
     from deskd.workspace.manager import WorkspaceManager
 
@@ -337,7 +464,11 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
     actual_popen = subprocess.Popen
 
     def observed_popen(argv, **kwargs):
-        if isinstance(argv, list) and str(prefix / "lib") in argv:
+        if (
+            isinstance(argv, list)
+            and str(prefix / "lib") in argv
+            and any("run_installed(" in value for value in argv)
+        ):
             path = prefix / f"synthetic-child-{len(diagnostics)}.log"
             diagnostics.append(path)
             with path.open("wb") as log:
@@ -398,7 +529,7 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
             ).fetchone()
             assert issuer == "desk/analyst" and executor == "desk/trader"
 
-        board = make_server(lambda: deployment.admin("workspace.status")["result"])
+        board = make_server(lambda: read_installed_snapshot(deployment))
         board_thread = threading.Thread(target=board.serve_forever, daemon=True)
         board_thread.start()
         base = f"http://127.0.0.1:{board.server_port}"
@@ -407,6 +538,7 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
             visible = json.loads(raw)
             assert response.headers["Cache-Control"] == "no-store"
         assert len(visible["seats"]) == 3 and MEMO.encode() not in raw
+        assert visible["live_observation"] and not visible["fenced"]
         assert b"MOCK TASK BODY" not in raw and b"proposal_id" not in raw
         with pytest.raises(urllib.error.HTTPError) as denied:
             urllib.request.urlopen(
@@ -425,9 +557,10 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
             },
         )["ok"]
         assert deployment.admin(
-            "workspace.enqueue",
+            "workspace.store.schedule_timer",
             {
-                "recipient": "desk/engineer",
+                "actor": "desk/engineer",
+                "due_at": time.time() + 0.1,
                 "body": "Resume after independent unpause.",
                 "request_id": "paused-work",
             },
@@ -444,6 +577,9 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
         assert mock.finished["engineer"] == 1
         before_generation = paused["service"]["generation"]
         manager.close()
+        with pytest.raises(urllib.error.HTTPError) as disconnected:
+            urllib.request.urlopen(base + "/status", timeout=5)
+        assert disconnected.value.code == 503
         manager = WorkspaceManager(manifest, on_event=lifecycle.append)
         manager.start(bootstrap=True)
         assert json.loads(deployment.roots_path.read_text()) == roots
@@ -499,6 +635,67 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
             for seat in after_revoke["seats"]
         )
         assert mock.finished["engineer"] == 2
+        analyst = next(
+            seat
+            for seat in after_revoke["seats"]
+            if seat["principal"] == "desk/analyst"
+        )
+        assert deployment.admin(
+            "workspace.pause",
+            {
+                "principal": "desk/analyst",
+                "paused": True,
+                "expected_version": analyst["version"],
+            },
+        )["ok"]
+        previous_pids = manager.pids
+        calls_before_crash = mock.calls
+        # Only this manager's just-created child is signalled. Do not poll or
+        # reap it here: the supervisor reserves the leader PID with WNOWAIT.
+        assert manager.children["controller"].pid == previous_pids["controller"]
+        os.kill(previous_pids["controller"], signal.SIGKILL)
+        deadline = time.monotonic() + 30
+        while manager.restarts == 0 and time.monotonic() < deadline:
+            manager.tick()
+            time.sleep(0.01)
+        assert manager.restarts == 1 and manager.state == "running"
+        assert all(manager.pids[name] != pid for name, pid in previous_pids.items())
+        assert json.loads(deployment.roots_path.read_text()) == roots
+        crash_recovered = deployment.admin("workspace.status")["result"]
+        assert crash_recovered["service"]["active"]
+        assert (
+            crash_recovered["service"]["generation"]
+            != after_revoke["service"]["generation"]
+        )
+        analyst = next(
+            seat
+            for seat in crash_recovered["seats"]
+            if seat["principal"] == "desk/analyst"
+        )
+        engineer = next(
+            seat
+            for seat in crash_recovered["seats"]
+            if seat["principal"] == "desk/engineer"
+        )
+        assert analyst["paused"] and engineer["revoked"]
+        assert mock.calls == calls_before_crash
+        with sqlite3.connect(
+            deployment.gateway_db.as_uri() + "?mode=ro", uri=True
+        ) as db:
+            assert db.execute("SELECT count(*) FROM memo_published").fetchone()[0] == 1
+        assert deployment.admin(
+            "workspace.pause",
+            {
+                "principal": "desk/analyst",
+                "paused": False,
+                "expected_version": analyst["version"],
+            },
+        )["ok"]
+        _native_attach(deployment, manager, mock, roots)
+        assert deployment.admin("fence")["ok"]
+        with urllib.request.urlopen(base + "/status", timeout=5) as response:
+            fenced = json.load(response)
+        assert fenced["live_observation"] and fenced["fenced"]
         assert lifecycle
     except Exception:
         for path in diagnostics:

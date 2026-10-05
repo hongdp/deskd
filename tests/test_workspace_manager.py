@@ -59,10 +59,14 @@ class Deployment:
 
     def seats(self):
         self.trace.append("existing-roots")
-        return []
+        return [SimpleNamespace(principal="demo/analyst")]
 
     def admin(self, method, params=None):
         self.trace.append(method)
+        if method == "workspace.bindings":
+            return {"ok": True, "result": [{"principal": "demo/analyst"}]}
+        if method == "workspace.status":
+            return {"ok": True, "result": {"seats": [{"principal": "demo/analyst"}]}}
         return {"ok": True, "result": {"fenced": True}}
 
 
@@ -175,6 +179,23 @@ def test_existing_roots_skip_bootstrap_even_on_explicit_up(manager):
     manager.start(bootstrap=True)
     assert "existing-roots" in manager.deployment.trace
     assert not any(event.get("child") == "bootstrap" for event in manager.test_events)
+
+
+def test_explicit_up_repairs_incomplete_registration_but_restart_does_not(manager):
+    manager.deployment.roots_path.write_text("synthetic protected record stand-in")
+    original = manager.deployment.admin
+
+    def partial(method, params=None):
+        if method == "workspace.status":
+            return {"ok": True, "result": {"seats": []}}
+        return original(method, params)
+
+    manager.deployment.admin = partial
+    manager.start(bootstrap=True)
+    assert sum(event.get("child") == "bootstrap" for event in manager.test_events) == 1
+    manager.children["daemon"].returncode = -9
+    manager.tick()
+    assert sum(event.get("child") == "bootstrap" for event in manager.test_events) == 1
 
 
 def test_start_failure_stops_only_spawned_children(manager, monkeypatch):

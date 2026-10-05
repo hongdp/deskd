@@ -500,22 +500,76 @@ def run_installed(command, path, *, daemon_pid=None):
 
         if deployment.admin("fence").get("ok") is not True:
             raise ValueError("gateway_fence_failed")
+        store.start_service()  # Fence coordination before completing any registration.
         roots = {}
         digest = hashlib.sha256(
             json.dumps(deployment.value, sort_keys=True).encode()
         ).hexdigest()
+        observed = deployment.admin("workspace.bindings")
+        if observed.get("ok") is not True:
+            raise ValueError("bootstrap_registry_unavailable")
+        existing = {b["principal"]: b for b in observed["result"]}
+        stored = {row["principal"]: row for row in store.snapshot()["seats"]}
+        expected = {
+            deployment.value["desk_id"] + "/" + role.seat
+            for role in deployment.installation.roles
+        }
+        if set(existing) - expected or set(stored) - expected:
+            raise ValueError("bootstrap_unexpected_existing_principal")
+
+        def capabilities(principal):
+            seat = principal.split("/")[1]
+            caps = [*ACTIONS, "state.read", "proposal.create"]
+            if seat == "analyst":
+                caps += ["approval.issue", "approval.revoke"]
+            if seat == "trader":
+                caps += ["action.execute"]
+            return caps
+
+        def validate_record(principal, row):
+            old = existing.get(principal)
+            previous = stored.get(principal)
+            if old is not None and (
+                old["root_id"] != row["root_id"]
+                or old["manifest_hash"] != digest
+                or old["status"] not in {"bound", "revoked"}
+                or old["binding_generation"] != 1 + int(old["status"] == "revoked")
+                or set(old["capabilities"]) != set(capabilities(principal))
+            ):
+                raise ValueError("bootstrap_existing_authority_mismatch")
+            if previous is not None and (
+                previous["root_id"] != row["root_id"]
+                or previous["manifest_hash"] != digest
+                or previous["binding_generation"] != 1
+            ):
+                raise ValueError("bootstrap_existing_workspace_mismatch")
+            if old is None and previous is not None and previous["revoked"]:
+                raise ValueError("bootstrap_revoked_authority_missing")
+            return (old is not None and old["status"] == "revoked") or (
+                previous is not None and bool(previous["revoked"])
+            )
+
+        if not deployment.roots_path.exists() and (existing or stored):
+            raise ValueError("bootstrap_existing_state_without_root_record")
         runtime = deployment.runtime()
         try:
             if deployment.roots_path.exists():
                 for seat in deployment.seats():
                     if seat.manifest_hash != digest or seat.binding_generation != 1:
                         raise ValueError("bootstrap_record_changed")
-                    runtime.resume_root(seat.root_id, seat.config)
                     roots[seat.principal] = {
                         "root_id": seat.root_id,
                         "manifest_hash": digest,
                         "binding_generation": 1,
                     }
+                # Validate every existing identity before resuming any root.
+                revoked = {
+                    principal: validate_record(principal, row)
+                    for principal, row in roots.items()
+                }
+                for seat in deployment.seats():
+                    if not revoked[seat.principal]:
+                        runtime.resume_root(seat.root_id, seat.config)
             else:
                 for role in deployment.installation.roles:
                     binding = runtime.start_root(deployment.root_config(role))
@@ -528,28 +582,12 @@ def run_installed(command, path, *, daemon_pid=None):
                 _json_write(deployment.roots_path, roots)
         finally:
             runtime.close()
-        observed = deployment.admin("workspace.bindings")
-        if observed.get("ok") is not True:
-            raise ValueError("bootstrap_registry_unavailable")
-        existing = {b["principal"]: b for b in observed["result"]}
         for principal, row in roots.items():
             desk, seat = principal.split("/")
-            caps = [*ACTIONS, "state.read", "proposal.create"]
-            if seat == "analyst":
-                caps += ["approval.issue", "approval.revoke"]
-            if seat == "trader":
-                caps += ["action.execute"]
+            caps = capabilities(principal)
             old = existing.get(principal)
-            if old is not None:
-                if (
-                    old["root_id"] != row["root_id"]
-                    or old["manifest_hash"] != digest
-                    or old["binding_generation"] != 1
-                    or old["status"] != "bound"
-                    or set(old["capabilities"]) != set(caps)
-                ):
-                    raise ValueError("bootstrap_existing_authority_mismatch")
-            else:
+            revoked = validate_record(principal, row)
+            if old is None:
                 reply = deployment.admin(
                     "bind",
                     {
@@ -563,7 +601,18 @@ def run_installed(command, path, *, daemon_pid=None):
                 )
                 if reply.get("ok") is not True:
                     raise ValueError("partial_bootstrap_retry_same_record")
-            store.register_seat(principal, row["root_id"], digest)
+            registered = store.register_seat(principal, row["root_id"], digest)
+            if revoked:
+                reply = deployment.admin(
+                    "workspace.revoke",
+                    {
+                        "principal": principal,
+                        "expected_binding_generation": 1,
+                        "expected_version": registered["version"],
+                    },
+                )
+                if reply.get("ok") is not True:
+                    raise ValueError("partial_bootstrap_revocation_repair_required")
         print(json.dumps({"registered": len(roots), "fenced": True}))
         return
     from .controller import WorkspaceController, descendant

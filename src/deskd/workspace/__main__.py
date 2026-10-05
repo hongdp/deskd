@@ -22,7 +22,13 @@ def main(argv=None):
     board = sub.add_parser(
         "board", help="read-only loopback status; private messages omitted"
     )
-    board.add_argument("--state", type=Path, required=True)
+    board_source = board.add_mutually_exclusive_group(required=True)
+    board_source.add_argument(
+        "--state", type=Path, help="recorded ledger; live health unverified"
+    )
+    board_source.add_argument(
+        "--deployment", type=Path, help="observe the installed gateway and workspace"
+    )
     board.add_argument("--port", type=int, default=0)
     control = sub.add_parser(
         "control", help="independent administrative socket request"
@@ -119,12 +125,20 @@ def main(argv=None):
             print(json.dumps(reply, ensure_ascii=False))
             return 0 if reply["ok"] else 1
         elif args.command == "board":
-            from .board import make_server, read_snapshot
+            from functools import partial
+            from .board import make_server, read_installed_snapshot, read_snapshot
 
-            if not args.state.is_file():
-                raise ValueError("existing_workspace_required")
-            read_snapshot(args.state)
-            server = make_server(lambda: read_snapshot(args.state), port=args.port)
+            if args.deployment is not None:
+                from .deployment import Deployment
+
+                installation = Deployment(args.deployment)
+                snapshot = partial(read_installed_snapshot, installation)
+            else:
+                if not args.state.is_file():
+                    raise ValueError("existing_workspace_required")
+                read_snapshot(args.state)
+                snapshot = partial(read_snapshot, args.state)
+            server = make_server(snapshot, port=args.port)
             print(f"http://127.0.0.1:{server.server_port}", flush=True)
             try:
                 server.serve_forever(poll_interval=0.2)

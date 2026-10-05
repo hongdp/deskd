@@ -114,12 +114,15 @@ Run the read-only board in another administrator terminal:
 
 ```sh
 sudo /opt/deskd-python/bin/python -m deskd.workspace board \
-  --state /opt/deskd/gateway/workspace.db --port 8765
+  --deployment /opt/deskd/policy/deployment.json --port 8765
 ```
 
-Open the printed `http://127.0.0.1:8765` URL. The board polls current seat and
-delivery metadata, omits message bodies and proposal contents, and has no mutation
-endpoint. Do not expose it through a public proxy.
+Open the printed `http://127.0.0.1:8765` URL. This mode checks the protected
+management connection on each poll and combines gateway fencing with recorded
+seat and delivery state. Failed observations are shown as stale. The separate
+`--state` mode is for inspecting a ledger and does not verify live service health.
+Both modes omit message bodies and proposal contents and have no mutation
+endpoint. Do not expose the board through a public proxy.
 
 Use the independent management socket for changes. First fetch the current
 versions and binding state:
