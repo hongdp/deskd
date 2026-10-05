@@ -215,18 +215,42 @@ def test_spoofed_human_or_role_identity_is_not_forwarded():
 def test_concurrent_slow_clients_are_bounded_before_any_backend_access():
     with server_fixture() as (server, backend, _):
         clients = []
+        admitted = threading.Condition()
+        release = threading.Event()
+        workers = []
+        original_setup = server.RequestHandlerClass.setup
+
+        def synchronized_setup(handler):
+            original_setup(handler)
+            with admitted:
+                workers.append(threading.current_thread())
+                admitted.notify_all()
+            # Keep every admitted handler occupied until the assertion. This
+            # tests the admission bound independently of CI scheduling speed
+            # and the separate incomplete-request timeout.
+            release.wait()
+
+        server.RequestHandlerClass.setup = synchronized_setup
         try:
-            # Each incomplete header occupies one of the bounded handlers.
-            for _ in range(24):
-                client = socket.create_connection(("127.0.0.1", server.server_port), timeout=1)
+            # Wait for actual admission after every connection rather than
+            # racing 24 connects against the platform's TCP listen backlog.
+            for index in range(24):
+                client = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
                 clients.append(client)
                 client.sendall(b"GET /api/snapshot HTTP/1.1\r\n")
-            overflow = socket.create_connection(("127.0.0.1", server.server_port), timeout=1)
+                with admitted:
+                    assert admitted.wait_for(lambda: len(workers) == index + 1, timeout=5)
+            overflow = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
             clients.append(overflow)
             # A full handler pool closes an excess connection immediately;
             # it cannot accumulate another waiting root server thread.
             assert overflow.recv(1) == b""
+            assert len(workers) == 24
             assert backend.calls == []
         finally:
             for client in clients:
                 client.close()
+            release.set()
+            for worker in workers:
+                worker.join(timeout=5)
+                assert not worker.is_alive()

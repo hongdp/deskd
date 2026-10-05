@@ -183,6 +183,7 @@ def make_server(backend, *, port=0, sessions=None):
     class Server(ThreadingHTTPServer):
         daemon_threads = True
         allow_reuse_address = False
+        request_queue_size = 32
 
         def __init__(self, *args, **kwargs):
             self._slots = threading.BoundedSemaphore(24)
@@ -269,13 +270,16 @@ def make_server(backend, *, port=0, sessions=None):
 
         def _run(self, callback):
             try:
-                callback()
-            except ConsoleError as exc:
-                self._reply(exc.status, {"ok": False, "error": {"code": exc.code}})
-            except (BrokenPipeError, ConnectionResetError):
+                try:
+                    callback()
+                except ConsoleError as exc:
+                    self._reply(exc.status, {"ok": False, "error": {"code": exc.code}})
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                    raise
+                except Exception:
+                    self._reply(503, {"ok": False, "error": {"code": "console_unavailable"}})
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass
-            except Exception:
-                self._reply(503, {"ok": False, "error": {"code": "console_unavailable"}})
 
         def do_GET(self):
             def get():
