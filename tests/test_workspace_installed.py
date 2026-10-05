@@ -16,6 +16,7 @@ import re
 import select
 import signal
 import sqlite3
+import stat
 import subprocess
 import struct
 import sys
@@ -493,18 +494,6 @@ def test_installed_workspace_collaborates_recovers_and_exposes_readonly_board(
     # These mock-only files cannot contain a real key or provider response.
     diagnostics = []
     actual_popen = subprocess.Popen
-    observe_errors = """
-import json, sys
-sys.path.insert(0, sys.argv[1])
-from deskd.workspace.runtime import CodexRuntime
-original_message = CodexRuntime._message
-def observed_message(self, deadline):
-    value = original_message(self, deadline)
-    if 'error' in value:
-        print('SYNTHETIC RUNTIME ERROR ' + json.dumps(value['error'])[:2000], file=sys.stderr, flush=True)
-    return value
-CodexRuntime._message = observed_message
-"""
 
     def observed_popen(argv, **kwargs):
         if (
@@ -514,9 +503,6 @@ CodexRuntime._message = observed_message
         ):
             path = prefix / f"synthetic-child-{len(diagnostics)}.log"
             diagnostics.append(path)
-            if "bootstrap" in argv or "controller" in argv:
-                argv = list(argv)
-                argv[4] = observe_errors + argv[4]
             with path.open("wb") as log:
                 return actual_popen(argv, **{**kwargs, "stderr": log})
         return actual_popen(argv, **kwargs)
@@ -745,6 +731,26 @@ CodexRuntime._message = observed_message
         assert fenced["live_observation"] and fenced["fenced"]
         assert lifecycle
     except Exception:
+        if "deployment" in locals():
+            for name in deployment.value["inventory"]:
+                path = Path(name)
+                assert prefix in path.parents
+                info = path.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != 0
+                    or info.st_mode & 0o022
+                    or info.st_nlink != 1
+                ):
+                    print(
+                        "SYNTHETIC INVENTORY METADATA",
+                        {
+                            "path": str(path.relative_to(prefix)),
+                            "uid": info.st_uid,
+                            "mode": oct(info.st_mode),
+                            "nlink": info.st_nlink,
+                        },
+                    )
         for path in diagnostics:
             with path.open("rb") as log:
                 data = log.read(4096)

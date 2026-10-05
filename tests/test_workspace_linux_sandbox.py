@@ -367,12 +367,16 @@ denied('owned_daemon_signal_zero', lambda: os.kill({daemon_pid}, 0))
 denied('other_write', lambda: pathlib.Path({str(Path(other.data) / "injected")!r}).write_text('bad'))
 denied('config_write', lambda: pathlib.Path({str(Path(role.root) / ".codex/config.toml")!r}).write_text('bad'))
 denied('shadow_config_mkdir', lambda: pathlib.Path({str(Path(role.data) / ".codex")!r}).mkdir())
-def shadow_config():
-    shadow = pathlib.Path({str(Path(role.data) / ".codex")!r})
-    shadow.mkdir()
-    (shadow / 'config.toml').write_text('default_permissions = "locked"')
-denied('shadow_config', shadow_config)
-denied('shadow_config_symlink', lambda: os.symlink({str(Path(role.root) / ".codex")!r}, {str(Path(role.data) / ".codex")!r}))
+# bwrap may leave an empty mount target. Probe the file independently so an
+# existing directory cannot short-circuit the actual policy write attempt.
+shadow = pathlib.Path({str(Path(role.data) / ".codex")!r})
+denied('shadow_config', lambda: (shadow / 'config.toml').write_text('default_permissions = "locked"'))
+denied('shadow_config_file_symlink', lambda: os.symlink({str(Path(role.root) / ".codex/config.toml")!r}, shadow / 'config.toml'))
+denied('shadow_config_symlink', lambda: os.symlink({str(Path(role.root) / ".codex")!r}, shadow))
+denied('shadow_config_remove', lambda: shadow.rmdir())
+replacement = pathlib.Path({str(Path(role.data) / ("shadow-replacement-" + suffix))!r})
+replacement.mkdir()
+denied('shadow_config_replace', lambda: os.replace(replacement, shadow))
 denied('config_rename', lambda: os.rename({role.root!r}, {role.root + "-moved"!r}))
 denied('hardlink', lambda: os.link({str(Path(other.data) / "marker")!r}, {str(Path(role.data) / "linked")!r}))
 link = pathlib.Path({str(Path(role.data) / ("peer-link-" + suffix))!r})
@@ -395,6 +399,16 @@ print('SYNTHETIC-SANDBOX-PROBE-COMPLETE')
     return "/usr/bin/python3 -c " + shlex.quote(script)
 
 
+def _assert_no_shadow_policy(role):
+    shadow = Path(role.data) / ".codex"
+    # Official bwrap can create a harmless empty mount target. The marker is
+    # the protected config file, so a placeholder must never supply policy.
+    assert not shadow.is_symlink()
+    if shadow.exists():
+        assert shadow.is_dir() and not any(shadow.iterdir())
+    assert not os.path.lexists(shadow / "config.toml")
+
+
 def _run_probe(
     client,
     binding,
@@ -406,9 +420,7 @@ def _run_probe(
     mock,
     suffix,
 ):
-    assert not os.path.lexists(Path(role.data) / ".codex"), (
-        "fixture must begin without a shadow project marker"
-    )
+    _assert_no_shadow_policy(role)
     mock.patch = None
     mock.command = _probe_command(
         installation,
@@ -454,9 +466,7 @@ def _run_probe(
     )
     checks = json.loads(result.read_text())
     assert checks and all(value is True for value in checks.values()), checks
-    assert not os.path.lexists(Path(role.data) / ".codex"), (
-        "sandbox must not leave a shadow project directory or symlink on the host"
-    )
+    _assert_no_shadow_policy(role)
     assert (Path(role.data) / f"own-{suffix}").read_text() == "allowed"
 
 

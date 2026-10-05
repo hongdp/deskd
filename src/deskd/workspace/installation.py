@@ -238,7 +238,12 @@ class Installation:
             for denied in private + [r.root for r in self.roles if r != role]:
                 lines.append(f'{_quote(denied)} = "deny"')
             lines += [f"[permissions.{seat}.network]", "enabled = false"]
-        for root in [self.path("base")] + [r.root for r in self.roles]:
+        # Project-layer discovery uses markers, while the official active-project
+        # trust check separately consults the exact cwd. Predeclare both so
+        # thread/start does not rewrite the attested base configuration.
+        for root in [self.path("base")] + [
+            path for r in self.roles for path in (r.root, r.data)
+        ]:
             lines += [f"[projects.{_quote(root)}]", 'trust_level = "trusted"']
         return "\n".join(lines) + "\n"
 

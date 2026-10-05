@@ -37,6 +37,7 @@ def test_fixed_profiles_disable_hook_discovery_and_hosted_image_generation(provi
     assert base["memories"] == {"generate_memories": False, "use_memories": False}
     for role in installation.roles:
         assert base["projects"][role.root]["trust_level"] == "trusted"
+        assert base["projects"][role.data]["trust_level"] == "trusted"
     assert features["hooks"] is False
     assert features["image_generation"] is False
     assert features["goals"] is False
