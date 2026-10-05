@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import socket
 import struct
+import time
 from typing import Any, BinaryIO, Callable
 import uuid
 
@@ -56,6 +57,8 @@ def _serve_stdio(
     target: BinaryIO,
     rpc: Callable[[str, dict[str, Any]], dict[str, Any]],
     catalog: list[dict[str, Any]],
+    *,
+    identify: bool = False,
 ) -> None:
     """Protocol loop over an already authenticated gateway connection."""
     initialized = ready = False
@@ -132,7 +135,12 @@ def _serve_stdio(
             elif method == "tools/list":
                 if set(params) - {"_meta"}:
                     raise BridgeError("unsupported_tool_cursor")
-                result = {"tools": catalog}
+                result = {
+                    "tools": [
+                        {k: v for k, v in t.items() if k != "_deskd_read"}
+                        for t in catalog
+                    ]
+                }
             elif method == "tools/call":
                 if (
                     set(params) != {"name", "arguments", "_meta"}
@@ -145,17 +153,36 @@ def _serve_stdio(
                     raise BridgeError("unknown_tool")
                 arguments = dict(params["arguments"])
                 request_id = identifier(arguments.pop("request_id", None), "request_id")
+                if identify:
+                    deadline = time.monotonic() + 5
+                    while True:
+                        observation = rpc("identify", {"_meta": params["_meta"]})
+                        if observation.get("ok") is not True:
+                            break
+                        if observation.get("result", {}).get("ready") is True:
+                            break
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
                 # No client supplied transport/generation fields are forwarded.
-                reply = rpc(
-                    "execute",
-                    {
-                        "request_id": request_id,
-                        "mcp": {
-                            "name": params["name"],
-                            "arguments": arguments,
-                            "_meta": params["_meta"],
-                        },
+                payload = {
+                    "request_id": request_id,
+                    "mcp": {
+                        "name": params["name"],
+                        "arguments": arguments,
+                        "_meta": params["_meta"],
                     },
+                }
+                # This dispatch flag comes from the installed catalog, never
+                # from an MCP caller. The gateway still authenticates the read.
+                read_only = any(
+                    t["name"] == params["name"] and t.get("_deskd_read") is True
+                    for t in catalog
+                )
+                reply = (
+                    rpc("read", payload["mcp"])
+                    if read_only
+                    else rpc("execute", payload)
                 )
                 if reply.get("ok") is not True and reply.get("error", {}).get(
                     "code"
@@ -209,7 +236,13 @@ def _serve_stdio(
 
 
 def run_bridge(
-    socket_path: Path | str, *, gateway_uid: int, source: BinaryIO, target: BinaryIO
+    socket_path: Path | str,
+    *,
+    gateway_uid: int,
+    source: BinaryIO,
+    target: BinaryIO,
+    catalog: list[dict[str, Any]] | None = None,
+    identify: bool = False,
 ) -> None:
     """Connect once; authenticate the server UID before sending any tool data."""
     if (
@@ -221,7 +254,9 @@ def run_bridge(
         raise BridgeError("distinct_gateway_uid_required")
     from .actions import tool_catalog
 
-    catalog = tool_catalog()
+    catalog = (
+        json.loads(canonical_json(catalog)) if catalog is not None else tool_catalog()
+    )
     for tool in catalog:
         schema = tool["inputSchema"]
         schema["properties"]["request_id"] = {
@@ -282,4 +317,4 @@ def run_bridge(
 
             if rpc("hello", {}).get("ok") is not True:
                 raise BridgeError("gateway_rejected_connection")
-            _serve_stdio(source, target, rpc, catalog)
+            _serve_stdio(source, target, rpc, catalog, identify=identify)

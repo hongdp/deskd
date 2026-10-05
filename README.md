@@ -45,12 +45,11 @@ it, fake it, or vote with it.
 
 ## 60 seconds to a live board
 
-For the experimental native-harness overlay, see the
-[local workflow](docs/local-workflow.md): three synthetic seats propose,
-independently authorize and publish one local memo, with an offline responsibility
-board. The memo gateway and fixed MCP bridge are implemented; two-service-user
-installation and official-harness isolation still require separate acceptance.
-The demonstration needs no model or credentials and is not a trading system.
+For the native-harness overlay, see the
+[persistent workspace guide](docs/workspace.md): separate persistent role roots,
+durable mail and tasks, independent memo authorization, a live board and managed
+recovery. Its offline rehearsal needs no model or credentials. Dedicated hosted
+Linux acceptance exercises the pinned official runtime and service-user boundary.
 
 ```bash
 pip install "deskd[web]"                     # the engine + the web console
@@ -68,7 +67,7 @@ public API; if a plain Python loop can play every part, the orchestration you
 are watching is all engine. Beat-by-beat script:
 [`examples/support_desk/README.md`](examples/support_desk/README.md).
 
-### Realtime terminal control
+## Realtime terminal control
 
 Install the optional TUI next to any machine that can reach the deskd control
 plane — it is a remote client and never opens the engine's SQLite database:
