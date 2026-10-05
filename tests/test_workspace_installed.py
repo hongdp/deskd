@@ -42,7 +42,13 @@ MEMO_HASH = hashlib.sha256(MEMO.encode()).hexdigest()
 def _object(value):
     """Unwrap only this mock's MCP text/receipt envelopes, never host data."""
     if isinstance(value, str):
-        return _object(json.loads(value))
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            raise AssertionError(
+                "non-JSON synthetic tool text: " + repr(value[:1200])
+            ) from None
+        return _object(decoded)
     if isinstance(value, list):
         # Stock 0.160.0 MCP output has a timing preamble plus one text body.
         # Strip only this exact observed envelope; never ignore an extra result
@@ -104,6 +110,7 @@ class CollaborationMock:
                 pass
 
             def do_POST(self):
+                root_id = None
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     assert 0 < length < 4 * 1024 * 1024
@@ -139,7 +146,18 @@ class CollaborationMock:
                 except Exception as exc:
                     # Every string here comes from this synthetic fixture. No request
                     # body, authorization header, or inherited environment is printed.
-                    owner.failure = type(exc).__name__ + ": " + str(exc)[:2400]
+                    state = owner.states.get(root_id, {})
+                    context = {
+                        "seat": owner.roles.get(root_id),
+                        "action": state.get("action", [None])[0],
+                    }
+                    owner.failure = (
+                        json.dumps(context)
+                        + " "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)[:2400]
+                    )
                     self.send_error(500)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
