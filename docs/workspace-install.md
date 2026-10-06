@@ -65,6 +65,14 @@ helper returns it privately to the trusted harness after gateway authorization;
 model tools are not given the auth operation. Real-key/API operation is outside
 the credential-free acceptance described below.
 
+For Google Gemini, the same installer accepts `--provider gemini
+--model gemini-3.8-flash --gemini-port PORT`, where `PORT` is an unused local
+non-privileged port. This selects the gateway-owned adapter described in
+[Gemini provider](workspace-gemini.md). Provision a Google Gemini API key in the
+same protected gateway file; the harness receives a separate temporary local
+capability, and the Google key stays in the gateway process. Merely changing the
+model name on an OpenAI installation does not select Gemini.
+
 For a completely synthetic rehearsal, use `install-mock` with the same path/UID
 arguments, `--mock-port PORT` and optional `--model`; it requires a separately
 started local Responses mock and does not read a key. The repository's privileged

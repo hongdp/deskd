@@ -21,6 +21,7 @@ OFFICIAL_LINUX_X64_SHA256 = (
     "12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad"
 )
 CONSOLE_ASSETS = ("console.html", "console.css", "console.js")
+GEMINI_MODEL = "gemini-3.8-flash"
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 _PATH = re.compile(r"/[A-Za-z0-9_./-]+\Z")
 BRIDGE_READ_TOOLS = ("inbox.read", "tasks.read", "workspace.receipt", "goal.read", "source.list", "source.read", "memory.search", "memory.read")
@@ -135,6 +136,7 @@ class Installation:
         self,
         *,
         mock_port: int | None = None,
+        gemini_port: int | None = None,
         with_gateway_bridge: bool = False,
         provider: str = "mock",
         model: str = "gpt-5.5",
@@ -146,13 +148,22 @@ class Installation:
         mechanism; no role can change this profile catalogue.
         """
         if (
-            provider not in {"mock", "api"}
+            provider not in {"mock", "api", "gemini"}
             or type(model) is not str
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model)
         ):
             raise ValueError("invalid_model_provider")
-        if provider == "api" and mock_port is not None:
+        if provider in {"api", "gemini"} and mock_port is not None:
             raise ValueError("api_provider_cannot_use_mock_endpoint")
+        if provider == "gemini":
+            if (
+                model != GEMINI_MODEL
+                or type(gemini_port) is not int
+                or not 1024 <= gemini_port <= 65535
+            ):
+                raise ValueError("invalid_gemini_provider")
+        elif gemini_port is not None:
+            raise ValueError("unexpected_gemini_endpoint")
         if type(with_gateway_bridge) is not bool:
             raise ValueError("invalid bridge switch")
         if mock_port is not None and (
@@ -174,6 +185,10 @@ class Installation:
         ]
         if provider == "api":
             lines.append('model_provider = "deskd_api"')
+        elif provider == "gemini":
+            lines.append('model_provider = "deskd_gemini"')
+            lines.append('model_reasoning_effort = "medium"')
+            lines.append('model_reasoning_summary = "none"')
         elif mock_port is not None:
             lines.append('model_provider = "deskd_mock"')
         lines.append("[notice.model_migrations]")
@@ -210,6 +225,7 @@ class Installation:
             "shell_snapshot = false",
             "js_repl = false",
             "code_mode = false",
+            *(["enable_request_compression = false"] if provider == "gemini" else []),
             "[mcp_servers.codex_tui]",
             'command = "/bin/false"',
             "enabled = false",
@@ -223,15 +239,24 @@ class Installation:
                 "request_max_retries = 0",
                 "stream_max_retries = 0",
             ]
-        if provider == "api":
+        if provider in {"api", "gemini"}:
+            # A custom provider identity has no OpenAI/Azure remote-compaction
+            # capability. Gemini receives only ordinary Responses requests at
+            # the protected gateway-owned adapter, never a direct Google key.
+            endpoint = (
+                f"http://127.0.0.1:{gemini_port}/v1"
+                if provider == "gemini"
+                else "https://api.openai.com/v1"
+            )
             lines += [
-                "[model_providers.deskd_api]",
-                'name = "deskd API"',
-                'base_url = "https://api.openai.com/v1"',
+                f"[model_providers.deskd_{provider}]",
+                'name = "deskd Gemini adapter"' if provider == "gemini" else 'name = "deskd API"',
+                f"base_url = {_quote(endpoint)}",
                 'wire_api = "responses"',
                 "requires_openai_auth = false",
                 "supports_websockets = false",
-                "[model_providers.deskd_api.auth]",
+                *(["request_max_retries = 0", "stream_max_retries = 0"] if provider == "gemini" else []),
+                f"[model_providers.deskd_{provider}.auth]",
                 f"command = {_quote(self.path('bin/deskd-model-auth'))}",
                 f"args = {json.dumps(['--socket', self.path('business/s'), '--gateway-uid', str(self.gateway_uid)])}",
                 f"cwd = {_quote(self.path('base'))}",
@@ -332,6 +357,7 @@ class Installation:
         self,
         *,
         mock_port: int | None = None,
+        gemini_port: int | None = None,
         with_gateway_bridge: bool = False,
         provider: str = "mock",
         model: str = "gpt-5.5",
@@ -339,6 +365,7 @@ class Installation:
         """Return reviewable metadata/content. Every emitted path is explicit."""
         config = self.configuration(
             mock_port=mock_port,
+            gemini_port=gemini_port,
             with_gateway_bridge=with_gateway_bridge,
             provider=provider,
             model=model,

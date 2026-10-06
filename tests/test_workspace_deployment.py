@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from deskd.workspace import deployment
-from deskd.workspace.installation import Installation, RoleInstallation
+from deskd.workspace.installation import GEMINI_MODEL, Installation, RoleInstallation
 
 
 @pytest.fixture
@@ -395,6 +395,86 @@ def test_api_provider_has_fixed_endpoint_and_private_command_auth(declared):
         assert filesystem[str(instance.prefix / "harness")] == "deny"
 
 
+def test_gemini_provider_is_pinned_loopback_without_external_key_or_discovery(declared):
+    instance, _, _ = declared
+    config = tomllib.loads(instance.installation.configuration(
+        provider="gemini", model=GEMINI_MODEL, gemini_port=18437,
+    ))
+    provider = config["model_providers"]["deskd_gemini"]
+    assert config["model"] == GEMINI_MODEL
+    assert config["model_provider"] == "deskd_gemini"
+    assert config["model_reasoning_effort"] == "medium"
+    assert config["model_reasoning_summary"] == "none"
+    assert provider["base_url"] == "http://127.0.0.1:18437/v1"
+    assert provider["wire_api"] == "responses"
+    assert provider["name"] == "deskd Gemini adapter"
+    assert provider["supports_websockets"] is False
+    assert provider["requires_openai_auth"] is False
+    assert provider["request_max_retries"] == provider["stream_max_retries"] == 0
+    assert provider["auth"]["command"] == str(instance.prefix / "bin/deskd-model-auth")
+    assert not {"env_key", "experimental_bearer_token", "http_headers"} & set(provider)
+    for flag in ("enable_request_compression", "remote_models", "api_key_model_discovery"):
+        assert config["features"][flag] is False
+    for role in instance.installation.roles:
+        permissions = config["permissions"][role.seat]
+        assert permissions["network"]["enabled"] is False
+        assert permissions["filesystem"][str(instance.prefix / "gateway")] == "deny"
+        assert permissions["filesystem"][str(instance.prefix / "business")] == "deny"
+
+
+@pytest.mark.parametrize("override", [
+    {"gemini_port": None}, {"gemini_port": True}, {"gemini_port": 0},
+    {"gemini_port": 1023}, {"gemini_port": 65536}, {"gemini_port": "18437"},
+    {"model": "gpt-5.5"}, {"model": "gemini-3.8-flash/../../other"},
+    {"mock_port": 18438}, {"provider": "api"}, {"provider": "mock"},
+])
+def test_gemini_provider_rejects_endpoint_or_model_reinterpretation(declared, override):
+    instance, _, _ = declared
+    kwargs = dict(provider="gemini", model=GEMINI_MODEL, gemini_port=18437)
+    kwargs.update(override)
+    with pytest.raises(ValueError):
+        instance.installation.configuration(**kwargs)
+
+
+def test_gemini_manifest_requires_exact_protected_endpoint_and_binds_root(declared):
+    instance, _, _ = declared
+    value = dict(instance.value, provider="gemini", model=GEMINI_MODEL,
+                 mock_port=None, gemini_port=18437)
+    instance.path.write_text(json.dumps(value))
+    gemini = deployment.Deployment(instance.path)
+    root = gemini.root_config(gemini.installation.roles[0])
+    assert root.model == GEMINI_MODEL and root.model_provider == "deskd_gemini"
+    assert root.expected_sandbox["networkAccess"] is False
+    assert "http://127.0.0.1:18437/v1" in gemini.plan["files"][0]["content"]
+    for wrong in (
+        {key: item for key, item in value.items() if key != "gemini_port"},
+        dict(value, endpoint="http://elsewhere"),
+        dict(value, provider="api"),
+        dict(value, provider="mock"),
+        dict(value, gemini_port=None),
+    ):
+        instance.path.write_text(json.dumps(wrong))
+        with pytest.raises(ValueError):
+            deployment.Deployment(instance.path)
+
+
+def test_gemini_attestation_requires_auth_helper_pin_before_reading_artifacts(declared):
+    instance, _, _ = declared
+    value = dict(instance.value, provider="gemini", model=GEMINI_MODEL,
+                 mock_port=None, gemini_port=18437)
+    plan = instance.installation.plan(provider="gemini", model=GEMINI_MODEL,
+                                      gemini_port=18437, with_gateway_bridge=True)
+    value["inventory"] = {item["path"]: item["sha256"] for item in plan["files"]}
+    value["inventory"].update({
+        instance.installation.binary: deployment.OFFICIAL_LINUX_X64_SHA256,
+        str(instance.prefix / "bin/codex-resources/bwrap"): deployment.OFFICIAL_BWRAP_SHA256,
+    })
+    instance.path.write_text(json.dumps(value))
+    gemini = deployment.Deployment(instance.path)
+    with pytest.raises(ValueError, match="missing_model_auth_pin"):
+        gemini.attest()
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -438,7 +518,7 @@ def install_model(tmp_path, monkeypatch):
     return tmp_path / "i", binary
 
 
-@pytest.mark.parametrize("provider", ["api", "mock"])
+@pytest.mark.parametrize("provider", ["api", "mock", "gemini"])
 def test_install_writes_pinned_helpers_without_creating_a_key(install_model, provider):
     prefix, binary = install_model
     path = deployment.install(
@@ -449,11 +529,17 @@ def test_install_writes_pinned_helpers_without_creating_a_key(install_model, pro
         business_gid=12003,
         provider=provider,
         mock_port=12345 if provider == "mock" else None,
-        model="synthetic-model",
+        gemini_port=18437 if provider == "gemini" else None,
+        model=GEMINI_MODEL if provider == "gemini" else "synthetic-model",
         python=Path("/usr/bin/python3"),
     )
     manifest = json.loads(path.read_text())
-    assert manifest["provider"] == provider and manifest["model"] == "synthetic-model"
+    assert manifest["provider"] == provider
+    assert manifest["model"] == (GEMINI_MODEL if provider == "gemini" else "synthetic-model")
+    if provider == "gemini":
+        assert manifest["gemini_port"] == 18437
+    else:
+        assert "gemini_port" not in manifest
     assert not (prefix / "gateway/model.key").exists()
     for name, command in [
         ("deskd-bridge", "bridge"),
@@ -475,7 +561,7 @@ def test_install_writes_pinned_helpers_without_creating_a_key(install_model, pro
     assert not list((prefix / "lib").rglob("__pycache__"))
 
 
-@pytest.mark.parametrize("provider", ["api", "mock"])
+@pytest.mark.parametrize("provider", ["api", "mock", "gemini"])
 def test_install_cli_explicitly_selects_provider_without_key_arguments(
     monkeypatch, capsys, provider
 ):
@@ -490,7 +576,7 @@ def test_install_cli_explicitly_selects_provider_without_key_arguments(
         ),
     )
     argv = [
-        "install" if provider == "api" else "install-mock",
+        "install-mock" if provider == "mock" else "install",
         "--prefix",
         "/synthetic",
         "--binary",
@@ -506,9 +592,12 @@ def test_install_cli_explicitly_selects_provider_without_key_arguments(
     ]
     if provider == "mock":
         argv += ["--mock-port", "12345"]
+    if provider == "gemini":
+        argv += ["--provider", "gemini", "--gemini-port", "18437"]
     assert main(argv) == 0
     assert calls[0][1]["provider"] == provider
     assert calls[0][1]["mock_port"] == (12345 if provider == "mock" else None)
+    assert calls[0][1]["gemini_port"] == (18437 if provider == "gemini" else None)
     assert not {"key", "token", "endpoint"} & set(calls[0][1])
     assert capsys.readouterr().err == ""
 
@@ -645,6 +734,95 @@ def test_mock_gateway_never_configures_model_key_source(gateway_auth_model):
     instance.value["provider"] = "mock"
     deployment.run_installed("gateway", instance.path)
     assert state["provider"] is None and state["reads"] == 0
+
+
+@pytest.fixture
+def gemini_gateway_model(gateway_auth_model, monkeypatch):
+    """Synthetic startup ordering, with neither real HTTP nor a provider call."""
+    import sys
+    from types import ModuleType
+    from deskd.workspace import service
+
+    instance, state, status = gateway_auth_model
+    instance.value.update(provider="gemini", model=GEMINI_MODEL, gemini_port=18437)
+    events = []
+    controls = {"proxy_failure": False, "gateway_failure": False}
+
+    class Proxy:
+        def __init__(self, *, port, model, key_source, authorize):
+            assert port == 18437 and model == GEMINI_MODEL
+            state["google_source"] = key_source
+            self.authorize = authorize
+            state["proxy"] = self
+
+        def token(self):
+            self.authorize()
+            return "SYNTHETIC-LOCAL-CAPABILITY"
+
+        def start(self):
+            events.append("proxy.start")
+            if controls["proxy_failure"]:
+                raise OSError("synthetic occupied endpoint")
+
+        def close(self):
+            events.append("proxy.close")
+
+    class Gateway:
+        def __init__(self, **kwargs):
+            state["provider"] = kwargs["auth_provider"]
+            self.transport = SimpleNamespace(service_generation=7)
+
+        def start(self):
+            events.append("gateway.start")
+            if controls["gateway_failure"]:
+                raise OSError("synthetic occupied socket")
+
+        def serve_forever(self):
+            events.append("gateway.serve")
+            # Binding the HTTP endpoint is not authorization to return even a
+            # local capability. The current service generation must be active.
+            with pytest.raises(ValueError, match="model_auth_service_fenced"):
+                state["provider"]()
+            assert state["reads"] == 0
+            status(7, 1)
+            assert state["provider"]() == "SYNTHETIC-LOCAL-CAPABILITY"
+            assert state["reads"] == 0
+            assert state["google_source"]() == "SYNTHETIC-ONLY-NOT-A-REAL-MODEL-KEY"
+            status(8, 1)
+            with pytest.raises(ValueError, match="model_auth_service_fenced"):
+                state["provider"]()
+            with pytest.raises(ValueError, match="model_auth_service_fenced"):
+                state["google_source"]()
+            status(7, 0)
+
+        def close(self):
+            events.append("gateway.close")
+
+    module = ModuleType("deskd.workspace.gemini")
+    module.GeminiProxy = Proxy
+    monkeypatch.setitem(sys.modules, "deskd.workspace.gemini", module)
+    monkeypatch.setattr(service, "WorkspaceGateway", Gateway)
+    return instance, state, events, controls
+
+
+def test_gemini_listens_before_gateway_and_returns_only_local_capability(gemini_gateway_model):
+    instance, state, events, _ = gemini_gateway_model
+    deployment.run_installed("gateway", instance.path)
+    assert events == ["proxy.start", "gateway.start", "gateway.serve", "gateway.close", "proxy.close"]
+    assert state["reads"] == 1
+
+
+@pytest.mark.parametrize("failure", ["proxy_failure", "gateway_failure"])
+def test_gemini_start_failure_closes_new_resources_without_reading_key(gemini_gateway_model, failure):
+    instance, state, events, controls = gemini_gateway_model
+    controls[failure] = True
+    with pytest.raises(OSError):
+        deployment.run_installed("gateway", instance.path)
+    assert state["reads"] == 0
+    assert events[-2:] == ["gateway.close", "proxy.close"]
+    assert "gateway.serve" not in events
+    if failure == "proxy_failure":
+        assert "gateway.start" not in events
 
 
 @pytest.fixture
