@@ -9,6 +9,7 @@ on:
       - "src/deskd/gateway/**"
       - "tests/test_workspace_linux_sandbox.py"
       - "tests/test_workspace_installed.py"
+      - "tests/test_workspace_gemini_official.py"
       - ".github/workflows/workspace-isolation.yml"
   push:
     branches: [main]
@@ -17,6 +18,7 @@ on:
       - "src/deskd/gateway/**"
       - "tests/test_workspace_linux_sandbox.py"
       - "tests/test_workspace_installed.py"
+      - "tests/test_workspace_gemini_official.py"
       - ".github/workflows/workspace-isolation.yml"
   workflow_dispatch:
 
@@ -140,6 +142,7 @@ jobs:
           print("Prepared protected scratchpad test interpreter.")
           COPY_TEST_PYTHON
           export DESKD_SANDBOX_TEST_PYTHON="$TMPDIR/python/bin/python3.11"
+          export DESKD_GEMINI_OFFICIAL_BINARY="$TMPDIR/official/codex"
           cd "$workspace"
           # All actual runtime/model/terminal probes run with loopback only in
           # a fresh network namespace. Artifact downloads are already complete.
@@ -151,7 +154,8 @@ jobs:
           /usr/sbin/ip link set lo up
           "$1" -m pytest -o addopts='' -p no:cacheprovider \
             --basetemp="$2/pytest" --junitxml="$2/results.xml" \
-            tests/test_workspace_linux_sandbox.py tests/test_workspace_installed.py -q
+            tests/test_workspace_linux_sandbox.py tests/test_workspace_installed.py \
+            tests/test_workspace_gemini_official.py -q
           PRIVATE_TEST_NETWORK
           "$python_executable" - "$TMPDIR/results.xml" <<'VERIFY_EXECUTION'
           import sys

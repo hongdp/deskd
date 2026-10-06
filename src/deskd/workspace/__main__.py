@@ -109,6 +109,8 @@ def main(argv=None):
             installer.add_argument("--model", default="gpt-5.5")
         else:
             installer.add_argument("--model", required=True)
+            installer.add_argument("--provider", choices=("api", "gemini"), default="api")
+            installer.add_argument("--gemini-port", type=int, help="fixed loopback port owned by the Gemini gateway adapter")
     up = sub.add_parser("up", help="supervise one protected installed workspace")
     up.add_argument("--deployment", type=Path, required=True)
     attach = sub.add_parser(
@@ -218,7 +220,8 @@ def main(argv=None):
                     gateway_uid=args.gateway_uid,
                     business_gid=args.business_gid,
                     mock_port=getattr(args, "mock_port", None),
-                    provider="api" if args.command == "install" else "mock",
+                    gemini_port=getattr(args, "gemini_port", None),
+                    provider=args.provider if args.command == "install" else "mock",
                     model=args.model,
                     python=args.python,
                 )

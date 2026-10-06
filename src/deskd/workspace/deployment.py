@@ -97,6 +97,7 @@ def install(
     gateway_uid: int,
     business_gid: int,
     mock_port: int | None = None,
+    gemini_port: int | None = None,
     provider: str = "mock",
     model: str = "gpt-5.5",
     desk_id="desk",
@@ -169,7 +170,8 @@ def install(
         str(prefix), harness_uid, gateway_uid, business_gid, roles
     )
     plan = installation.plan(
-        mock_port=mock_port, with_gateway_bridge=True, provider=provider, model=model
+        mock_port=mock_port, gemini_port=gemini_port,
+        with_gateway_bridge=True, provider=provider, model=model
     )
     prefix.mkdir(mode=0o755)  # Never replace or repair an existing installation.
     for item in plan["directories"]:
@@ -215,7 +217,7 @@ def install(
     bridge.write_text(wrapper)
     bridge.chmod(0o755)
     inventory[str(bridge)] = hashlib.sha256(wrapper.encode()).hexdigest()
-    if provider == "api":
+    if provider in {"api", "gemini"}:
         auth_wrapper = wrapper.replace('main(["bridge",', 'main(["model-auth",')
         helper = prefix / "bin/deskd-model-auth"
         helper.write_text(auth_wrapper)
@@ -231,6 +233,8 @@ def install(
         "inventory": inventory,
         "python": python_pin,
     }
+    if provider == "gemini":
+        deployment["gemini_port"] = gemini_port
     _json_write(prefix / "policy/deployment.json", deployment)
     return prefix / "policy/deployment.json"
 
@@ -250,7 +254,7 @@ class Deployment:
                 "python",
                 "provider",
                 "model",
-            }
+            } | ({"gemini_port"} if self.value.get("provider") == "gemini" else set())
             or self.value["schema_version"] != 1
         ):
             raise ValueError("invalid_deployment")
@@ -264,6 +268,7 @@ class Deployment:
             raise ValueError("unexpected_deployment_path")
         self.plan = self.installation.plan(
             mock_port=self.value["mock_port"],
+            gemini_port=self.value.get("gemini_port"),
             with_gateway_bridge=True,
             provider=self.value["provider"],
             model=self.value["model"],
@@ -323,7 +328,7 @@ class Deployment:
         if any(inventory.get(path) != digest for path, digest in required.items()):
             raise ValueError("missing_official_runtime_pin")
         if (
-            self.value["provider"] == "api"
+            self.value["provider"] in {"api", "gemini"}
             and str(self.prefix / "bin/deskd-model-auth") not in inventory
         ):
             raise ValueError("missing_model_auth_pin")
@@ -476,7 +481,8 @@ def run_installed(command, path, *, daemon_pid=None):
         deployment.attest(gateway_only=True)
         os.umask(0o077)
         auth_provider = None
-        if deployment.value["provider"] == "api":
+        proxy = None
+        if deployment.value["provider"] in {"api", "gemini"}:
             from .model_auth import ModelKeySource
 
             def authorize_model_key():
@@ -497,7 +503,18 @@ def run_installed(command, path, *, daemon_pid=None):
                 deployment.installation.gateway_uid,
                 authorize=authorize_model_key,
             )
-            auth_provider = key_source.read_token
+            if deployment.value["provider"] == "gemini":
+                from .gemini import GeminiProxy
+
+                proxy = GeminiProxy(
+                    port=deployment.value["gemini_port"],
+                    model=deployment.value["model"],
+                    key_source=key_source.read_token,
+                    authorize=authorize_model_key,
+                )
+                auth_provider = proxy.token
+            else:
+                auth_provider = key_source.read_token
         gateway = WorkspaceGateway(
             gateway_db=deployment.gateway_db,
             coordination_db=deployment.coordination_db,
@@ -512,16 +529,26 @@ def run_installed(command, path, *, daemon_pid=None):
             activation_check=lambda: deployment.attest(gateway_only=True),
             auth_provider=auth_provider,
         )
-        gateway.start()
-
         def stop(_sig, _frame):
             gateway.close()
+            if proxy is not None:
+                proxy.close()
 
-        signal.signal(signal.SIGTERM, stop)
+        previous_signal = signal.signal(signal.SIGTERM, stop)
         try:
+            # Occupy the protected adapter endpoint before admitting the daemon
+            # through either gateway socket. Never reuse an existing listener.
+            if proxy is not None:
+                proxy.start()
+            gateway.start()
             gateway.serve_forever()
         finally:
-            gateway.close()
+            try:
+                gateway.close()
+            finally:
+                if proxy is not None:
+                    proxy.close()
+                signal.signal(signal.SIGTERM, previous_signal)
         return
     if os.geteuid() != 0:
         raise ValueError("independent_administrator_required")
